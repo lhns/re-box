@@ -19,6 +19,8 @@ concurrency:
 env:
   IMAGE: ghcr.io/${{ github.repository }}
   CACHE: ghcr.io/${{ github.repository }}:buildcache
+  # The build-record artifact counts against the account's Actions storage quota; the logs suffice.
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
 
 jobs:
   pins:

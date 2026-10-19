@@ -1,29 +1,53 @@
-# Example deployment (also deployable as a Swarm stack). docs/OPERATIONS.md explains each knob.
+# Example deployment. Copy .env.example to .env and create the token file first:
+#   openssl rand -hex 32 > rebox_token && chmod 600 rebox_token
+# docs/OPERATIONS.md explains every knob, docs/PERSISTENCE.md what is kept where.
 services:
   re-box:
-    image: ${REBOX_IMAGE:-registry.example/re-box:latest}
-    # Started as root only so the entrypoint can give `rebox` the host user's PUID/PGID; it drops
-    # to that user before anything else runs. Without PUID/PGID needs, delete `user` and the
-    # three cap_add entries: the image defaults to uid 1000.
+    image: ${REBOX_IMAGE:-ghcr.io/lhns/re-box:latest}
+    # Started as root only so the entrypoint can give `rebox` the host user's PUID/PGID (files in
+    # the mounts then belong to you); it drops to that user before anything else runs. To skip the
+    # remap, delete `user` and the three cap_add entries: the image then runs as uid 1000.
     user: "0:0"
     cap_drop: [ALL]
     cap_add: [CHOWN, SETUID, SETGID]
     security_opt: ["no-new-privileges:true"]
     environment:
-      REBOX_TOKEN: ${REBOX_TOKEN:?set REBOX_TOKEN in .env}
+      REBOX_TOKEN_FILE: /run/secrets/rebox_token
       RE_WORKDIR: ${RE_WORKDIR:?set RE_WORKDIR in .env}
+      # Empty: state lives in $RE_WORKDIR/re-box-state and persists with the work dir.
+      REBOX_STATE_DIR: ${REBOX_STATE_DIR:-}
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
+    secrets: [rebox_token]
     volumes:
-      # Same absolute path inside as outside: paths the harness sends are valid here as-is.
+      # Same absolute path inside as outside: paths a client sends are valid here as they are,
+      # and paths re-box writes are valid on the host.
       - ${RE_WORKDIR}:${RE_WORKDIR}
+      # A separate state dir (e.g. an agent's scratchpad), also at its own path. Uncomment with
+      # REBOX_STATE_DIR set in .env:
+      # - ${REBOX_STATE_DIR}:${REBOX_STATE_DIR}
+      # REA's per-session Ghidra projects and tool scratch space: a few GB per busy session.
       - rebox-tmp:/tmp
     ports:
-      - "8443:8443"
+      # Plain HTTP: keep it on loopback, or put a TLS proxy in front (docs/OPERATIONS.md, Security).
+      - "127.0.0.1:8443:8443"
     deploy:
       resources:
         limits:
+          # Fits the defaults: docs/OPERATIONS.md, Memory.
           memory: 16g
-    stop_grace_period: 90s
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/re-box-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      start_period: 5m
+      retries: 3
+    restart: unless-stopped
+    # Shutdown saves every Ghidra program and exports each REA session's evidence; Docker's
+    # default 10 s can SIGKILL that half way (docs/PERSISTENCE.md).
+    stop_grace_period: 120s
+secrets:
+  rebox_token:
+    file: ./rebox_token
 volumes:
   rebox-tmp:

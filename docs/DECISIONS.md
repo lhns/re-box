@@ -133,10 +133,10 @@ docs/CLIENTS.md says when to switch to `compact`/`off`.
 
 ## Other departures from the spec
 
-- **`GHIDRA_PROJECTS_DIR` defaults to `$RE_WORKDIR/ghidra-projects`, not `.ghidra-projects`.**
-  Ghidra refuses project paths with a dot-prefixed element:
-  `ERROR Error creating project: Path element starting with '.' is not permitted`. The same holds
-  for `RE_WORKDIR` itself when it contains the projects dir.
+- **No dot-prefixed project path** (the spec had `.ghidra-projects`): Ghidra refuses
+  `ERROR Error creating project: Path element starting with '.' is not permitted`. The projects
+  dir is `$REBOX_STATE_DIR/ghidra-projects` ("State dir" below), so the rule covers every element
+  of the state dir path, e.g. a host path under `~/.cache` fails at start with one line.
 - **ghidra-mcp extension install:** not needed. The headless server is
   `com.xebyte.headless.GhidraMCPHeadlessServer` run from `GhidraMCP-<v>.jar` plus Ghidra's
   jars on the classpath, which is what upstream's `docker/entrypoint.sh` does; the extension zip
@@ -195,3 +195,65 @@ docs/CLIENTS.md says when to switch to `compact`/`off`.
   do not follow `nextCursor` would silently lose tools. Claude Code 2.1.303 handles the full catalog.
 - **Claude Code `-p` exits without DELETE**, so its session (and REA's Ghidra JVM) lives until the
   idle timeout and counts against `REBOX_MAX_SESSIONS` (docs/OPERATIONS.md).
+
+## State dir (persistence)
+
+**Decision:** one state root, `REBOX_STATE_DIR`, default `$RE_WORKDIR/re-box-state`, holding the
+ghidra-mcp project (`ghidra-projects/`), the services' `HOME` (`home/`: Ghidra settings and logs,
+tool configs), `XDG_CACHE_HOME` (`cache/`) and REA evidence exports (`rea/evidence/`). Layout and
+survival table: docs/PERSISTENCE.md.
+
+- **Default inside the work dir,** not a container path: the work dir is already a required,
+  writable mount, so state persists with no extra configuration; a container path would vanish
+  with `docker rm`, `--rm` or `compose down`. A separate state dir is one variable and one mount.
+- **HOME and XDG, not per-tool symlinks.** An empty `/home/rebox` and a runtime audit of the
+  image (files written outside `/work` and `/tmp` while REA, ghidra-mcp and every bundled tool
+  ran) showed everything user-level goes to `$HOME` or `/var/tmp/<user>-ghidramcp`; moving `HOME`
+  plus the XDG variables, and `-Duser.home` for the headless JVM (Java takes `user.home` from
+  passwd, not `$HOME`), catches all of it, including tools nobody audited.
+- **The project is opened by the headless server's `--project` flag** and created on first start
+  by `analyzeHeadless ... -preScript ReboxNoop.java`. ghidra-mcp's HTTP `/open_project` and
+  `/create_project` honour `GHIDRA_MCP_FILE_ROOT` (canonical paths, symlinks resolved), which
+  stays on `RE_WORKDIR` as a guard for agent-driven imports; a state dir outside the work dir
+  would otherwise be unreachable. Widening the root to a common ancestor would make it `/` in the
+  scratchpad case.
+- **No chown, ever.** The service user creates what is missing; an unwritable state dir stops the
+  supervisor with one line (exit 2). `/work` exists in the image owned by 1000 so a named volume
+  there is writable.
+- **REA is ephemeral by design.** REA keeps each session's Ghidra database in a private
+  `mkdtemp` under `TMPDIR` and deletes it when the process ends (`GhidraClient`,
+  `PrivateRuntimeRoot`); `annotate_native_function` says it edits an "ephemeral session analysis
+  database"; mitmproxy gets a per-run `confdir` (so a per-run CA) and apktool a per-run
+  `--frame-path`. Nothing of that can be reopened, so `/tmp` stays out of the state dir. REA's
+  supported persistence is `export_evidence_bundle` / `import_evidence_bundle` and
+  `close_binary {snapshot_path}`; the aggregator calls the first (below).
+
+## Saving
+
+- **ghidra-mcp:** edits live in the headless JVM until saved. `exit_ghidra` (sent on SIGTERM)
+  saves all programs, and so does the JVM's own shutdown hook (`releaseAll` -> `saveIfChanged`).
+  Added: the supervisor posts `/save_all_programs` every `REBOX_AUTOSAVE_INTERVAL` (300 s) and
+  immediately on SIGTERM, so a kill or OOM loses at most one interval and a short `docker stop`
+  grace still saves first. Upstream refuses to autosave on behalf of a user in the GUI; here no
+  user reviews edits before a save, and losing them is the failure the owner named.
+- **REA:** a generic per-child `[child.autosave]` hook in the aggregator config calls
+  `export_evidence_bundle` into `$REBOX_STATE_DIR/rea/evidence/<session>.json` when a session
+  ends (DELETE, idle, shutdown) and every `REBOX_AUTOSAVE_INTERVAL` while the session has new
+  calls and none running, bounded by `REBOX_AUTOSAVE_TIMEOUT` (20 s, so a DELETE still clears
+  the session's processes within the e2e test's 30 s). Snapshots are left to the agent: REA
+  refuses them after metadata edits, and they only help reopen the same target.
+
+## Release pipeline
+
+- **Plain `docker build` / GitHub Actions to ghcr.io,** with the in-cluster ImageBuild kept as an
+  optional route (docs/IMAGEBUILD.md). Nothing in the Dockerfile is ImageBuild-specific; the
+  tini supervisor and the self-contained test stage also suit any BuildKit.
+- **Runner: GitHub-hosted by default.** The k0s-flux self-hosted scale sets are registered per
+  repository; the only Docker-capable one serves `lhns/k0s-flux`, through a shared remote-docker
+  workspace with a 6 GiB limit and a 20 GiB graph. A hosted private-repo runner (2 CPU, 8 GB,
+  6 h) fits the build's memory and, after freeing preinstalled toolchains, its disk, and a cold
+  build took 11 min there (docs/BUILDING.md). `vars.REBOX_RUNNER` moves the job to a dedicated scale set without editing
+  the workflow (docs/BUILDING.md).
+- **Registry build cache** on ghcr (`:buildcache`, `mode=max`): the gha cache's 10 GB cap is
+  below this build's layers. Container registry storage is free (GitHub billing docs,
+  2026-10-19).

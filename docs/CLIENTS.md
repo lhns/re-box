@@ -6,7 +6,10 @@ ghidra-mcp's `gh_`. Any client that speaks streamable HTTP with a custom header 
 
 Paths in tool arguments are paths **inside the container**. Mount your work directory at the
 same absolute path (`RE_WORKDIR`, docs/OPERATIONS.md) and the paths your harness sees are valid
-as they are. Nothing is uploaded.
+as they are. Nothing is uploaded. The same goes for the state dir (`REBOX_STATE_DIR`,
+docs/PERSISTENCE.md): mounted at its own path, e.g. inside the agent's scratchpad, the agent reads
+REA exports and evidence autosaves there directly, and a path it passes to
+`rea_export_evidence_bundle` or `rea_close_binary {snapshot_path}` is valid on both sides.
 
 ## Claude Code
 
@@ -103,5 +106,8 @@ Anything that does streamable HTTP with a static header: point it at `/mcp` with
 - Clients with small message or schema limits: see the schema profiles above, and
   `REA_MCP_MAX_RESPONSE_BYTES` (docs/OPERATIONS.md).
 - A session ends after `REBOX_SESSION_IDLE_TIMEOUT` (30 min) without requests; the next request
-  gets 404 and a compliant client re-initializes. REA state (the open binary) does not survive
-  that, by design: each session's REA process holds it.
+  gets 404 and a compliant client re-initializes. REA state (the open binary and its in-session
+  Ghidra database) does not survive that, by design: each session's REA process holds it. Before
+  closing, the aggregator exports the session's REA evidence to
+  `$REBOX_STATE_DIR/rea/evidence/` (docs/PERSISTENCE.md). Work that must last belongs in
+  ghidra-mcp's project (`gh_` tools), which is saved.

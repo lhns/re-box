@@ -1,33 +1,19 @@
-# Building with ImageBuild (kube-oci-composer)
+# Building in-cluster with ImageBuild (optional)
 
-The release image is built in-cluster by kube-oci-composer's `ImageBuild`, which takes exactly one
-`target`. Building `final` always runs the test suite: `final` copies
-`/opt/rebox/tests-passed`, which only a passing `test` stage writes (docs/DECISIONS.md). CI
-(`.github/workflows/build.yml`) builds `test` only and pushes nothing.
+Release images come from CI (docs/BUILDING.md). This is the alternative: kube-oci-composer's
+`ImageBuild`, which takes exactly one `target`. Building `final` always runs the test suite (it
+copies the marker only a passing `test` stage writes).
 
 The test stage starts the services inside a `RUN`, which works under rootless BuildKit with
 `--oci-worker-no-process-sandbox` (no init, no PID namespace): `tests/run-tests.sh` scopes every
 process check to its own instance id and kills everything it started before the `RUN` ends.
-
-## Measured locally
-
-Docker Desktop, 20 CPUs, 64 GB, BuildKit, empty build cache (2026-10-19):
-
-| | |
-| --- | --- |
-| cold build of `test` (all stages, incl. the suite) | 37 min (`install-tools.sh` 15 min, the suite 9-11 min) |
-| cold build of `final` | 40 min |
-| test stage, peak RSS of the services | 2.5-2.7 GiB (headless JVM + one REA Ghidra JVM at a time) |
-| `final` image | 3.66 GB uncompressed |
-
-The RSS figure sums per-process RSS of the services during the suite (shared pages counted twice)
-and does not cover build steps (Gradle, cargo). None of this ran under rootless BuildKit yet; do a
-first ImageBuild with generous limits and tighten them from the pod's metrics. Rootless BuildKit
-in a pod is slower than Docker Desktop; allow about twice the local time.
+None of this has run under rootless BuildKit yet; do a first ImageBuild with generous limits and
+tighten them from the pod's metrics. Local build times and memory: docs/BUILDING.md. Rootless
+BuildKit in a pod is slower than Docker Desktop; allow about twice the local time.
 
 ## Draft manifest
 
-Hosting is not decided; replace the URL and the push repository.
+Replace the push repository if it should not be ghcr.
 
 ```yaml
 apiVersion: source.toolkit.fluxcd.io/v1
@@ -37,7 +23,7 @@ metadata:
   namespace: re-box
 spec:
   interval: 1h
-  url: https://<forge>/<owner>/re-box
+  url: https://github.com/lhns/re-box  # private: add spec.secretRef
   ref:
     branch: main
 ---
@@ -70,7 +56,7 @@ spec:
       memory: 12Gi
       ephemeral-storage: 40Gi
   push:
-    repository: <registry>/re-box
+    repository: ghcr.io/lhns/re-box
     history: 10
 ```
 
