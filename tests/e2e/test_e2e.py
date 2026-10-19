@@ -316,8 +316,14 @@ def test_11_idle_stop_and_restart():
         time.sleep(0.5)
     record("11_idle_stop", "Ghidra gone after the last session closed (idle timeout 5 s)", time.monotonic() - t0)
     assert not ghidra_server_pids()
+    # The JVM leaves /proc a moment before the supervisor has reaped it and says "stopped"
+    # (measured 0.3 s on an idle machine).
     with httpx.Client(timeout=30) as http:
-        health = http.get(URL.rsplit("/mcp", 1)[0] + "/healthz")
+        for _ in range(40):
+            health = http.get(URL.rsplit("/mcp", 1)[0] + "/healthz")
+            if health.status_code != 200 or health.json()["ghidra"] != "stopping":
+                break
+            time.sleep(0.25)
     assert health.status_code == 200 and health.json()["ghidra"] == "stopped", health.text
 
     # A cold session: the catalog comes from the cache at once, and a gh_ call waits for Ghidra.

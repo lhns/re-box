@@ -582,7 +582,8 @@ class Session:
             "gh_import_file only reads files under RE_WORKDIR" + (f" ({os.environ['RE_WORKDIR']})." if os.environ.get("RE_WORKDIR") else "."),
             "rea_: REA works on the same project: rea_open_binary imports the file (by its name; a different file "
             "of the same name goes to /rea/<sha256 prefix>/) and REA's renames and comments persist there, visible "
-            "to gh_ tools and other sessions, whatever REA's own texts say about an ephemeral project. REA's evidence "
+            "to gh_ tools and other sessions, whatever REA's own texts say about an ephemeral project. REA caches "
+            "what it read: reopen the binary to see edits made since by gh_ tools or other sessions. REA's evidence "
             "and in-session state still end with the session. Raw, DOS COM and similar targets run in a private "
             "Ghidra whose edits are discarded.",
             "Paths: the container sees host paths unchanged (same-path mount). On Windows send the Git Bash form "
