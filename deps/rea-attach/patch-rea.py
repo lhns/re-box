@@ -4,13 +4,14 @@
     patch-rea.py <rea-agents package root> <output dir for the attach bridge scripts>
 
 1. JS: the `rea mcp` bundle chunk (dist/mcp/main-*.js) that constructs GhidraHeadlessLauncher
-   gets a `javaLaunch` override. When REBOX_REA_ATTACH_HELPER is set and the target needs nothing
-   ghidra-mcp's import can't do, REA spawns that helper instead of its own JVM, with the
-   AnalyzeHeadless arguments it would have used. REA's descriptor, process ownership, handshake
-   and cleanup are unchanged. Anything else falls back to REA's own JVM.
-2. Java: bridge/ghidra/*.java is copied to the output dir and ReaGhidraBridge.java patched to
-   run without a HeadlessAnalyzer, keep its default address space per session thread, and hold
-   ghidra-mcp's write lock around its edits. REA's own copy stays untouched for the fallback.
+   gets a `javaLaunch` override: with REBOX_REA_ATTACH_HELPER set, REA spawns that helper instead
+   of its own JVM, with the AnalyzeHeadless arguments it would have used (the helper maps them to
+   ghidra-mcp's import, or refuses one it does not know). REA's descriptor, process ownership,
+   handshake and cleanup are unchanged.
+2. Java: bridge/ghidra/*.java is copied to the output dir (the helper's import runs REA's pre-
+   and post-scripts from there) and ReaGhidraBridge.java patched to run without a
+   HeadlessAnalyzer, keep its default address space per session thread, and hold ghidra-mcp's
+   write lock around its edits. REA's own copy stays as shipped.
 
 Every anchor must match exactly as expected, or this fails: REA ships often, and a silent
 mismatch would ship a REA that quietly runs its own JVM again or a bridge that doesn't compile.
@@ -26,35 +27,23 @@ from pathlib import Path
 MARK = "/* re-box: attach to ghidra-mcp */"
 
 JS_SITE = "launcher: new GhidraHeadlessLauncher({"
-JS_SITE_NEW = JS_SITE + " ...__reboxAttach(target, extensions),"
+JS_SITE_NEW = JS_SITE + " ...__reboxAttach(target),"
 JS_CACHE = ': { cachePolicy: "snapshot" },'
 JS_CACHE_NEW = ': { cachePolicy: process.env.REBOX_REA_ATTACH_HELPER ? "live" : "snapshot" },'
-# Bundle-level names the appended function relies on; checked so a rename fails the build.
+# What the appended function relies on; checked so a rename fails the build.
 JS_NEEDS = (
-    "var GHIDRA_LAUNCH_SUPPORT_CAPTURE_BYTES, GhidraLaunchSupportError, jvmEnvironmentArguments, "
-    "rejectJvmPlatformOverrides, ghidraJavaLaunch;",
     "this.options.javaLaunch ?? ghidraJavaLaunch",
-    "extensions.length === 0 ? {} : { analysisExtensions: extensions }",
     "targetPath: installation.platform === \"win32\" ? target.sourcePath ?? target.path : target.path,",
 )
-# Loader and script options only REA's own AnalyzeHeadless run can apply: raw, DOS, PSP and
-# language overrides (-loader/-processor/-cspec), seeds and disabled analyzers (-preScript),
-# MIPS soft-float storage (its post-script).
 JS_TAIL = MARK + r"""
-function __reboxAttach(target, extensions) {
+function __reboxAttach(target) {
 	const helper = process.env.REBOX_REA_ATTACH_HELPER;
-	const root = (process.env.RE_WORKDIR ?? "").replace(/\/+$/u, "");
-	// ghidra-mcp imports only from its file root (RE_WORKDIR) and only with auto-detected loaders.
-	if (!helper || process.platform === "win32" || root === "" || extensions.length > 0 ||
-		typeof target?.path !== "string" || !target.path.startsWith(root + "/")) return {};
+	if (!helper || process.platform === "win32" || typeof target?.path !== "string") return {};
 	return { javaLaunch: async (options) => {
-		const args = options.arguments;
-		if (args.some((a) => a === "-loader" || a === "-processor" || a === "-cspec" || a === "-preScript" ||
-			a.endsWith("/ReaGhidraMipsSoftFloat.java"))) return ghidraJavaLaunch(options);
 		const environment = { ...options.environment };
 		for (const [key, value] of Object.entries(process.env))
 			if (key.startsWith("REBOX_") && value !== undefined) environment[key] = value;
-		return { command: process.execPath, arguments: [helper, "--target", target.path, ...args],
+		return { command: process.execPath, arguments: [helper, "--target", target.path, ...options.arguments],
 			environment, configuredMaxHeap: undefined };
 	} };
 }

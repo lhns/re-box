@@ -47,7 +47,7 @@ class AnchorLogic(unittest.TestCase):
 
     def test_missing_or_duplicate_anchor_fails(self):
         for broken in (JS.replace(pr.JS_SITE, "launcher: other"), JS + pr.JS_SITE,
-                       JS.replace("ghidraJavaLaunch;", "javaLaunch;"), JS.replace(pr.JS_CACHE, "")):
+                       JS.replace("?? ghidraJavaLaunch", "?? other"), JS.replace(pr.JS_CACHE, "")):
             with self.assertRaises(pr.PatchError):
                 pr.patch_js_text(broken)
         for broken in (JAVA.replace(pr.DISPATCH, "x();"), JAVA + pr.CLASS_DECL,
