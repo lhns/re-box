@@ -303,13 +303,21 @@ Rejected:
   transaction is open (it releases the lock while it waits, at most 60 s). Still open: gh_
   comment and label writes take no lock in headless mode, so one that starts during a REA edit
   joins it and is lost if that edit aborts (duplicate or invalid name, cancel).
-- REA caches what it has read (inventories, analysis results) for the life of its process, on
-  the assumption that the program does not change under it: renames, functions, labels or
-  strings that gh_ tools or other sessions make later reach REA only in a new MCP session
-  (measured: a rename by another session stayed "unknown procedure" in an open session, even
-  after close and reopen of the binary; a new session found it).
+- REA assumes nobody else edits its program: the bridge keeps name, procedure and string
+  inventories until its own edit invalidates them, and REA's node side replays analysis results
+  per target ("snapshot" cache policy). Attached, both would hide edits made by gh_ tools or other
+  sessions. The patched bridge drops its inventories whenever the program's modification number
+  moved since its last request, and the patched chunk asks REA for its "live" policy (the one it
+  uses for IDA and Kuna) while the attach helper is configured.
+- REA's `close_binary` clears its in-memory evidence ledger; the next autosave would then
+  overwrite (or, empty, delete) the session's bundle. The rea child's autosave therefore runs
+  before a `close_binary` is forwarded (`[child.autosave] before_tools`).
 - Concurrent attaches in one JVM collide on Ghidra's script-bundle file lock (meant for separate
   JVMs: `OverlappingFileLockException`); the helper retries until the other's build is done.
+- `import_file` checks for an existing program, then imports: two sessions opening the same new
+  file at once both imported it, and Ghidra saved the second as `<name>.0`, a separate program
+  (found in CI: one session's rename landed in the copy). The helpers take a lock per program
+  name around the import, and fail loudly if an import comes back under another name.
 - Memory: REA's programs live in the shared heap (`JAVA_OPTS`, now `-Xmx8g`); a session costs
   about 0.5 GiB outside it (rea node, helper, bridge). `GHIDRA_HEADLESS_MAXMEM` applies only to
   targets in REA's own JVM.

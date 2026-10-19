@@ -17,6 +17,8 @@ REBOX_REA_ATTACH_HELPER = "/opt/rebox/rea-attach/helper.mjs"
 tool = "export_evidence_bundle"
 arguments = { path = "{state_dir}/rea/evidence/{session}.json", overwrite = true }
 prune_empty = true
+# close_binary clears REA's evidence ledger, so export before forwarding it.
+before_tools = ["close_binary"]
 
 [[child]]
 name = "ghidra"

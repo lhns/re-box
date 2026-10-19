@@ -27,6 +27,8 @@ MARK = "/* re-box: attach to ghidra-mcp */"
 
 JS_SITE = "launcher: new GhidraHeadlessLauncher({"
 JS_SITE_NEW = JS_SITE + " ...__reboxAttach(target, extensions),"
+JS_CACHE = ': { cachePolicy: "snapshot" },'
+JS_CACHE_NEW = ': { cachePolicy: process.env.REBOX_REA_ATTACH_HELPER ? "live" : "snapshot" },'
 # Bundle-level names the appended function relies on; checked so a rename fails the build.
 JS_NEEDS = (
     "var GHIDRA_LAUNCH_SUPPORT_CAPTURE_BYTES, GhidraLaunchSupportError, jvmEnvironmentArguments, "
@@ -75,7 +77,16 @@ CLASS_DECL_NEW = CLASS_DECL + """
     private static final Set<String> REBOX_EDITS =
         Set.of("annotate_native_function", "set_address_name", "set_addresses_names");
 
+    // The program is shared: drop this bridge's inventories whenever anyone changed it since the
+    // last request (REA only invalidates them after its own edits).
+    private long reboxSeenModification = -1;
+
     private JsonElement reboxHandle(Request request, SessionDescriptor descriptor) throws Exception {
+        long modification = currentProgram.getModificationNumber();
+        if (modification != reboxSeenModification) {
+            invalidateAnalysisCaches();
+            reboxSeenModification = modification;
+        }
         if (!REBOX_EDITS.contains(request.method)) return handleRequest(request, descriptor);
         // Writers that don't take the lock (analysis, scripts): wait for their transaction to end
         // rather than join it, but never while holding the lock, which every gh_ call needs.
@@ -104,7 +115,8 @@ HEADLESS_ONLY = re.compile(
     r"setHeadlessImportDirectory)\(")
 # Members reboxHandle uses; a rename upstream must fail here, not at bridge compile time.
 BRIDGE_NEEDS = ("private JsonElement handleRequest(Request request, SessionDescriptor descriptor)",
-                "private record Request(int id, String method,", "import java.util.Set;", "import com.google.gson.JsonElement;")
+                "private record Request(int id, String method,", "import java.util.Set;", "import com.google.gson.JsonElement;",
+                "private void invalidateAnalysisCaches()")
 
 
 class PatchError(Exception):
@@ -124,7 +136,11 @@ def patch_js_text(text: str, where: str = "chunk") -> str:
     for needed in JS_NEEDS:
         if needed not in text:
             raise PatchError(f"{where}: missing {needed!r}")
-    return replace_once(text, JS_SITE, JS_SITE_NEW, where) + "\n" + JS_TAIL
+    text = replace_once(text, JS_SITE, JS_SITE_NEW, where)
+    # REA replays analysis results per target, assuming a program nobody else edits; attached, it
+    # does not own the program, so ask live (REA's policy for IDA and Kuna, which have the same issue).
+    text = replace_once(text, JS_CACHE, JS_CACHE_NEW, where)
+    return text + "\n" + JS_TAIL
 
 
 def patch_bridge_text(text: str) -> str:

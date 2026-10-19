@@ -38,6 +38,19 @@ async def test_autosave_on_delete_writes_file_and_logs(tmp_path):
         assert (e["child"], e["reason"], e["outcome"]) == ("a", "close", "ok") and "path" not in e
 
 
+async def test_autosave_runs_before_a_tool_that_drops_the_work(tmp_path):
+    before = ChildSpec("a", "a_", (sys.executable, FAKE, "a"), {}, Autosave("save", ARGS, before_tools=("echo",)))
+    with run_app([before], state_dir=str(tmp_path), autosave_interval=0) as r:
+        async with r.raw() as http:
+            sid, _ = await raw_init(http, r.url)
+            await call(http, r, sid, "a_echo")  # nothing to save yet
+            assert not r.logged("autosave")
+            await call(http, r, sid, "a_echo", rid=3)  # saves the first call's work, then runs
+            assert json.loads(saved_file(tmp_path, sid).read_text()) == {"saves": 1}
+            (e,) = r.logged("autosave")
+            assert (e["reason"], e["outcome"]) == ("before echo", "ok")
+
+
 async def test_not_dirty_means_no_call(tmp_path):
     with run_app([spec()], state_dir=str(tmp_path), autosave_interval=0) as r:
         async with r.raw() as http:

@@ -21,7 +21,8 @@ _spec.loader.exec_module(pr)
 
 PACKAGE = os.environ.get("REA_PACKAGE")
 
-JS = "\n".join(pr.JS_NEEDS) + "\nconst client = clientFactory({ " + pr.JS_SITE + " a: 1 }) });\n"
+JS = ("\n".join(pr.JS_NEEDS) + "\n" + pr.JS_CACHE
+      + "\nconst client = clientFactory({ " + pr.JS_SITE + " a: 1 }) });\n")
 JAVA = "\n".join(pr.BRIDGE_NEEDS) + "\n" + pr.CLASS_DECL + "\n" + pr.SPACE_DECL + """
     void run() { sessionDefaultAddressSpace =
         x(); }
@@ -36,6 +37,8 @@ class AnchorLogic(unittest.TestCase):
         js = pr.patch_js_text(JS)
         self.assertEqual(js.count(pr.JS_SITE_NEW), 1)
         self.assertEqual(js.count("function __reboxAttach("), 1)
+        self.assertIn(pr.JS_CACHE_NEW, js)
+        self.assertIn("invalidateAnalysisCaches();\n            reboxSeenModification", pr.patch_bridge_text(JAVA))
         java = pr.patch_bridge_text(JAVA)
         self.assertNotIn("sessionDefaultAddressSpace", java)
         self.assertIn("SESSION_SPACE.set(x());", java)
@@ -44,7 +47,7 @@ class AnchorLogic(unittest.TestCase):
 
     def test_missing_or_duplicate_anchor_fails(self):
         for broken in (JS.replace(pr.JS_SITE, "launcher: other"), JS + pr.JS_SITE,
-                       JS.replace("ghidraJavaLaunch;", "javaLaunch;")):
+                       JS.replace("ghidraJavaLaunch;", "javaLaunch;"), JS.replace(pr.JS_CACHE, "")):
             with self.assertRaises(pr.PatchError):
                 pr.patch_js_text(broken)
         for broken in (JAVA.replace(pr.DISPATCH, "x();"), JAVA + pr.CLASS_DECL,
@@ -79,6 +82,7 @@ class PinnedRea(unittest.TestCase):
         js = chunk.read_text()
         self.assertEqual(js.count(pr.MARK), 1)
         self.assertEqual(js.count(pr.JS_SITE_NEW), 1)
+        self.assertEqual(js.count(pr.JS_CACHE_NEW), 1)
         subprocess.run(["node", "--check", str(chunk)], check=True)
         java = bridge.read_text()
         self.assertNotIn("sessionDefaultAddressSpace", java)
