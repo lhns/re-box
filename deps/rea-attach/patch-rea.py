@@ -47,8 +47,9 @@ function __reboxAttach(target) {
 			"REBOX_REA_ATTACH_HELPER is not set or the target has no path (REBOX_REA_ATTACH=0 for REA's own JVM)");
 	return { javaLaunch: async (options) => {
 		const environment = { ...options.environment };
+		// REA gives its child a sanitized environment: pass on what the helper needs.
 		for (const [key, value] of Object.entries(process.env))
-			if (key.startsWith("REBOX_") && value !== undefined) environment[key] = value;
+			if ((key.startsWith("REBOX_") || key === "GHIDRA_MCP_AUTH_TOKEN") && value !== undefined) environment[key] = value;
 		return { command: process.execPath, arguments: [helper, "--target", target.path, ...options.arguments],
 			environment, configuredMaxHeap: undefined };
 	} };

@@ -8,6 +8,7 @@ the anchor-logic tests run.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -73,6 +74,20 @@ try {
         self.assertEqual(run({"REBOX_REA_ATTACH_HELPER": "/h.mjs"}), "helper")
         self.assertEqual(run({}), "error")
         self.assertEqual(run({"REBOX_REA_ATTACH": "0"}), "own-jvm")
+
+    def test_helper_gets_rebox_and_token_env_only(self):
+        """REA sanitizes its child's environment; the helper needs REBOX_* and ghidra-mcp's token."""
+        probe = pr.JS_TAIL + """
+__reboxAttach({ path: "/work/x" }).javaLaunch({ environment: { PATH: "/bin" }, arguments: ["a"] })
+    .then((l) => console.log(JSON.stringify([l.arguments, l.environment])));
+"""
+        env = {"PATH": os.environ["PATH"], "REBOX_REA_ATTACH_HELPER": "/h.mjs", "REBOX_INSTANCE": "i",
+               "GHIDRA_MCP_AUTH_TOKEN": "tok", "GHIDRA_MCP_URL": "x", "SECRET": "s"}
+        out = subprocess.run(["node", "-e", probe], env=env, capture_output=True, text=True, check=True).stdout
+        arguments, environment = json.loads(out)
+        self.assertEqual(arguments[1:], ["--target", "/work/x", "a"])
+        self.assertEqual(environment, {"PATH": "/bin", "REBOX_REA_ATTACH_HELPER": "/h.mjs", "REBOX_INSTANCE": "i",
+                                       "GHIDRA_MCP_AUTH_TOKEN": "tok"})
 
     def test_refuses_to_patch_twice(self):
         with self.assertRaises(pr.PatchError):
