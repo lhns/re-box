@@ -73,8 +73,8 @@ The work dir holds only the targets and what tools or agents write there explici
   evicted from ghidra-mcp's open-program cache;
 - every `REBOX_AUTOSAVE_INTERVAL` seconds (default 300; `0` disables): the supervisor saves every
   changed program (after waiting for running auto-analysis, as ghidra-mcp's save does);
-- shutdown: on SIGTERM the supervisor starts a save at once, then sends `exit_ghidra`, which saves
-  again and stops the JVM; the JVM's shutdown hook saves too if it gets a bare SIGTERM.
+- shutdown: on SIGTERM the supervisor starts a save at once (waiting up to 30 s for it), then sends
+  `exit_ghidra`, which saves again and stops the JVM; the JVM's shutdown hook saves too if it gets a bare SIGTERM.
 
 **REA** keeps each session's analysis in that session's REA process. The aggregator calls REA's
 `export_evidence_bundle` to `rea/evidence/<session>.json` (overwritten each time, written
@@ -94,7 +94,7 @@ Sessions without REA calls write nothing. `<session>` is the session tag the con
 | --- | --- | --- | --- | --- |
 | client ends the session, or it idles out | kept (the headless server and its project outlive sessions) | gone, by design | exported at session end | kept |
 | `docker stop` with enough grace (`stop_grace_period: 120s`, `--stop-timeout 120`) | **everything saved** | gone | **exported** for every session | kept |
-| `docker stop` with Docker's default 10 s | saved: the save starts at SIGTERM (measured: done 1.6 s after it, 145 ms for the save). Only a save that must first wait for long-running auto-analysis can be cut off; then edits since the last save are lost | gone | exported unless a session's export is still running at the SIGKILL | kept |
+| `docker stop` with Docker's default 10 s | saved: the save starts at SIGTERM (measured: done 1.6 s after it, 145 ms for the save). Only a save that must first wait for long-running auto-analysis can be cut off (the shutdown waits at most 30 s for it before `exit_ghidra`); then edits since the last save are lost | gone | exported unless a session's export is still running at the SIGKILL | kept |
 | `docker kill`, host crash, power loss | edits since the last save (at most one `REBOX_AUTOSAVE_INTERVAL`) lost; imported programs survive (an import saves). The project opens at its last save; the stale lock is taken over on the next start (verified) | gone | changes since the last periodic export lost | kept |
 | OOM kill of the headless JVM (largest process at the defaults) | edits since the last save lost; the supervisor restarts the JVM with backoff and reopens the project; sessions stay up, `gh_` calls fail until it is back | unaffected | unaffected | kept |
 | OOM kill of a REA Ghidra JVM | unaffected | that call fails; REA reports it and can start a new JVM | unaffected | kept |
