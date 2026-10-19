@@ -15,9 +15,10 @@ Docker Desktop, 20 CPUs, 64 GB, BuildKit, empty build cache (2026-10-19):
 
 | | |
 | --- | --- |
-| cold build of `test` (all stages, incl. the suite) | 37 min (`install-tools.sh` 15 min, the suite 9 min) |
-| test stage, peak RSS of the services | 2.7 GiB (headless JVM + one REA Ghidra JVM at a time) |
-| `final` image | see the report / `docker image ls` |
+| cold build of `test` (all stages, incl. the suite) | 37 min (`install-tools.sh` 15 min, the suite 9-11 min) |
+| cold build of `final` | 40 min |
+| test stage, peak RSS of the services | 2.5-2.7 GiB (headless JVM + one REA Ghidra JVM at a time) |
+| `final` image | 3.66 GB uncompressed |
 
 Rootless BuildKit in a pod is slower than Docker Desktop; allow about twice the local time.
 
