@@ -96,10 +96,12 @@ def run_app(children=None, **overrides):
     server = make_server(app)
     loops: list = []
 
+    async def main() -> None:
+        loops.append(asyncio.get_running_loop())
+        await server.serve()
+
     def serve() -> None:
-        loop = asyncio.new_event_loop()
-        loops.append(loop)
-        loop.run_until_complete(server.serve())
+        asyncio.run(main())  # cancels what the server leaves running (sse_starlette tasks) and closes the loop
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()

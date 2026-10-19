@@ -81,6 +81,14 @@ def _tool_error(text: str) -> dict:
     return {"content": [{"type": "text", "text": text}], "isError": True}
 
 
+def _changed_kinds(old: ChildCatalog, new: ChildCatalog) -> list[str]:
+    """The list_changed kinds that tell a client about the difference between two listings of a child."""
+    kinds = [k for k in ("tools", "prompts") if getattr(old, k) != getattr(new, k)]
+    if (old.resources, old.templates) != (new.resources, new.templates):
+        kinds.append("resources")
+    return kinds
+
+
 class Session:
     def __init__(
         self,
@@ -251,15 +259,15 @@ class Session:
 
     async def _autosave(self, child: Child, reason: str) -> None:
         """Persist a child's work through its configured tool. Never touches last_activity."""
-        if not (child.spec.autosave and self.settings.state_dir) or child.dead or child.name not in self._dirty:
+        if not (child.spec.autosave and self.settings.state_dir) or child.dead:
             return
         tool, args = self._autosave_call(child)
         lock = self._save_locks.setdefault(child.name, anyio.Lock())
         start = time.monotonic()
         outcome, error = "timeout", None
         with anyio.move_on_after(self.settings.autosave_timeout):
-            async with lock:
-                if child.name not in self._dirty or child.dead:  # a concurrent save already covered it
+            async with lock:  # also when clean: a save in flight must finish before close goes on
+                if child.name not in self._dirty or child.dead:  # clean, or a concurrent save covered it
                     return
                 self._dirty.discard(child.name)
                 try:
@@ -275,8 +283,9 @@ class Session:
                     outcome, error = "rpc_error", e.message
                 except OSError as e:
                     outcome, error = "rpc_error", f"cannot create directory: {e.strerror}"
-        if outcome != "ok":
-            self._dirty.add(child.name)  # retried by the next periodic save
+                finally:
+                    if outcome != "ok":  # also on timeout or a cancelled caller: retried by the next save
+                        self._dirty.add(child.name)
         log(
             "autosave",
             "info" if outcome == "ok" else "warn",
@@ -628,9 +637,10 @@ class Session:
             part = await self._fetch(child, ("tools", "prompts", "resources"), self.parts.get(child.name))
             if self._partial(child, part):
                 return  # not connected after all; its own list_changed brings the full listing
-            if self._adopt(child, part):
-                for kind in ("tools",):
-                    await self._notify_down(f"notifications/{kind}/list_changed", None, None, droppable=False)
+            old = self.parts[child.name]
+            self._adopt(child, part)
+            for kind in _changed_kinds(old, part):
+                await self._notify_down(f"notifications/{kind}/list_changed", None, None, droppable=False)
         except (ChildError, CatalogError) as e:
             log("refresh_failed", "warn", session=self.tag, child=child.name, error=str(e)[:500])
 
@@ -658,8 +668,9 @@ class Session:
         self._boot_tools[spec.name] = {t.get("name") for t in part.tools}
         cached = catalogcache.load(self.settings.state_dir, spec)
         # A live backend does not mean the child has connected to it yet: a listing smaller than the
-        # cache is still the bridge's static one (the rule catalogcache.save uses too).
-        if self.backend_ready() and (cached is None or len(part.tools) >= len(cached.tools)):
+        # cache is still the bridge's static one (the rule catalogcache.save uses too). Without a cache
+        # there is no telling, so that case connects it below.
+        if self.backend_ready() and cached is not None and len(part.tools) >= len(cached.tools):
             self._tg.start_soon(self._save_cache, spec, part)
             return
         if cached is not None:  # advertised now; calls wait for the live catalog (_wait_live)
