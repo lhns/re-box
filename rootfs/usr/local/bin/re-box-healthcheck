@@ -1,6 +1,7 @@
 #!/bin/sh
-# Docker HEALTHCHECK: the aggregator's /healthz, which is ready only while the ghidra-mcp
-# headless server answers and its project is open.
+# Docker HEALTHCHECK: the aggregator's /healthz. 200 while the aggregator is up and the ghidra-mcp
+# server is stopped (it starts with the first session), starting or ready; 503 when it failed or
+# did not start within REBOX_HEADLESS_START_TIMEOUT.
 scheme=http
 [ -n "${REBOX_TLS_CERT:-}" ] && scheme=https
 exec curl -fsS -k --max-time 8 -o /dev/null "$scheme://127.0.0.1:${REBOX_PORT:-8443}/healthz"
