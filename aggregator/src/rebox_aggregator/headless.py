@@ -86,16 +86,13 @@ def headless_command(cfg: SupervisorConfig) -> list[str]:
 
 
 async def ensure_project(http: httpx2.AsyncClient, base: str, projects_dir: Path) -> None:
-    """Fallback when --project did not open it: ghidra-mcp's HTTP API, which only works inside its file root."""
+    """Check that the project is open; if --project did not open it, ask ghidra-mcp to (inside its file root).
+    The .gpr exists by then: Headless._create_project makes it before the JVM starts."""
     info = await http.get(f"{base}/get_project_info")
     info.raise_for_status()
     if info.json().get("has_project"):
         return
-    gpr = projects_dir / f"{PROJECT_NAME}.gpr"
-    if gpr.exists():
-        r = await http.post(f"{base}/open_project", json={"path": str(gpr)})
-    else:
-        r = await http.post(f"{base}/create_project", json={"parentDir": str(projects_dir), "name": PROJECT_NAME})
+    r = await http.post(f"{base}/open_project", json={"path": str(projects_dir / f"{PROJECT_NAME}.gpr")})
     r.raise_for_status()
     # ghidra-mcp answers 200 with {"error": ...} when it cannot open the project, e.g. while another
     # container holds its lock; trust only a re-check.
@@ -121,6 +118,9 @@ class Headless:
     States: stopped, starting, ready, failed (crashed, backing off), stopping (idle stop), shutting_down.
     """
 
+    BACKOFF_START = 5.0  # restart delay after a crash, doubling up to BACKOFF_MAX
+    BACKOFF_MAX = 60.0
+
     def __init__(self, cfg: SupervisorConfig, instance: str, base: str | None = None):
         self.cfg, self.instance = cfg, instance
         self.base = base or f"http://127.0.0.1:{HEADLESS_PORT}"
@@ -133,11 +133,12 @@ class Headless:
         self._idle_stopped = False  # the current process is being stopped for lack of sessions
         self._sessions = False
         self._warming = False
-        self._fail = ""  # why the last start failed, once known (shown in /healthz)
         self._wake = anyio.Event()
         self._starting_since = 0.0
         self._saving = anyio.Lock()  # one save_all_programs at a time
-        self._http = httpx2.AsyncClient(timeout=10)
+        # ghidra-mcp's HTTP port wants the token the JVM inherited (main() makes sure there is one)
+        token = os.environ.get("GHIDRA_MCP_AUTH_TOKEN")
+        self._http = httpx2.AsyncClient(timeout=10, headers={"Authorization": f"Bearer {token}"} if token else None)
 
     @property
     def _want(self) -> bool:
@@ -174,9 +175,12 @@ class Headless:
     def _set(self, state: str, reason: str = "") -> None:
         if state == "starting":
             self._starting_since = time.monotonic()
-        if state != self.state:
+        changed = state != self.state
+        if changed:
             log("headless_state", state=state, **({"reason": reason} if reason else {}))
         self.state, self.reason = state, reason
+        if changed and state == "ready" and self.on_ready:
+            self.on_ready()
 
     def _poke(self) -> None:
         woken, self._wake = self._wake, anyio.Event()
@@ -253,7 +257,7 @@ class Headless:
 
     async def run(self) -> None:
         """Start the headless server while sessions want it; restart it with backoff when it crashes."""
-        backoff = 5.0
+        backoff = self.BACKOFF_START
         while not self._stopping:
             await self._until(lambda: self._want or self._stopping)
             if self._stopping:
@@ -265,12 +269,11 @@ class Headless:
             env["GHIDRA_MCP_IMPORT_SCRIPT_ROOTS"] = str(self.cfg.rea_attach_dir / "import_scripts")
             env["REBOX_INSTANCE"] = self.instance  # lets the shutdown sweep find a stuck JVM too
             started = time.monotonic()
-            self._fail = ""
             self._set("starting")
             if not await self._create_project(env):
                 self._set("failed", "project not created")
                 await self._backoff(backoff)
-                backoff = min(60.0, backoff * 2)
+                backoff = min(self.BACKOFF_MAX, backoff * 2)
                 continue
             if self._stopping:
                 return
@@ -292,20 +295,20 @@ class Headless:
             if self._idle_stopped:  # no sessions, so no REA helpers either
                 self._idle_stopped = False
                 self._set("stopped")
-                backoff = 5.0
+                backoff = self.BACKOFF_START
                 continue
             # A crash: the REA bridges it served are gone. Their helpers would notice within seconds;
             # killing them now makes REA report it at once (reopen the binary to attach again).
             await anyio.to_thread.run_sync(kill_by_command, self.instance, ATTACH_HELPER)
             log("headless_exit", "error", exit_code=proc.returncode)
             if time.monotonic() - started > 60:
-                backoff = 5.0
+                backoff = self.BACKOFF_START
             if not self._want:
                 self._set("stopped")  # nobody is waiting for it; the next session starts it again
                 continue
-            self._set("failed", self._fail or "headless server down")
+            self._set("failed", self.reason or "headless server down")  # the monitor may have said why
             await self._backoff(backoff)
-            backoff = min(60.0, backoff * 2)
+            backoff = min(self.BACKOFF_MAX, backoff * 2)
 
     async def _backoff(self, seconds: float) -> None:
         """Sleep, but wake early when the last session goes away (no point in restarting then)."""
@@ -348,8 +351,7 @@ class Headless:
         try:
             await ensure_project(self._http, self.base, self.cfg.projects_dir)
         except (httpx2.HTTPError, ValueError) as e:
-            self._fail = str(e) if isinstance(e, ProjectError) else "project not open"
-            self._set("failed", self._fail)
+            self._set("failed", str(e) if isinstance(e, ProjectError) else "project not open")
             log("project_failed", "error", error=str(e)[:500])
             self._kill_group(proc, signal.SIGKILL)
             return
@@ -359,8 +361,6 @@ class Headless:
         self._set("ready")
         size, files = await anyio.to_thread.run_sync(dir_size, self.cfg.projects_dir)
         log("project_size", bytes=size, files=files)
-        if self.on_ready:
-            self.on_ready()
         while True:
             await anyio.sleep(POLL_INTERVAL)
             if self.state not in ("ready", "failed"):

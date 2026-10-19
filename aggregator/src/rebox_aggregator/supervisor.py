@@ -1,6 +1,7 @@
 """Container supervisor: ghidra-mcp headless server lifecycle, Ghidra project, and the aggregator app."""
 
 import os
+import secrets
 import signal
 import sys
 import tempfile
@@ -112,6 +113,14 @@ def apply_state_env(cfg: SupervisorConfig) -> None:
 
 
 
+def ensure_mcp_auth_token() -> None:
+    """ghidra-mcp's HTTP port (8089) requires `Authorization: Bearer $GHIDRA_MCP_AUTH_TOKEN` when that is set.
+    Make one per container start unless preset: the JVM, the bridges and REA's helper inherit it, and a JVM
+    restart keeps it, so the bridges survive that. Nothing logs or forwards it."""
+    if not os.environ.get("GHIDRA_MCP_AUTH_TOKEN"):
+        os.environ["GHIDRA_MCP_AUTH_TOKEN"] = secrets.token_hex(32)
+
+
 async def warm_up(cfg: SupervisorConfig, app: App, headless: Headless) -> None:
     """Fill missing catalog caches at container start: run the server once, list the children against it
     exactly as a session would, then let the normal idle stop take the server down again."""
@@ -184,6 +193,7 @@ def main() -> None:
         description="Run the ghidra-mcp headless server and the MCP aggregator; configured through env.",
     ).parse_args()
     harden()
+    ensure_mcp_auth_token()
     try:
         cfg = validate(os.environ)
         _ensure_writable(REA_TMP, "REA's TMPDIR")
