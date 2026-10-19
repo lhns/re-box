@@ -6,6 +6,7 @@ import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 NAME_RE = re.compile(r"^[a-z0-9-]+$")
 
@@ -20,6 +21,15 @@ class ChildSpec:
     prefix: str
     command: tuple[str, ...]
     env: Mapping[str, str] = field(default_factory=dict)
+    autosave: "Autosave | None" = None
+
+
+@dataclass(frozen=True)
+class Autosave:
+    """A child tool that persists the child's work; called on session close and periodically."""
+
+    tool: str  # the child's own (unprefixed) tool name
+    arguments: Mapping[str, Any] = field(default_factory=dict)  # {state_dir} and {session} are substituted
 
 
 @dataclass(frozen=True)
@@ -35,6 +45,19 @@ class Settings:
     child_grace: float = 5.0
     init_timeout: float = 120.0
     max_body: int = 16 * 1024 * 1024
+    state_dir: str = ""  # empty: autosave disabled
+    autosave_interval: float = 300.0  # 0: only on session close
+    autosave_timeout: float = 20.0
+
+
+def _autosave(name: str, raw: Any) -> Autosave | None:
+    if raw is None:
+        return None
+    tool = raw.get("tool") if isinstance(raw, dict) else None
+    args = raw.get("arguments", {}) if isinstance(raw, dict) else None
+    if not (isinstance(tool, str) and tool) or not isinstance(args, dict):
+        raise ConfigError(f"child {name}: autosave needs a non-empty tool name and an arguments table")
+    return Autosave(tool, dict(args))
 
 
 def load_children(path: str) -> tuple[ChildSpec, ...]:
@@ -56,7 +79,7 @@ def load_children(path: str) -> tuple[ChildSpec, ...]:
         env = c.get("env", {})
         if not all(isinstance(v, str) for v in env.values()):
             raise ConfigError(f"child {name}: env values must be strings")
-        specs.append(ChildSpec(name, str(c.get("prefix", "")), tuple(command), dict(env)))
+        specs.append(ChildSpec(name, str(c.get("prefix", "")), tuple(command), dict(env), _autosave(name, c.get("autosave"))))
     if not specs:
         raise ConfigError(f"no [[child]] entries in {path}")
     if len({s.name for s in specs}) != len(specs):
@@ -104,6 +127,11 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
     max_sessions = _num(env, "REBOX_MAX_SESSIONS", 4, int)
     if max_sessions < 1:
         raise ConfigError("REBOX_MAX_SESSIONS must be at least 1")
+    state_dir = env.get("REBOX_STATE_DIR", "")
+    interval = _num(env, "REBOX_AUTOSAVE_INTERVAL", 300)
+    timeout = _num(env, "REBOX_AUTOSAVE_TIMEOUT", 20)
+    if interval < 0 or timeout <= 0:
+        raise ConfigError("REBOX_AUTOSAVE_INTERVAL must be >= 0 and REBOX_AUTOSAVE_TIMEOUT > 0")
     return Settings(
         token=token,
         children=load_children(env.get("REBOX_CONFIG", "/etc/rebox/aggregator.toml")),
@@ -116,4 +144,7 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
         child_grace=_num(env, "REBOX_CHILD_GRACE", 5),
         init_timeout=_num(env, "REBOX_INIT_TIMEOUT", 120),
         max_body=_num(env, "REBOX_MAX_BODY_BYTES", 16 * 1024 * 1024, int),
+        state_dir=state_dir,
+        autosave_interval=interval,
+        autosave_timeout=timeout,
     )

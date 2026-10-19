@@ -3,8 +3,8 @@
 # re-box: ghidra-mcp + REA behind one authenticated MCP endpoint. Stages:
 #   pins -> base -> ghidra, ghidra-mcp, rea -> runtime-core -> runtime -> test -> final
 # `final` copies a marker that only a passing `test` stage writes, so building `final` (the
-# ImageBuild target) always runs the test suite. Pins live in versions.env; docs/DECISIONS.md
-# says why each departure from the spec exists.
+# release image CI builds; an in-cluster ImageBuild also works) always runs the test suite.
+# Pins live in versions.env; docs/DECISIONS.md says why each departure from the spec exists.
 
 # --- pins: versions.env split per component, so a bump rebuilds only the stages that use it.
 FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS pins
@@ -158,7 +158,10 @@ RUN --mount=type=bind,from=pins,source=/pins/tools.env,target=/run/pins.env     
 ENV REA_RIZIN_COMMAND=/usr/local/bin/rizin     REA_OBJDUMP_COMMAND=/usr/bin/objdump     REA_GDB_COMMAND=/usr/bin/gdb     REA_JADX_MCP_JAR=/opt/rebox/tools/jadx/jadx-headless-mcp.jar     REA_JADX_HEAP_MIB=2048     REA_APKTOOL_COMMAND=/usr/local/bin/apktool     REA_ADB_PATH=/usr/bin/adb     REA_BINWALK_COMMAND=/usr/local/bin/binwalk     REA_UNBLOB_COMMAND=/usr/local/bin/unblob     REA_FIRMWARE_PRLIMIT_COMMAND=/usr/bin/prlimit     REA_TSHARK_COMMAND=/usr/bin/tshark     REA_CAPINFOS_COMMAND=/usr/bin/capinfos     REA_TSHARK_PRLIMIT_COMMAND=/usr/bin/prlimit     REA_SIGROK_COMMAND=/usr/bin/sigrok-cli     REA_SIGROK_PRLIMIT_COMMAND=/usr/bin/prlimit     REA_WABT_BIN_DIRECTORY=/opt/rebox/tools/wabt/bin     REA_PWNTOOLS_PYTHON=/opt/rebox/tools/pwntools/bin/python     REA_PWNDBG_GDB=/usr/bin/gdb     REA_PWNDBG_GDBINIT=/opt/rebox/tools/pwndbg/src/gdbinit.py     REA_PWNDBG_VENV_PATH=/opt/rebox/tools/pwndbg/venv     REA_MITMDUMP_COMMAND=/opt/rebox/tools/mitmproxy/mitmdump     REA_BROWSER_EXECUTABLE=/opt/rebox/tools/chrome/chrome     REA_BROWSER_NO_SANDBOX=true
 COPY aggregator /src/aggregator
 RUN UV_PROJECT_ENVIRONMENT=/opt/rebox/venv uv sync -q --frozen --no-dev --no-editable --project /src/aggregator \
- && rm -rf /src /root/.cache
+ && rm -rf /src /root/.cache /tmp/hsperfdata_root /tmp/uv-* /var/tmp/*
+# A fresh named volume at /work is root-owned otherwise, and the uid-1000 supervisor refuses it.
+# 0755 home: the PUID remap's `usermod` must read it without CAP_DAC_OVERRIDE (it is empty).
+RUN mkdir -p /work && chown 1000:1000 /work && chmod 0755 /home/rebox
 COPY --chmod=0755 rootfs/usr/local/bin/ /usr/local/bin/
 COPY rootfs/usr/local/lib/rebox/ /usr/local/lib/rebox/
 COPY rootfs/etc/rebox/ /etc/rebox/
@@ -172,6 +175,7 @@ ENV RE_WORKDIR=/work \
     REBOX_PORT=8443 \
     REBOX_MAX_SESSIONS=4 \
     REBOX_SESSION_IDLE_TIMEOUT=1800 \
+    REBOX_AUTOSAVE_INTERVAL=300 \
     JAVA_OPTS="-Xmx4g -XX:+UseG1GC" \
     GHIDRA_HEADLESS_MAXMEM=1536m \
     GHIDRA_MCP_ALLOW_SCRIPTS=0 \
@@ -182,6 +186,9 @@ ENV RE_WORKDIR=/work \
     REA_MCP_OUTPUT_SCHEMA_PROFILE=full \
     REA_LOG_LEVEL=warn \
     HOME=/home/rebox
+LABEL org.opencontainers.image.source="https://github.com/lhns/re-box" \
+      org.opencontainers.image.title="re-box" \
+      org.opencontainers.image.description="Ghidra, ghidra-mcp and REA behind one authenticated MCP endpoint"
 EXPOSE 8443
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5m --retries=3 CMD ["/usr/local/bin/re-box-healthcheck"]
 USER 1000:1000

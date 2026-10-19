@@ -1,7 +1,7 @@
 """Shared setup for the e2e suite. tests/run-tests.sh starts the container's services and sets:
 
-REBOX_URL, REBOX_TOKEN, RE_WORKDIR (fixtures copied in), GHIDRA_PROJECTS_DIR, PUID, PGID,
-REBOX_INSTANCE.
+REBOX_URL, REBOX_TOKEN, RE_WORKDIR (fixtures copied in), REBOX_STATE_DIR, PUID, PGID,
+REBOX_INSTANCE, REBOX_E2E_PHASE (unset for the first run, `restart` for the run after a restart).
 """
 from __future__ import annotations
 
@@ -19,7 +19,9 @@ COMPUTE_MULTIPLIER = ("0x539", "1337")
 URL = os.environ["REBOX_URL"]
 TOKEN = os.environ["REBOX_TOKEN"]
 WORKDIR = Path(os.environ["RE_WORKDIR"])
-PROJECTS = Path(os.environ.get("GHIDRA_PROJECTS_DIR", WORKDIR / "ghidra-projects"))
+STATE = Path(os.environ.get("REBOX_STATE_DIR") or WORKDIR / "re-box-state")
+PROJECTS = Path(os.environ.get("GHIDRA_PROJECTS_DIR") or STATE / "ghidra-projects")
+PHASE = os.environ.get("REBOX_E2E_PHASE", "first")
 INSTANCE = os.environ["REBOX_INSTANCE"]
 
 _durations: list[tuple[str, str, float]] = []

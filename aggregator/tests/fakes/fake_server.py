@@ -1,7 +1,7 @@
 """Raw JSON-RPC stdio MCP server (no SDK) for the aggregator tests.
 
 Env: FAKE_EXTRA_TOOLS=a,b adds no-op tools; FAKE_BIG=N adds a tool whose description is N bytes;
-FAKE_FAIL_INIT=1 exits during initialize; FAKE_HANG_INIT=1 never answers it.
+FAKE_SAVE_SLEEP=N delays the `save` tool (it writes its `path` argument); FAKE_FAIL_INIT=1 exits during initialize; FAKE_HANG_INIT=1 never answers it.
 """
 
 import asyncio
@@ -17,6 +17,7 @@ slow_ids: list = []
 replies: list = []
 cancel_events: dict = {}
 extra_tools: list[str] = []
+saves: list[str] = []
 
 
 def tool(name, props=None):
@@ -26,7 +27,7 @@ def tool(name, props=None):
 
 def tools():
     names = ["echo", "pid", "env", "set_state", "get_state", "slow", "get_cancelled", "progress",
-             "add_tool", "crash", "spawn", "structured", "fail", "ask_roots", "bad_msgs"]
+             "add_tool", "crash", "spawn", "structured", "fail", "ask_roots", "bad_msgs", "save"]
     out = [tool(n) for n in names + os.environ.get("FAKE_EXTRA_TOOLS", "").split(",") + extra_tools if n]
     if os.environ.get("FAKE_BIG"):
         t = tool("big")
@@ -49,6 +50,14 @@ async def call(rid, name, args, meta):
         return text(f"dyn:{name}")
     if name == "echo":
         return text(args.get("text", ""))
+    if name == "save":
+        saves.append(args["path"])
+        await asyncio.sleep(float(os.environ.get("FAKE_SAVE_SLEEP", "0")))
+        if os.environ.get("FAKE_SAVE_FAIL"):
+            return text("disk full", isError=True)
+        with open(args["path"], "w") as f:
+            f.write(json.dumps({"saves": len(saves)}))
+        return text("saved")
     if name == "pid":
         return text(str(os.getpid()))
     if name == "env":

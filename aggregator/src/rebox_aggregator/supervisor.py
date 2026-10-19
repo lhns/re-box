@@ -22,16 +22,42 @@ from .log import log
 HEADLESS_PORT = 8089
 PROJECT_NAME = "rebox"
 POLL_INTERVAL = 10.0
+SUBDIRS = ("ghidra-projects", "home", "cache", "rea/evidence")
+# `support/analyzeHeadless` (runs a no-op script) creates the project: ghidra-mcp's HTTP API only
+# creates projects inside GHIDRA_MCP_FILE_ROOT (RE_WORKDIR), and REBOX_STATE_DIR may be elsewhere.
+SCRIPT_PATH = "/usr/local/lib/rebox/ghidra_scripts"
+AUTOSAVE_CLIENT_TIMEOUT = 3600.0  # save_all_programs waits for running auto-analysis
+SHUTDOWN_SAVE_WAIT = 30.0
 
 
 @dataclass(frozen=True)
 class SupervisorConfig:
     workdir: Path
+    state_dir: Path
     projects_dir: Path
     ghidra_dir: str
     jar: str
     java_opts: list[str]
     start_timeout: float
+    autosave_interval: float = 0.0
+
+
+def _dot_element(path: Path) -> bool:
+    return any(part.startswith(".") for part in path.parts[1:])
+
+
+def _ensure_writable(path: Path, what: str) -> None:
+    """Create path and prove it is writable by creating a file in it (os.access misses read-only mounts and ACLs)."""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".rebox-probe-{os.getpid()}"
+        probe.write_bytes(b"")
+        probe.unlink()
+    except OSError as e:
+        raise ConfigError(
+            f"{what} {path} is not writable by uid {os.getuid()} gid {os.getgid()} ({e.strerror}); "
+            "chown it to that user, or start the container as root with PUID/PGID"
+        ) from None
 
 
 def validate(env: Mapping[str, str]) -> SupervisorConfig:
@@ -41,23 +67,49 @@ def validate(env: Mapping[str, str]) -> SupervisorConfig:
     if not workdir_s or not os.path.isdir(workdir_s) or not os.access(workdir_s, os.W_OK):
         raise ConfigError(f"RE_WORKDIR {workdir_s!r} must be an existing writable directory")
     workdir = Path(os.path.abspath(workdir_s))
-    projects = Path(os.path.abspath(env.get("GHIDRA_PROJECTS_DIR") or workdir / "ghidra-projects"))
-    if projects != workdir and workdir not in projects.parents:
-        raise ConfigError(f"GHIDRA_PROJECTS_DIR {projects} must be inside RE_WORKDIR {workdir}")
-    if any(part.startswith(".") for part in projects.parts[1:]):
+    state_s = env.get("REBOX_STATE_DIR") or ""
+    if state_s and not os.path.isabs(state_s):
+        raise ConfigError(f"REBOX_STATE_DIR {state_s!r} must be an absolute path")
+    state = Path(os.path.abspath(state_s or workdir / "re-box-state"))
+    projects_s = env.get("GHIDRA_PROJECTS_DIR") or ""
+    projects = Path(os.path.abspath(projects_s or state / "ghidra-projects"))
+    if _dot_element(projects):
         raise ConfigError(f"GHIDRA_PROJECTS_DIR {projects} has a path element starting with '.', which Ghidra refuses")
     try:
         timeout = float(env.get("REBOX_HEADLESS_START_TIMEOUT", 300))
+        interval = float(env.get("REBOX_AUTOSAVE_INTERVAL", 300))
     except ValueError:
-        raise ConfigError("REBOX_HEADLESS_START_TIMEOUT must be a number") from None
+        raise ConfigError("REBOX_HEADLESS_START_TIMEOUT and REBOX_AUTOSAVE_INTERVAL must be numbers") from None
+    if interval < 0:
+        raise ConfigError("REBOX_AUTOSAVE_INTERVAL must be >= 0")
+    _ensure_writable(state, "REBOX_STATE_DIR")
+    for sub in SUBDIRS:
+        _ensure_writable(state / sub, "REBOX_STATE_DIR")
+    if projects != state / "ghidra-projects":
+        _ensure_writable(projects, "GHIDRA_PROJECTS_DIR")
     return SupervisorConfig(
         workdir=workdir,
+        state_dir=state,
         projects_dir=projects,
         ghidra_dir=env.get("GHIDRA_INSTALL_DIR", "/opt/ghidra"),
         jar=env.get("GHIDRA_MCP_JAR", "/opt/ghidra-mcp/GhidraMCP.jar"),
         java_opts=env.get("JAVA_OPTS", "").split(),
         start_timeout=timeout,
+        autosave_interval=interval,
     )
+
+
+def apply_state_env(cfg: SupervisorConfig) -> None:
+    """Point HOME and the XDG dirs of the services and every child into the state dir."""
+    home = cfg.state_dir / "home"
+    os.environ.update({
+        "REBOX_STATE_DIR": str(cfg.state_dir),
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_DATA_HOME": str(home / ".local/share"),
+        "XDG_STATE_HOME": str(home / ".local/state"),
+        "XDG_CACHE_HOME": str(cfg.state_dir / "cache"),
+    })
 
 
 def headless_command(cfg: SupervisorConfig) -> list[str]:
@@ -66,13 +118,15 @@ def headless_command(cfg: SupervisorConfig) -> list[str]:
         jars += sorted(glob.glob(f"{cfg.ghidra_dir}/Ghidra/{group}/*/lib/*.jar"))
     return [
         "java", *cfg.java_opts, "-Djava.awt.headless=true", f"-Dghidra.home={cfg.ghidra_dir}",
+        f"-Duser.home={cfg.state_dir / 'home'}",  # the JVM takes it from passwd, not $HOME
         "-Dapplication.name=GhidraMCP", "-classpath", ":".join(jars),
         "com.xebyte.headless.GhidraMCPHeadlessServer", "--port", str(HEADLESS_PORT), "--bind", "127.0.0.1",
+        "--project", str(cfg.projects_dir / f"{PROJECT_NAME}.gpr"),
     ]
 
 
 async def ensure_project(http: httpx2.AsyncClient, base: str, projects_dir: Path) -> None:
-    """Open the rebox project, creating it on first start."""
+    """Fallback when --project did not open it: ghidra-mcp's HTTP API, which only works inside its file root."""
     info = await http.get(f"{base}/get_project_info")
     info.raise_for_status()
     if info.json().get("has_project"):
@@ -94,6 +148,7 @@ class Headless:
         self._proc: anyio.abc.Process | None = None
         self._healthy = False
         self._stopping = False
+        self._saving = anyio.Lock()  # one save_all_programs at a time
         self._http = httpx2.AsyncClient(timeout=10)
 
     def health(self) -> tuple[bool, str]:
@@ -115,6 +170,55 @@ class Headless:
                 if line.strip():
                     log("headless_log", line=line.rstrip()[:2000])
 
+    async def _create_project(self, env: dict[str, str]) -> bool:
+        """First start: create the empty project with the headless analyzer (see SCRIPT_PATH)."""
+        if (self.cfg.projects_dir / f"{PROJECT_NAME}.gpr").exists():
+            return True
+        cmd = [
+            f"{self.cfg.ghidra_dir}/support/analyzeHeadless", str(self.cfg.projects_dir), PROJECT_NAME,
+            "-scriptPath", SCRIPT_PATH, "-preScript", "ReboxNoop.java",
+        ]
+        out = b""
+        try:
+            with anyio.fail_after(self.cfg.start_timeout):
+                res = await anyio.run_process(cmd, env=env, check=False, stderr=-2)
+            out, ok = res.stdout, res.returncode == 0
+        except (TimeoutError, OSError) as e:
+            ok = False
+            out = str(e).encode()
+        if not ok or not (self.cfg.projects_dir / f"{PROJECT_NAME}.gpr").exists():
+            tail = out.decode(errors="replace").strip().splitlines()[-20:]
+            log("project_failed", "error", error="project creation failed", output=tail)
+            return False
+        return True
+
+    async def save_all(self, reason: str) -> None:
+        """Save every open program; skipped while another save runs. Failures only warn."""
+        if self._saving.locked() or not self._healthy:
+            return
+        async with self._saving:
+            start = time.monotonic()
+            try:
+                r = await self._http.post(f"{self.base}/save_all_programs", timeout=AUTOSAVE_CLIENT_TIMEOUT)
+                r.raise_for_status()
+                body = r.json()
+                saved, errors = int(body.get("saved_count") or 0), len(body.get("errors") or [])
+            except (httpx2.HTTPError, ValueError, AttributeError, TypeError) as e:
+                log("autosave", "warn", component="ghidra", reason=reason, error=(str(e) or type(e).__name__)[:300])
+                return
+            if saved or errors:
+                log(
+                    "autosave", "warn" if errors else "info", component="ghidra", reason=reason, saved_count=saved,
+                    errors=errors, duration_ms=round((time.monotonic() - start) * 1000),
+                )
+
+    async def _autosave_loop(self) -> None:
+        interval = self.cfg.autosave_interval
+        while interval > 0:
+            await anyio.sleep(interval)
+            if not self._stopping:
+                await self.save_all("interval")
+
     async def run(self) -> None:
         """Start the headless server, keep it healthy, restart it with backoff when it exits."""
         backoff = 5.0
@@ -122,15 +226,20 @@ class Headless:
             env = {k: v for k, v in os.environ.items() if not k.startswith("REBOX_")}
             env["GHIDRA_MCP_FILE_ROOT"] = str(self.cfg.workdir)
             env["REBOX_INSTANCE"] = self.instance  # lets the shutdown sweep find a stuck JVM too
-            self.cfg.projects_dir.mkdir(parents=True, exist_ok=True)
             started = time.monotonic()
             self.reason = "starting"
+            if not await self._create_project(env):
+                self.reason = "project not created"
+                await anyio.sleep(backoff)
+                backoff = min(60.0, backoff * 2)
+                continue
             self._proc = proc = await anyio.open_process(
                 headless_command(self.cfg), env=env, stdout=-1, stderr=-2, start_new_session=True
             )
             async with anyio.create_task_group() as tg:
                 tg.start_soon(self._relay, proc)
                 tg.start_soon(self._monitor, proc, tg.cancel_scope)
+                tg.start_soon(self._autosave_loop)
                 await proc.wait()
                 tg.cancel_scope.cancel()
             self._healthy = False
@@ -227,7 +336,15 @@ async def supervise(cfg: SupervisorConfig, app: App) -> int:
                     tg.start_soon(shutdown)
 
         async def shutdown() -> None:
-            await app.shutdown()
+            # Saved first and concurrently: a short `docker stop` grace may end before the sessions are closed.
+            # Bounded, since a save waits for running auto-analysis; exit_ghidra saves again anyway.
+            async def early_save() -> None:
+                with anyio.move_on_after(SHUTDOWN_SAVE_WAIT):
+                    await headless.save_all("shutdown")
+
+            async with anyio.create_task_group() as stg:
+                stg.start_soon(early_save)
+                stg.start_soon(app.shutdown)
             await headless.stop(skip)
             server.should_exit = True
 
@@ -255,6 +372,7 @@ def main() -> None:
     harden()
     try:
         cfg = validate(os.environ)
+        apply_state_env(cfg)
         settings = load_settings()
     except ConfigError as e:
         print(f"rebox-supervisor: {e}", file=sys.stderr)

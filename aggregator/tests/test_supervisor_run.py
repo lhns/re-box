@@ -24,14 +24,19 @@ def test_supervisor_lifecycle(tmp_path):
     java.chmod(0o755)
     work = tmp_path / "work"
     work.mkdir()
+    ghidra = tmp_path / "ghidra"
+    (ghidra / "support").mkdir(parents=True)
+    ah = ghidra / "support" / "analyzeHeadless"  # stand-in: creates <dir>/<name>.gpr like the real one
+    ah.write_text('#!/bin/sh\ntouch "$1/$2.gpr"\necho "$HOME" > "$1/analyze-home"\n')
+    ah.chmod(0o755)
     marker = tmp_path / "marker"
     cfg = tmp_path / "agg.toml"
     cfg.write_text(f'[[child]]\nname = "a"\nprefix = "a_"\ncommand = ["{sys.executable}", "{FAKES / "fake_server.py"}", "a"]\n')
     port = free_port()
     env = {
-        **{k: v for k, v in os.environ.items() if k != "GHIDRA_PROJECTS_DIR"}, "PATH": f"{bindir}:{os.environ['PATH']}", "REBOX_TOKEN": "tok", "REBOX_PORT": str(port),
+        **{k: v for k, v in os.environ.items() if k not in ("GHIDRA_PROJECTS_DIR", "REBOX_STATE_DIR")}, "PATH": f"{bindir}:{os.environ['PATH']}", "REBOX_TOKEN": "tok", "REBOX_PORT": str(port),
         "REBOX_BIND": "127.0.0.1", "REBOX_CONFIG": str(cfg), "RE_WORKDIR": str(work), "FAKE_MARKER": str(marker),
-        "REBOX_INSTANCE": "supervisor-test", "REBOX_HEADLESS_START_TIMEOUT": "30",
+        "REBOX_INSTANCE": "supervisor-test", "GHIDRA_INSTALL_DIR": str(ghidra), "REBOX_AUTOSAVE_INTERVAL": "1", "REBOX_HEADLESS_START_TIMEOUT": "30",
     }
     proc = subprocess.Popen([SUPERVISOR], env=env, stdout=subprocess.PIPE, text=True)
     try:
@@ -45,7 +50,13 @@ def test_supervisor_lifecycle(tmp_path):
                 time.sleep(0.2)
         else:
             pytest.fail("supervisor never became healthy")
-        assert f'/create_project {{"parentDir": "{work / "ghidra-projects"}", "name": "rebox"}}' in marker.read_text()
+        state = work / "re-box-state"
+        assert f"start project={state}/ghidra-projects/rebox.gpr home={state}/home user.home=['-Duser.home={state}/home'] cache={state}/cache" in marker.read_text()
+        assert (state / "ghidra-projects" / "analyze-home").read_text().strip() == f"{state}/home"
+        deadline = time.time() + 15
+        while "/save_all_programs" not in marker.read_text() and time.time() < deadline:
+            time.sleep(0.2)
+        assert "/save_all_programs" in marker.read_text()
         assert "env_token=False" in marker.read_text()
 
         r = httpx2.post(f"{base}/mcp", json=INIT, headers={**RAW_HEADERS, "Authorization": "Bearer tok"})

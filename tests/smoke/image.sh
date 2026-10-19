@@ -12,6 +12,25 @@ set -e
 [ "$rc" = 2 ] || fail "supervisor without REBOX_TOKEN exited $rc: $out"
 grep -q REBOX_TOKEN <<<"$out" || fail "no REBOX_TOKEN message: $out"
 
+# State dir checks run before any service starts: one line, exit 2.
+sup() { as_rebox env -u REBOX_TOKEN_FILE REBOX_TOKEN=t HOME=/home/rebox RE_WORKDIR=/tmp "$@" /opt/rebox/venv/bin/rebox-supervisor 2>&1; }
+expect_refused() { # <what> <output> <rc>
+  [ "$3" = 2 ] || fail "$1 exited $3: $2"
+  grep -q REBOX_STATE_DIR <<<"$2" || fail "$1: no REBOX_STATE_DIR in message: $2"
+  [ "$(wc -l <<<"$2")" = 1 ] || fail "$1: not exactly one line: $2"
+}
+ro=$(mktemp -d); chmod 0755 "$ro"
+set +e
+out=$(sup REBOX_STATE_DIR="$ro/state"); rc=$?
+expect_refused "unwritable state dir" "$out" $rc
+out=$(sup REBOX_STATE_DIR=relative/state); rc=$?
+expect_refused "relative state dir" "$out" $rc
+out=$(sup REBOX_STATE_DIR=/tmp/.dot/state); rc=$?
+set -e
+[ "$rc" = 2 ] && [ "$(wc -l <<<"$out")" = 1 ] && grep -q "'.'" <<<"$out" || fail "dot-element state dir: rc=$rc $out"
+[ ! -e /tmp/.dot ] || fail "dot-element state dir was created"
+rm -rf "$ro"
+
 # Started directly as uid 1000 (Kubernetes runAsUser): no remap, PUID/PGID ignored with a warning.
 out=$(as_rebox env PUID=4321 PGID=4321 /usr/local/bin/re-box-entrypoint id -u 2>&1)
 grep -q 'ignoring them' <<<"$out" || fail "no PUID warning in uid-1000 mode: $out"

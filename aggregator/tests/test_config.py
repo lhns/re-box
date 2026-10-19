@@ -43,3 +43,42 @@ def test_instance_id_honours_env(monkeypatch):
     assert instance_id() == "run-1"
     monkeypatch.setenv("REBOX_INSTANCE", "bad id!")
     assert instance_id() != "bad id!"
+
+
+AUTOSAVE = GOOD + '[child.autosave]\ntool = "export_evidence_bundle"\narguments = { path = "{state_dir}/rea/{session}.json", overwrite = true }\n'
+
+
+def test_autosave_parsed(tmp_path):
+    (spec,) = load_children(toml(tmp_path, AUTOSAVE))
+    assert spec.autosave.tool == "export_evidence_bundle"
+    assert dict(spec.autosave.arguments) == {"path": "{state_dir}/rea/{session}.json", "overwrite": True}
+    assert load_children(toml(tmp_path, GOOD))[0].autosave is None
+
+
+@pytest.mark.parametrize("bad", [
+    '[child.autosave]\ntool = ""\n',
+    '[child.autosave]\narguments = {}\n',
+    '[child.autosave]\ntool = "x"\narguments = "no"\n',
+])
+def test_bad_autosave(tmp_path, bad):
+    with pytest.raises(ConfigError, match="autosave"):
+        load_children(toml(tmp_path, GOOD + bad))
+
+
+def test_shipped_config_has_rea_autosave():
+    from pathlib import Path
+
+    repo = Path(__file__).parents[2] / "rootfs/etc/rebox/aggregator.toml"  # in the image: the installed copy
+    specs = {s.name: s for s in load_children(str(repo if repo.exists() else "/etc/rebox/aggregator.toml"))}
+    assert specs["rea"].autosave.tool == "export_evidence_bundle" and specs["ghidra"].autosave is None
+
+
+def test_autosave_settings(tmp_path):
+    cfg = toml(tmp_path, GOOD)
+    s = load_settings({"REBOX_TOKEN": "t", "REBOX_CONFIG": cfg})
+    assert (s.state_dir, s.autosave_interval, s.autosave_timeout) == ("", 300, 20)
+    s = load_settings({"REBOX_TOKEN": "t", "REBOX_CONFIG": cfg, "REBOX_STATE_DIR": "/s", "REBOX_AUTOSAVE_INTERVAL": "0"})
+    assert (s.state_dir, s.autosave_interval) == ("/s", 0)
+    for bad in ("-1", "x"):
+        with pytest.raises(ConfigError):
+            load_settings({"REBOX_TOKEN": "t", "REBOX_CONFIG": cfg, "REBOX_AUTOSAVE_INTERVAL": bad})

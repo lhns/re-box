@@ -13,7 +13,9 @@ export REBOX_TOKEN="e2e-$(head -c24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 export REBOX_PORT=18443
 export REBOX_URL="http://127.0.0.1:$REBOX_PORT/mcp"
 export RE_WORKDIR=/tmp/rebox-e2e/work
-export GHIDRA_PROJECTS_DIR=$RE_WORKDIR/ghidra-projects
+# Outside RE_WORKDIR on purpose: exercises the analyzeHeadless + --project path. The supervisor
+# (as PUID) creates it.
+export REBOX_STATE_DIR=/tmp/rebox-e2e/state
 LOG=/tmp/rebox-e2e/services.log
 MEM=/tmp/rebox-e2e/rss.log
 
@@ -52,10 +54,35 @@ step "start services (root -> uid $PUID)"
 rm -rf /tmp/rebox-e2e && mkdir -p "$RE_WORKDIR"
 cp /opt/rebox/fixtures/* "$RE_WORKDIR/"
 chown -R "$PUID:$PGID" "$RE_WORKDIR"
+chown "$PUID:$PGID" /tmp/rebox-e2e  # test scaffolding: lets the supervisor create the state dir
 chmod 0644 "$RE_WORKDIR"/*
-# Own session and process group, like the container's PID 1 would give it.
-setsid env REBOX_INSTANCE="$REBOX_INSTANCE" /usr/local/bin/re-box-entrypoint /opt/rebox/venv/bin/rebox-supervisor >"$LOG" 2>&1 &
-sup_pid=$!
+start_services() {
+  # Own session and process group, like the container's PID 1 would give it.
+  setsid env REBOX_INSTANCE="$REBOX_INSTANCE" /usr/local/bin/re-box-entrypoint /opt/rebox/venv/bin/rebox-supervisor >>"$LOG" 2>&1 &
+  sup_pid=$!
+  local start
+  start=$(date +%s)
+  until curl -fs -o /dev/null "http://127.0.0.1:$REBOX_PORT/healthz"; do
+    kill -0 "$sup_pid" 2>/dev/null || { cat "$LOG"; echo "supervisor exited during startup" >&2; exit 1; }
+    [ $(( $(date +%s) - start )) -lt 600 ] || { tail -100 "$LOG"; echo "not ready after 600 s" >&2; exit 1; }
+    sleep 1
+  done
+  echo "ready after $(( $(date +%s) - start )) s"
+}
+
+# SIGTERM the supervisor and check that it exits 0 and leaves nothing of the instance behind.
+stop_services() {
+  kill -TERM "$sup_pid"
+  for _ in $(seq 120); do kill -0 "$sup_pid" 2>/dev/null || break; sleep 0.5; done
+  if kill -0 "$sup_pid" 2>/dev/null; then echo "supervisor ignored SIGTERM for 60 s" >&2; e2e=1; fi
+  sup_rc=0; wait "$sup_pid" || sup_rc=$?
+  left=$(instance_pids)
+  if [ -n "$left" ]; then echo "processes left after shutdown: $left" >&2; ps -o pid,args -p $left >&2 || true; e2e=1; fi
+  [ "$sup_rc" = 0 ] || { echo "supervisor exit code $sup_rc" >&2; e2e=1; }
+}
+
+: >"$LOG"
+start_services
 # RSS of everything in the instance, for sizing the ImageBuild resources.
 ( peak=0; while sleep 2; do
     kb=0; for p in $(instance_pids) $sup_pid; do
@@ -63,13 +90,6 @@ sup_pid=$!
     [ "$kb" -gt "$peak" ] && peak=$kb && echo "$peak" > "$MEM"
   done ) &
 sampler=$!
-start=$(date +%s)
-until curl -fs -o /dev/null "http://127.0.0.1:$REBOX_PORT/healthz"; do
-  kill -0 "$sup_pid" 2>/dev/null || { cat "$LOG"; echo "supervisor exited during startup" >&2; exit 1; }
-  [ $(( $(date +%s) - start )) -lt 600 ] || { tail -100 "$LOG"; echo "not ready after 600 s" >&2; exit 1; }
-  sleep 1
-done
-echo "ready after $(( $(date +%s) - start )) s"
 
 step "e2e"
 set +e
@@ -79,14 +99,20 @@ e2e=$?
 set -e
 
 step "graceful shutdown"
-kill -TERM "$sup_pid"
-for _ in $(seq 120); do kill -0 "$sup_pid" 2>/dev/null || break; sleep 0.5; done
-if kill -0 "$sup_pid" 2>/dev/null; then echo "supervisor ignored SIGTERM for 60 s" >&2; e2e=1; fi
-sup_rc=0; wait "$sup_pid" || sup_rc=$?
-left=$(instance_pids)
-if [ -n "$left" ]; then echo "processes left after shutdown: $left" >&2; ps -o pid,args -p $left >&2 || true; e2e=1; fi
-[ "$sup_rc" = 0 ] || { echo "supervisor exit code $sup_rc" >&2; e2e=1; }
+stop_services
 grep -q '"event": *"session_open"' "$LOG" || { echo "no session_open log line" >&2; e2e=1; }
+
+if [ "$e2e" = 0 ]; then
+  # Same work and state dirs: what a SIGTERM stop must have kept (project edits, REA evidence).
+  step "restart on the same state"
+  start_services
+  set +e
+  (cd "$TESTS/e2e" && REBOX_INSTANCE="$REBOX_INSTANCE" REBOX_E2E_PHASE=restart as_puid "$PY" -m pytest -v -p no:cacheprovider -rA test_restart.py)
+  e2e=$?
+  set -e
+  step "graceful shutdown (2)"
+  stop_services
+fi
 echo "peak RSS of the instance: $(( $(cat "$MEM" 2>/dev/null || echo 0) / 1024 )) MiB"
 
 if [ "$e2e" != 0 ]; then

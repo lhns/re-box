@@ -263,6 +263,7 @@ async def test_old_jvm_group_killed_before_restart(tmp_path, monkeypatch):
     java.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bindir}:{os.environ['PATH']}")
     cfg = validate({"REBOX_TOKEN": "t", "RE_WORKDIR": str(tmp_path), "REBOX_HEADLESS_START_TIMEOUT": "5"})
+    (cfg.projects_dir / "rebox.gpr").write_text("")  # skip project creation
     h = Headless(cfg, "i")
     with anyio.move_on_after(3):
         await h.run()  # returns only on stop; it sleeps in backoff after the JVM "exits"

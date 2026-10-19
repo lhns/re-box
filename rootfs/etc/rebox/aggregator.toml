@@ -5,6 +5,12 @@
 name = "rea"
 prefix = "rea_"
 command = ["/usr/local/bin/rea", "mcp"]
+# REA's database is private to the process; its evidence bundle is the supported way to keep
+# annotations. Run on session close and periodically when REBOX_STATE_DIR is set; {state_dir} and
+# {session} are substituted.
+[child.autosave]
+tool = "export_evidence_bundle"
+arguments = { path = "{state_dir}/rea/evidence/{session}.json", overwrite = true }
 
 [[child]]
 name = "ghidra"

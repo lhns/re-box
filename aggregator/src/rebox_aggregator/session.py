@@ -98,6 +98,8 @@ class Session:
         self._up_by_child: dict[tuple[str, Any], tuple[int, anyio.CancelScope]] = {}
         self._up_ids = itertools.count(1)
         self._refreshing: dict[str, set[str]] = {}
+        self._dirty: set[str] = set()  # children that served a tools/call since their last autosave
+        self._save_locks: dict[str, anyio.Lock] = {}
         self._closing: str | None = None
         self._closed = anyio.Event()
         self._ws: Any = None
@@ -118,6 +120,8 @@ class Session:
                     task_status.started()
                     tg.start_soon(self._write_downstream)
                     tg.start_soon(self._idle_watch)
+                    if self._autosave_on() and self.settings.autosave_interval > 0:
+                        tg.start_soon(self._autosave_loop)
                     try:
                         async for item in read:
                             self.last_activity = time.monotonic()
@@ -127,6 +131,7 @@ class Session:
                             await self._on_downstream(item.message, item.metadata)
                     except (anyio.ClosedResourceError, anyio.BrokenResourceError):
                         pass
+                    await self.close("disconnect")  # while the child tasks still run, so the autosave can answer
                     tg.cancel_scope.cancel()
         except Exception as e:  # session-local: never take the app's task group down
             log("internal_error", "error", session=self.tag, error=repr(e)[:500])
@@ -140,6 +145,9 @@ class Session:
             return
         self._closing = reason
         with anyio.CancelScope(shield=True):
+            async with anyio.create_task_group() as tg:
+                for child in self.children.values():
+                    tg.start_soon(self._autosave, child, "close")
             async with anyio.create_task_group() as tg:
                 for child in self.children.values():
                     tg.start_soon(child.close)
@@ -166,6 +174,74 @@ class Session:
             # A long call may legitimately keep a session quiet; a client silent for 4x is gone.
             if idle > timeout and (not self._inflight or idle > 4 * timeout):
                 await self.close("idle")
+
+    # -- autosave ---------------------------------------------------------
+
+    def _autosave_on(self) -> bool:
+        return bool(self.settings.state_dir) and any(s.autosave for s in self.settings.children)
+
+    def _autosave_call(self, child: Child) -> tuple[str, dict]:
+        spec = child.spec.autosave
+        assert spec
+        subs = {"{state_dir}": self.settings.state_dir, "{session}": self.tag}
+
+        def fill(v: Any) -> Any:
+            if isinstance(v, str):
+                for k, new in subs.items():
+                    v = v.replace(k, new)
+                return v
+            if isinstance(v, dict):
+                return {k: fill(x) for k, x in v.items()}
+            if isinstance(v, list):
+                return [fill(x) for x in v]
+            return v
+
+        return spec.tool, fill(dict(spec.arguments))
+
+    async def _autosave(self, child: Child, reason: str) -> None:
+        """Persist a child's work through its configured tool. Never touches last_activity."""
+        if not (child.spec.autosave and self.settings.state_dir) or child.dead or child.name not in self._dirty:
+            return
+        tool, args = self._autosave_call(child)
+        lock = self._save_locks.setdefault(child.name, anyio.Lock())
+        start = time.monotonic()
+        outcome, error = "timeout", None
+        with anyio.move_on_after(self.settings.autosave_timeout):
+            async with lock:
+                if child.name not in self._dirty or child.dead:  # a concurrent save already covered it
+                    return
+                self._dirty.discard(child.name)
+                try:
+                    os.makedirs(os.path.dirname(args.get("path") or "") or ".", exist_ok=True)
+                    result = await child.request("tools/call", {"name": tool, "arguments": args}, bypass=True)
+                    outcome = "ok"
+                    if result.get("isError"):
+                        outcome = "tool_error"
+                        error = " ".join(c.get("text", "") for c in result.get("content") or [] if isinstance(c, dict))
+                except ChildError as e:
+                    outcome, error = "rpc_error", e.message
+                except OSError as e:
+                    outcome, error = "rpc_error", f"cannot create directory: {e.strerror}"
+        if outcome != "ok":
+            self._dirty.add(child.name)  # retried by the next periodic save
+        log(
+            "autosave",
+            "info" if outcome == "ok" else "warn",
+            session=self.tag,
+            child=child.name,
+            reason=reason,
+            outcome=outcome,
+            duration_ms=round((time.monotonic() - start) * 1000),
+            **({"error": error[:300]} if error else {}),
+        )
+
+    async def _autosave_loop(self) -> None:
+        while True:
+            await anyio.sleep(self.settings.autosave_interval)
+            for child in list(self.children.values()):
+                busy = any(fl.child is child for fl in self._inflight.values())
+                if not (self._closing or busy):
+                    await self._autosave(child, "interval")
 
     async def on_exit(self, child: Child) -> None:
         if self.initialized and not self._closing and all(c.dead for c in self.children.values()):
@@ -355,6 +431,8 @@ class Session:
         try:
             return await child.request(method, params, on_id=set_id)
         finally:
+            if method == "tools/call":
+                self._dirty.add(child.name)
             if owns:
                 self._tokens.pop(key, None)
 

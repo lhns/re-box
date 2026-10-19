@@ -14,7 +14,7 @@ from pathlib import Path
 import httpx2 as httpx
 import pytest
 
-from conftest import (COMPUTE_MARKERS, COMPUTE_MULTIPLIER, INSTANCE, PROJECTS, TOKEN, URL,
+from conftest import (COMPUTE_MARKERS, COMPUTE_MULTIPLIER, INSTANCE, PROJECTS, STATE, TOKEN, URL,
                       fixture_path, record)
 from mcpclient import McpError, Session
 
@@ -245,14 +245,14 @@ def test_08_auth():
         assert health.status_code == 200
 
 
-# --- 9. ownership of files written to RE_WORKDIR
+# --- 9. ownership of everything the services wrote to the state dir
 def test_09_ownership():
     """Runs in the PUID/PGID remap mode (container started as root). The uid-1000 mode is
     covered by tests/smoke/image.sh: there no remap happens and files belong to the runtime uid."""
     puid, pgid = int(os.environ["PUID"]), int(os.environ["PGID"])
-    files = [p for p in PROJECTS.rglob("*")]
-    assert files, "test_03 should have written the project"
-    wrong = [(str(p), p.stat().st_uid, p.stat().st_gid) for p in files if (p.stat().st_uid, p.stat().st_gid) != (puid, pgid)]
+    files = [p for p in STATE.rglob("*")]
+    assert any(p.is_relative_to(PROJECTS) for p in files), "test_03 should have written the project"
+    wrong = [(str(p), p.lstat().st_uid, p.lstat().st_gid) for p in files if (p.lstat().st_uid, p.lstat().st_gid) != (puid, pgid)]
     assert not wrong, wrong[:5]
 
 

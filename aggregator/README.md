@@ -30,7 +30,8 @@ token), `REBOX_INIT_TIMEOUT` (120 s, per child, covers spawn + `initialize` + li
 exceeds it is killed and counts as failed), `REBOX_MAX_BODY_BYTES` (16 MiB; larger POSTs get HTTP 413), `REBOX_PORT` (8443),
 `REBOX_BIND` (0.0.0.0), `REBOX_TLS_CERT`/`REBOX_TLS_KEY` (both or neither), `REBOX_MAX_SESSIONS`
 (4), `REBOX_SESSION_IDLE_TIMEOUT` (1800 s), `REBOX_CHILD_GRACE` (5 s), `REBOX_CONFIG`
-(`/etc/rebox/aggregator.toml`).
+(`/etc/rebox/aggregator.toml`), `REBOX_STATE_DIR` (the supervisor exports the resolved path; empty
+disables autosave), `REBOX_AUTOSAVE_INTERVAL` (300 s, 0 = only on close), `REBOX_AUTOSAVE_TIMEOUT` (20 s).
 
 Children (TOML), generic so more servers can be added without code changes:
 
@@ -41,7 +42,16 @@ prefix = "rea_"              # prepended to tool and prompt names
 command = ["/usr/local/bin/rea", "mcp"]   # absolute path required
 [child.env]                  # forced: overrides the container env
 REA_LOG_LEVEL = "warn"
+[child.autosave]             # optional: a child tool that persists its work
+tool = "export_evidence_bundle"   # the child's own (unprefixed) tool name
+arguments = { path = "{state_dir}/rea/evidence/{session}.json", overwrite = true }  # {state_dir}, {session} substituted
 ```
+
+Autosave runs when `REBOX_STATE_DIR` is set, for children that served a `tools/call` since their
+last save (dirty): on session close (all reasons, concurrently, before the children are closed,
+each bounded by `REBOX_AUTOSAVE_TIMEOUT`) and every `REBOX_AUTOSAVE_INTERVAL` seconds while no
+request is in flight to that child. It never counts as session activity. Logged as `autosave`
+(`reason`, `outcome` ok/tool_error/rpc_error/timeout, `duration_ms`); failures only warn.
 
 A child's environment is the container env **minus every `REBOX_*` variable** (the token is not
 handed to children or the targets REA executes; a same-uid process could still read a token
@@ -70,7 +80,8 @@ supervisor's random instance id) and `REBOX_SESSION` (the session tag, below).
   `server/discover` probes), gets HTTP 400 with JSON-RPC error `-32022` and
   `data: {"supported": [...handshake versions...], "requested": <header or "">}`; clients fall back
   to `initialize`. GET/DELETE without a session id: 400. Unknown session id: 404, `-32001`.
-- **Close:** on DELETE, idle timeout, supervisor shutdown, or once every child is dead: (1) close
+- **Close:** on DELETE, idle timeout, supervisor shutdown, or once every child is dead: (0) autosave
+  the live children; (1) close
   each child's stdin and wait up to 2 s; (2) SIGTERM its process group, wait `REBOX_CHILD_GRACE`;
   (3) SIGKILL the group; (4) SIGKILL any remaining process whose `/proc/<pid>/environ` holds
   this `REBOX_SESSION` and `REBOX_INSTANCE`. Then terminate the transport (later requests: 404).
@@ -141,26 +152,37 @@ results.**
 ## Supervisor
 
 1. Refuse to start (exit 2, one clear line) without a token, if `RE_WORKDIR` is missing or
-   not writable, if `GHIDRA_PROJECTS_DIR` (default `$RE_WORKDIR/ghidra-projects`) is outside
-   `RE_WORKDIR` (`GHIDRA_MCP_FILE_ROOT` is `RE_WORKDIR`) or has a path element starting with `.`
-   (Ghidra refuses those).
-2. Set `REBOX_INSTANCE` to a random id in its own environment, unless it is already set (the
+   not writable, if `REBOX_STATE_DIR` (default `$RE_WORKDIR/re-box-state`; absolute) cannot be
+   created or written (checked with a temp file) or if `GHIDRA_PROJECTS_DIR` (default
+   `$REBOX_STATE_DIR/ghidra-projects`, any absolute path) has a path element starting with `.`
+   (Ghidra refuses those). It creates `ghidra-projects/`, `home/`, `cache/` and `rea/evidence/`
+   under the state dir as the running user and never chowns. `GHIDRA_MCP_FILE_ROOT` stays
+   `RE_WORKDIR`.
+2. Export `HOME=$STATE/home`, `XDG_{CONFIG,DATA,STATE}_HOME` below it and `XDG_CACHE_HOME=$STATE/cache`
+   (inherited by the JVM and every child). Set `REBOX_INSTANCE` to a random id in its own environment, unless it is already set (the
    test-stage runner sets it to find every process of the instance).
 3. Start the headless server in its own process group:
    `java $JAVA_OPTS -Djava.awt.headless=true -Dghidra.home=$GHIDRA_INSTALL_DIR
    -Dapplication.name=GhidraMCP -classpath <jar>:<Ghidra/{Framework,Features,Processors}/*/lib/*.jar>
-   com.xebyte.headless.GhidraMCPHeadlessServer --port 8089 --bind 127.0.0.1`, env minus `REBOX_*` plus
+   com.xebyte.headless.GhidraMCPHeadlessServer --port 8089 --bind 127.0.0.1
+   --project <projects>/rebox.gpr` (plus `-Duser.home=$STATE/home`), env minus `REBOX_*` plus
    `REBOX_INSTANCE`,
-   with `GHIDRA_MCP_FILE_ROOT=$RE_WORKDIR` forced; its output relayed as `headless_log` lines.
+   with `GHIDRA_MCP_FILE_ROOT=$RE_WORKDIR` forced; if `rebox.gpr` is missing it is first created with
+   `analyzeHeadless <dir> rebox -preScript ReboxNoop.java` (the HTTP API cannot create projects
+   outside the file root); its output relayed as `headless_log` lines.
 4. Wait for `GET http://127.0.0.1:8089/check_connection` to answer `{"status":"ok",...}`
-   (`REBOX_HEADLESS_START_TIMEOUT`, 300 s). Then ensure the project: `GET /get_project_info`;
-   if `has_project` is false, `POST /open_project {"path": "<dir>/rebox.gpr"}` when it exists,
+   (`REBOX_HEADLESS_START_TIMEOUT`, 300 s). Then check the project: `GET /get_project_info`;
+   if `has_project` is false (fallback, works only inside the file root), `POST /open_project {"path": "<dir>/rebox.gpr"}` when it exists,
    else `POST /create_project {"parentDir": "<dir>", "name": "rebox"}` (JSON bodies).
 5. Serve the app. `/healthz` is 200 only while the headless process runs, its last
    `check_connection` (polled every 10 s) succeeded and the project is open; else 503 with the
    reason.
+   Every `REBOX_AUTOSAVE_INTERVAL` seconds a separate task `POST`s `/save_all_programs`
+   (sequential, never overlapping; logged as `autosave` with `component: ghidra` when something
+   was saved or failed).
 6. If the headless server exits unexpectedly, restart it with backoff (5 s doubling to 60 s) and
    redo step 4; sessions stay up.
-7. SIGTERM/SIGINT: refuse new sessions, close all sessions, `POST /exit_ghidra` (saves all
+7. SIGTERM/SIGINT: at once `POST /save_all_programs` (concurrently with closing the sessions, so a
+   short `docker stop` grace cannot lose it; waited for at most 30 s), refuse new sessions, close all sessions, `POST /exit_ghidra` (saves all
    programs), wait up to 60 s for the JVM, then SIGTERM/SIGKILL its group, then SIGKILL anything
    left with this `REBOX_INSTANCE`; exit 0. A second signal skips the waits.

@@ -8,7 +8,12 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 port = int(sys.argv[sys.argv.index("--port") + 1])
 marker = os.environ["FAKE_MARKER"]
-project = {"open": False}
+args = sys.argv
+gpr = args[args.index("--project") + 1] if "--project" in args else ""
+project = {"open": bool(gpr) and os.path.exists(gpr)}
+with open(marker, "a") as f:
+    f.write(f"start project={gpr} home={os.environ.get('HOME')} user.home={[a for a in args if a.startswith('-Duser.home=')]} "
+            f"cache={os.environ.get('XDG_CACHE_HOME')}\n")
 
 
 class H(BaseHTTPRequestHandler):
@@ -33,7 +38,7 @@ class H(BaseHTTPRequestHandler):
         with open(marker, "a") as f:
             f.write(f"{self.path} {json.dumps(body)} env_token={'REBOX_TOKEN' in os.environ}\n")
         project["open"] = True
-        self.reply({"success": True})
+        self.reply({"success": True, "saved_count": 0, "errors": []})
         if self.path == "/exit_ghidra":
             threading.Thread(target=lambda: os._exit(0)).start()
 
