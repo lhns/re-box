@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 #
 # re-box: ghidra-mcp + REA behind one authenticated MCP endpoint. Stages:
-#   pins -> base -> ghidra, ghidra-mcp, rea -> runtime-core -> runtime -> test -> final
+#   pins -> base -> ghidra, ghidra-mcp, rea (-> rea-attach) -> runtime-core -> runtime -> test -> final
 # `final` copies a marker that only a passing `test` stage writes, so building `final` (the
 # release image CI builds; an in-cluster ImageBuild also works) always runs the test suite.
 # Pins live in versions.env; docs/DECISIONS.md says why each departure from the spec exists.
@@ -123,6 +123,18 @@ npm ci --omit=dev --ignore-scripts --no-audit --no-fund --fetch-retries=5
 rm -rf /root/.npm
 EOS
 
+# --- rea-attach: REA's Ghidra sessions attach to the ghidra-mcp JVM (deps/rea-attach,
+# DECISIONS.md). The tests check the patch anchors against this REA release first; any mismatch
+# fails the build. Copied into `runtime` late, so a patch change does not rebuild the tools.
+FROM rea AS rea-attach
+RUN --mount=type=bind,source=deps/rea-attach,target=/src/rea-attach <<'EOS'
+set -eu
+cd /src/rea-attach
+REA_PACKAGE=/opt/rea/node_modules/rea-agents python3 -B -m unittest -q test_patch_rea
+python3 -B patch-rea.py /opt/rea/node_modules/rea-agents /opt/rebox/rea-attach/ghidra_scripts
+install -m 0644 ReboxReaAttach.java helper.mjs /opt/rebox/rea-attach/
+EOS
+
 # --- fixtures: test binaries (spec 8.2).
 FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS fixtures
 RUN apt-get update \
@@ -158,6 +170,12 @@ RUN --mount=type=bind,from=pins,source=/pins/tools.env,target=/run/pins.env     
 # absolute paths, and compares REA_BROWSER_NO_SANDBOX to the string "true": Chromium's sandbox
 # needs user namespaces the container does not grant, the container is the sandbox.
 ENV REA_RIZIN_COMMAND=/usr/local/bin/rizin     REA_OBJDUMP_COMMAND=/usr/bin/objdump     REA_GDB_COMMAND=/usr/bin/gdb     REA_JADX_MCP_JAR=/opt/rebox/tools/jadx/jadx-headless-mcp.jar     REA_JADX_HEAP_MIB=2048     REA_APKTOOL_COMMAND=/usr/local/bin/apktool     REA_ADB_PATH=/usr/bin/adb     REA_BINWALK_COMMAND=/usr/local/bin/binwalk     REA_UNBLOB_COMMAND=/usr/local/bin/unblob     REA_FIRMWARE_PRLIMIT_COMMAND=/usr/bin/prlimit     REA_TSHARK_COMMAND=/usr/bin/tshark     REA_CAPINFOS_COMMAND=/usr/bin/capinfos     REA_TSHARK_PRLIMIT_COMMAND=/usr/bin/prlimit     REA_SIGROK_COMMAND=/usr/bin/sigrok-cli     REA_SIGROK_PRLIMIT_COMMAND=/usr/bin/prlimit     REA_WABT_BIN_DIRECTORY=/opt/rebox/tools/wabt/bin     REA_PWNTOOLS_PYTHON=/opt/rebox/tools/pwntools/bin/python     REA_PWNDBG_GDB=/usr/bin/gdb     REA_PWNDBG_GDBINIT=/opt/rebox/tools/pwndbg/src/gdbinit.py     REA_PWNDBG_VENV_PATH=/opt/rebox/tools/pwndbg/venv     REA_MITMDUMP_COMMAND=/opt/rebox/tools/mitmproxy/mitmdump     REA_BROWSER_EXECUTABLE=/opt/rebox/tools/chrome/chrome     REA_BROWSER_NO_SANDBOX=true
+# REA's patched `rea mcp` chunk and the attach files (stage rea-attach). The patched bridge must
+# still compile against this Ghidra, or sessions would fail at open.
+COPY --from=rea-attach /opt/rea/node_modules/rea-agents/dist/mcp /opt/rea/node_modules/rea-agents/dist/mcp
+COPY --from=rea-attach /opt/rebox/rea-attach /opt/rebox/rea-attach
+RUN --mount=type=bind,source=deps/rea-attach/compile-check.sh,target=/run/compile-check.sh \
+    sh /run/compile-check.sh /opt/ghidra /opt/rebox/rea-attach
 COPY aggregator /src/aggregator
 RUN UV_PROJECT_ENVIRONMENT=/opt/rebox/venv uv sync -q --frozen --no-dev --no-editable --project /src/aggregator \
  && rm -rf /src /root/.cache /tmp/hsperfdata_root /tmp/uv-* /var/tmp/*
@@ -170,19 +188,21 @@ COPY rootfs/etc/rebox/ /etc/rebox/
 # REA's workflow skill for the client side, with tool names prefixed as the aggregator serves
 # them (spec 11). Extract: docker run --rm <image> tar -C /opt/rebox/skills -c . | tar -x -C ~/.claude/skills
 RUN python3 /usr/local/lib/rebox/rewrite-skill.py /opt/rea/node_modules/rea-agents/skills /opt/rebox/skills rea_
-# Defaults; docs/OPERATIONS.md explains each. Memory: JAVA_OPTS heap (headless server) plus up
-# to REBOX_MAX_SESSIONS x GHIDRA_HEADLESS_MAXMEM (one REA Ghidra JVM per session) must fit the
-# container limit with overhead; these fit 16 GiB. The G1 flags give heap back after a burst
-# (REA's own JVMs reject JVM option overrides, so they keep the defaults).
+# Defaults; docs/OPERATIONS.md explains each. Memory: the JAVA_OPTS heap holds ghidra-mcp's and
+# REA's programs (REA attaches to that JVM); GHIDRA_HEADLESS_MAXMEM is the heap of a REA session
+# that still needs its own JVM (raw, DOS, PSP targets). These fit 16 GiB with one such session.
+# The G1 flags give heap back after a burst (REA's own JVMs reject JVM option overrides).
+# GHIDRA_MCP_ALLOW_SCRIPTS: REA's bridge is started through ghidra-mcp's script endpoint; the
+# aggregator denies the script tools to clients (aggregator.toml), and 8089 is loopback-only.
 ENV RE_WORKDIR=/work \
     REBOX_PORT=8443 \
     REBOX_MAX_SESSIONS=4 \
     REBOX_SESSION_IDLE_TIMEOUT=1800 \
     REBOX_GHIDRA_IDLE_TIMEOUT=300 \
     REBOX_AUTOSAVE_INTERVAL=300 \
-    JAVA_OPTS="-Xmx4g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30" \
+    JAVA_OPTS="-Xmx8g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30" \
     GHIDRA_HEADLESS_MAXMEM=1536m \
-    GHIDRA_MCP_ALLOW_SCRIPTS=0 \
+    GHIDRA_MCP_ALLOW_SCRIPTS=1 \
     GHIDRA_MCP_LAZY=0 \
     GHIDRA_MCP_LOG_LEVEL=WARNING \
     REA_ANALYSIS_PROVIDER=ghidra \

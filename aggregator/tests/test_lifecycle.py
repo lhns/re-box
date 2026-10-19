@@ -3,6 +3,7 @@
 import contextlib
 import os
 import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -148,6 +149,42 @@ async def test_last_session_leaving_cancels_the_restart_backoff(tmp_path, monkey
         assert await wait_until(lambda: h.state == "stopped", 10)
         await anyio.sleep(1)
         assert h.starts() == 1
+
+
+async def test_rea_attach_script_installed_at_each_start(tmp_path, monkeypatch):
+    src = tmp_path / "attach"
+    src.mkdir()
+    (src / "ReboxReaAttach.java").write_text("v1")
+    installed = tmp_path / "re-box-state" / "home" / "ghidra_scripts" / "ReboxReaAttach.java"
+    async with headless(tmp_path, monkeypatch, REBOX_GHIDRA_IDLE_TIMEOUT="300", REBOX_REA_ATTACH_DIR=str(src)) as h:
+        h.want(True)
+        await ready(h)
+        assert installed.read_text() == "v1"
+        (src / "ReboxReaAttach.java").write_text("v2")  # an image upgrade
+        os.killpg(h._proc.pid, signal.SIGKILL)
+        assert await wait_until(lambda: h.starts() == 2 and h.ready(), 30)
+        assert installed.read_text() == "v2"
+
+
+async def test_jvm_exit_kills_this_instances_rea_attach_helpers(tmp_path, monkeypatch):
+    def fake_helper(instance):
+        return subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(120)", "/opt/rebox/rea-attach/helper.mjs"],
+            env={**os.environ, "REBOX_INSTANCE": instance},
+        )
+
+    async with headless(tmp_path, monkeypatch, REBOX_GHIDRA_IDLE_TIMEOUT="300") as h:
+        h.want(True)
+        await ready(h)
+        mine, other = fake_helper(h.instance), fake_helper("someone-else")
+        try:
+            os.killpg(h._proc.pid, signal.SIGKILL)
+            assert await wait_until(lambda: mine.poll() is not None, 10)
+            assert other.poll() is None
+        finally:
+            for p in (mine, other):
+                p.kill()
+                p.wait()
 
 
 async def test_starting_past_the_start_timeout_is_unhealthy(tmp_path, monkeypatch):

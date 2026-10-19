@@ -61,9 +61,9 @@ with a native Linux path.
 ### Laptop
 
 Docker Desktop's VM must hold the container limit (Settings, Resources, or `memory=` in
-`.wslconfig`). For an 8 GB VM: `-e REBOX_MAX_SESSIONS=2 -e JAVA_OPTS="-Xmx2g -XX:+UseG1GC"
--e GHIDRA_HEADLESS_MAXMEM=1g --memory 7g`; the formula's worst case is 8 GiB, so this relies on the
-JVMs not peaking together. Sizing: [docs/OPERATIONS.md](docs/OPERATIONS.md), "Memory".
+`.wslconfig`). For an 8 GB VM: `-e REBOX_MAX_SESSIONS=2 -e JAVA_OPTS="-Xmx4g -XX:+UseG1GC"
+-e GHIDRA_HEADLESS_MAXMEM=1g --memory 7g`; a raw or DOS target (REA's own JVM) adds 2 GiB, so
+that case relies on the JVMs not peaking together. Sizing: [docs/OPERATIONS.md](docs/OPERATIONS.md), "Memory".
 
 ## Connect a client
 

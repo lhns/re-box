@@ -154,7 +154,8 @@ docs/CLIENTS.md says when to switch to `compact`/`off`.
   is for the GUI plugin. Upstream's Dockerfile also unpacks the bundled Jython extension; we do
   the same so scripts work if `GHIDRA_MCP_ALLOW_SCRIPTS=1`.
 - **REA per-session heap** is `GHIDRA_HEADLESS_MAXMEM` (fallback `GHIDRA_MAXMEM`, default
-  `2G`; `src/ghidra/GhidraJavaLaunch.ts`).
+  `2G`; `src/ghidra/GhidraJavaLaunch.ts`); since REA attaches to the shared JVM it applies only to
+  targets that still run in REA's own JVM.
 - **Two Python environments:** the ghidra-mcp bridge pins `mcp>=1.28.1,<2`; the aggregator uses
   `mcp` 2.3.0. Each runs from its own venv by absolute path.
 - **Supervision: tini + `rebox-supervisor`, not s6-overlay.** The in-cluster build runs the test
@@ -204,7 +205,7 @@ docs/CLIENTS.md says when to switch to `compact`/`off`.
   raises the cap or the container uses `REA_MCP_INPUT_SCHEMA_PROFILE=compact` and
   `REA_MCP_OUTPUT_SCHEMA_PROFILE=off`. The aggregator does not paginate `tools/list`: clients that
   do not follow `nextCursor` would silently lose tools. Claude Code 2.1.303 handles the full catalog.
-- **Claude Code `-p` exits without DELETE**, so its session (and REA's Ghidra JVM) lives until the
+- **Claude Code `-p` exits without DELETE**, so its session (and REA's open binary) lives until the
   orphan timeout and counts against `REBOX_MAX_SESSIONS` until then or until evicted
   (docs/OPERATIONS.md; "Session timeouts" below).
 
@@ -220,7 +221,8 @@ stops `REBOX_GHIDRA_IDLE_TIMEOUT` (300 s) after the last one closed; an idle con
   rejects overrides, so a shim is ignored. Its bridge extends `HeadlessScript` and needs
   `HeadlessAnalyzer`, a per-JVM singleton with its own project manager, while ghidra-mcp runs
   another. REA also kills its JVM's process group on cancel, which would take ghidra-mcp's unsaved
-  edits with it. (Stage 2 revisits this by hosting REA's bridge inside the ghidra-mcp JVM.)
+  edits with it. Superseded for most targets by "REA attaches to the ghidra-mcp JVM" below,
+  which hosts REA's bridge on a thread instead.
 - **Start on the first session, not the first `gh_` call:** a bridge that boots without Ghidra
   shows only static tools, so the client would never see a `gh_` tool to call. `initialize` is not
   held when a catalog cache exists (39 s against client connect timeouts); the bridge starts at once,
@@ -247,6 +249,76 @@ stops `REBOX_GHIDRA_IDLE_TIMEOUT` (300 s) after the last one closed; an idle con
   503 when failed or starting past `REBOX_HEADLESS_START_TIMEOUT`; the body names the state.
 - **G1 flags** (`G1PeriodicGCInterval=60000`, `MinHeapFreeRatio=10`, `MaxHeapFreeRatio=30`) hand heap
   back after a burst. Not applied to REA's JVMs: REA rejects `JAVA_TOOL_OPTIONS` overrides.
+
+## REA attaches to the ghidra-mcp JVM ("route 1")
+
+**Status:** accepted. Supersedes "separate JVMs" in the entry above for every target ghidra-mcp's
+import can express.
+
+**Context.** REA started one Ghidra JVM per session (AnalyzeHeadless on a throwaway project,
+`-deleteProject`), next to ghidra-mcp's JVM on the persistent `rebox.gpr`: N+1 JVMs, 1.5 GB each,
+and REA's annotations lost at session end (only the evidence export survived).
+
+**Decision.** REA's bridge (`ReaGhidraBridge.java`, the GhidraScript that serves REA's protocol
+over a unix socket) runs on a thread inside the ghidra-mcp JVM, against the program in
+`rebox.gpr`. `deps/rea-attach/patch-rea.py` patches REA at image build: its launcher spawns
+`helper.mjs` instead of a JVM; the helper imports the target through ghidra-mcp's
+`/import_file` (original path under `RE_WORKDIR`; a program of the same name with other bytes
+moves the target to `/rea/<sha12>/`), then starts the bridge through `/run_ghidra_script`
+(`ReboxReaAttach.java`) and lives as long as it. REA's descriptor, token, sha check, process
+ownership and cleanup are unchanged. Targets ghidra-mcp's import can't express (raw, DOS, PSP,
+language overrides, seeds, disabled analyzers, MIPS soft-float, extensions, paths outside
+`RE_WORKDIR`) keep REA's own JVM. Bridge patches (on a copy; REA's own stays for that path):
+`analysisTimeoutOccurred()` returns false (no HeadlessAnalyzer here; the helper starts the bridge
+after analysis), the session's default address space is per thread instead of static, and edits
+run under ghidra-mcp's write lock (below).
+
+Rejected:
+- REA opening `rebox.gpr` itself: blocked by the project lock while ghidra-mcp runs; a Ghidra
+  Server adds a third JVM and check-out/check-in.
+- Dropping REA's Ghidra provider: loses REA's Ghidra workflows.
+- ghidra-mcp per session like REA: loses the shared project, N x 4 GB, a cold start per session,
+  and still needs the attach work.
+- Unmodified bridge in the shared JVM: it calls `analysisTimeoutOccurred()`, which needs a
+  HeadlessAnalyzer, and keeps the address space in a static field.
+
+**Consequences.**
+- One Ghidra JVM; REA's edits persist in the shared project (autosave, shutdown save) and are
+  visible to gh_ tools and to other sessions at once. REA's own texts ("ephemeral",
+  `project_ephemeral`, `persists_after_close: false`) are stale under re-box.
+- ghidra-mcp runs with scripts enabled; `run_ghidra_script`/`run_script_inline` are denied in
+  the aggregator (8089 stays loopback-only, as before). The supervisor copies the host script into
+  `$REBOX_STATE_DIR/home/ghidra_scripts` at every JVM start: ghidra-mcp runs scripts only from
+  there. That script must stay free of compile-time references to `ghidra.app.plugin.core.osgi`
+  (bnd then imports the package twice, Felix refuses the bundle, and every script in the
+  directory stops loading, silently in headless mode).
+- REA's cancel and cleanup kill the helper's process group, never the JVM; the bridge thread
+  ends with the helper (a watchdog in the host script), the helper ends with the bridge (its
+  socket) or the JVM (and the supervisor kills helpers when the JVM exits). REA then reports
+  "provider exited, reopen the binary", as it did for a crashed JVM of its own. An idle stop
+  cannot happen while a session, hence a REA binary, is open.
+- Ghidra merges concurrent transactions into one, so an aborted edit discards the other side's
+  work (measured; ghidra-mcp's `WriteTx` even joins an open transaction on purpose). The bridge
+  runs its edits under ghidra-mcp's write lock (found by reflection), and only when no other
+  transaction is open (it releases the lock while it waits, at most 60 s). Still open: gh_
+  comment and label writes take no lock in headless mode, so one that starts during a REA edit
+  joins it and is lost if that edit aborts (duplicate or invalid name, cancel).
+- REA caches what it has read (inventories, analysis results) for the life of its process, on
+  the assumption that the program does not change under it: renames, functions, labels or
+  strings that gh_ tools or other sessions make later reach REA only in a new MCP session
+  (measured: a rename by another session stayed "unknown procedure" in an open session, even
+  after close and reopen of the binary; a new session found it).
+- Concurrent attaches in one JVM collide on Ghidra's script-bundle file lock (meant for separate
+  JVMs: `OverlappingFileLockException`); the helper retries until the other's build is done.
+- Memory: REA's programs live in the shared heap (`JAVA_OPTS`, now `-Xmx8g`); a session costs
+  about 0.5 GiB outside it (rea node, helper, bridge). `GHIDRA_HEADLESS_MAXMEM` applies only to
+  targets in REA's own JVM.
+- Maintenance per REA release (REA ships about daily): the build tests the patch anchors against
+  the pinned REA and recompiles the patched bridge; a mismatch fails the build, and the patch is
+  re-fitted by hand (typically a moved anchor string). Each ghidra-mcp bump re-checks the
+  reflection path to its write lock (the bridge logs and runs without it if it's gone).
+- Upstream: an opt-in external launcher command in REA would remove the patch
+  (`deps/rea-attach/UPSTREAM.md`, not yet proposed).
 
 ## Session timeouts
 

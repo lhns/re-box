@@ -45,7 +45,14 @@ for bad in 0 00 "" x1; do
 done
 
 # Security defaults.
-[ "${GHIDRA_MCP_ALLOW_SCRIPTS:-}" = 0 ] || fail "GHIDRA_MCP_ALLOW_SCRIPTS is '${GHIDRA_MCP_ALLOW_SCRIPTS:-}'"
+# Scripts are on for REA's attach (DECISIONS.md); clients must not reach the script tools.
+grep -q '^deny = \["run_ghidra_script", "run_script_inline"\]' /etc/rebox/aggregator.toml \
+  || fail "ghidra-mcp's script tools are not denied"
+grep -q '^REBOX_REA_ATTACH_HELPER = "/opt/rebox/rea-attach/helper.mjs"' /etc/rebox/aggregator.toml \
+  || fail "REA attach helper not configured"
+[ -f /opt/rebox/rea-attach/helper.mjs ] && [ -f /opt/rebox/rea-attach/ReboxReaAttach.java ] \
+  && [ -f /opt/rebox/rea-attach/ghidra_scripts/ReaGhidraBridge.java ] || fail "REA attach files missing"
+grep -q 're-box: attach to ghidra-mcp' /opt/rea/node_modules/rea-agents/dist/mcp/main-*.js || fail "REA not patched"
 grep -q 'GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS = "1"' /etc/rebox/aggregator.toml || fail "program selectors not forced"
 
 # The shipped REA skill is rewritten to the prefixed names.

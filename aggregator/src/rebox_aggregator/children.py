@@ -281,6 +281,26 @@ class Child:
             await self._wait_group_gone(2.0)
 
 
+def kill_by_command(instance: str, marker: str) -> int:
+    """SIGKILL this instance's processes whose command line contains `marker`."""
+    wanted = f"REBOX_INSTANCE={instance}".encode()
+    killed = 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                if marker.encode() not in f.read():
+                    continue
+            with open(f"/proc/{entry}/environ", "rb") as f:
+                if wanted in f.read().split(b"\0"):
+                    os.kill(int(entry), signal.SIGKILL)
+                    killed += 1
+        except OSError:
+            continue
+    return killed
+
+
 def kill_leftovers(session: str | None, instance: str) -> int:
     """SIGKILL any process whose environment carries this instance (and session, when given)."""
     wanted = {f"REBOX_INSTANCE={instance}".encode()}
