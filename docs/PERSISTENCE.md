@@ -54,7 +54,7 @@ mode 777); it needs a one-time chown to uid 1000. Docker Desktop was not tested.
 
 | path (under `REBOX_STATE_DIR`) | holds | why keep it | size |
 | --- | --- | --- | --- |
-| `ghidra-projects/rebox.gpr`, `rebox.rep/` | the shared Ghidra project: every program imported with `ghidra_import_file` or opened with `rea_open_binary` (by file name; a different file of the same name goes to `/rea/<sha256 prefix>/`), its auto-analysis, and all `ghidra_` and REA edits (renames, types, comments, bookmarks) | the long-running work. Re-importing a large binary costs its auto-analysis again (hours for big targets) and loses every annotation | several times each imported binary: MBs for small ELFs, GBs for large firmware |
+| `ghidra-projects/rebox.gpr`, `rebox.rep/` | the shared Ghidra project: every program imported with `gh_import_file` or opened with `rea_open_binary` (under `/rea/<sha256 prefix>-<REA profile>/<file name>`, with REA's loader options and scripts), its auto-analysis, and all `gh_` and REA edits (renames, types, comments, bookmarks) | the long-running work. Re-importing a large binary costs its auto-analysis again (hours for big targets) and loses every annotation | several times each imported binary: MBs for small ELFs, GBs for large firmware |
 | `home/` | `HOME` of every service and tool | | small |
 | `home/.config/ghidramcp/ghidramcp_12.1.4_PUBLIC/` | the headless server's Ghidra settings: preferences, tool state, `application.log` and `script.log` (Ghidra's own logs, more detail than the container log); `home/.config/ghidra*`, `rebox-ghidra` are the first-start project creation's | diagnosing after a restart; preferences | small; logs roll at 50 MB (below) |
 | `home/ghidra_scripts/` | `ReboxReaAttach.java`, which starts REA's bridge in the Ghidra JVM (copied from the image at every Ghidra start), and Ghidra's script bundle state | nothing to keep; rewritten at start. Clients cannot run scripts (the aggregator denies ghidra-mcp's script tools) | small |
@@ -92,7 +92,7 @@ Suggested places for an agent's own REA exports (not created automatically): `re
 
 | what | where | why not |
 | --- | --- | --- |
-| REA's per-session runtime (`rea-ghidra-*`: descriptor, socket, target snapshot, logs; for targets in REA's own JVM also its throwaway project) | `/tmp` | REA creates it privately per session and deletes it when the session closes the binary (leftovers of killed sessions are swept at start, above). Only targets ghidra-mcp's import cannot express (raw, DOS COM/MZ, PSP, language overrides, seeds, disabled analyzers, MIPS soft-float, targets outside `RE_WORKDIR`) still run in REA's own JVM with that throwaway project; their edits survive only as the evidence export |
+| REA's per-session runtime (`rea-ghidra-*`: descriptor, socket, target snapshot, logs) | `/tmp/rebox-rea` (REA's `TMPDIR`) | REA creates it privately per session and deletes it when the session closes the binary (leftovers of killed sessions are swept at start, above); the program itself is imported into the project from the snapshot |
 | mitmproxy config and CA, apktool frameworks, extraction scratch | `/tmp`, per REA operation | REA gives each run its own directory (`confdir=<run dir>`, `--frame-path <run dir>`), so there is no long-lived CA to keep or trust. Extraction output a caller wants kept goes to a path the caller names |
 | Ghidra temp files, JVM perf data, ghidra-mcp's socket | `/tmp` | scratch |
 | aggregator and supervisor logs | stdout | the container runtime's logging driver keeps them; Ghidra's own log is under `home/` |
@@ -138,17 +138,14 @@ Sessions without REA calls write nothing. `<session>` is the session tag the con
 | `docker stop` with enough grace (`stop_grace_period: 120s`, `--stop-timeout 120`) | **everything saved** | gone | **exported** for every session | kept |
 | `docker stop` with Docker's default 10 s | saved: the save starts at SIGTERM (measured: done 1.6 s after it, 145 ms for the save). Only a save that must first wait for long-running auto-analysis can be cut off (the shutdown waits at most 30 s for it before `exit_ghidra`); then edits since the last save are lost | gone | exported unless a session's export is still running at the SIGKILL | kept |
 | `docker kill`, host crash, power loss | edits since the last save (at most one `REBOX_AUTOSAVE_INTERVAL`) lost; imported programs survive (an import saves). The project opens at its last save; the stale lock is taken over on the next start (verified) | gone | changes since the last periodic export lost | kept |
-| OOM kill of the headless JVM (largest process at the defaults) | edits since the last save lost; the supervisor restarts the JVM with backoff and reopens the project; sessions stay up, `ghidra_` calls fail until it is back | an open REA binary's calls fail with "provider exited"; `rea_open_binary` again attaches to the restarted JVM | unaffected | kept |
-| OOM kill of a REA Ghidra JVM (targets in REA's own JVM only) | unaffected | that call fails; REA reports it and can start a new JVM | unaffected | kept |
+| OOM kill of the headless JVM (largest process at the defaults) | edits since the last save lost; the supervisor restarts the JVM with backoff and reopens the project; sessions stay up, `gh_` calls fail until it is back | an open REA binary's calls fail with "provider exited"; `rea_open_binary` again attaches to the restarted JVM | unaffected | kept |
 | OOM kill of a session's `rea mcp` process | unaffected | gone | changes since the last periodic export lost; the session's REA tools fail until the client opens a new session | kept |
 | `docker rm`, `compose down`, image upgrade | kept (it is in the mount) | gone | kept | kept |
 
 To keep a REA investigation beyond its session: its renames and comments already are (in the
 project); export REA evidence or snapshots to the state dir before ending the session, and after a
 restart `rea_open_binary` the target (it reopens the same program, annotations included) and
-`rea_import_evidence_bundle` the export. Imported evidence is data for REA's evidence views. For
-targets in REA's own JVM (see "Not in it") annotations end with the session; keep those in a
-`ghidra_` import of the file.
+`rea_import_evidence_bundle` the export. Imported evidence is data for REA's evidence views.
 
 ## Removing programs
 
