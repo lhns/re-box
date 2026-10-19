@@ -1,0 +1,1381 @@
+From 92a3c522b1165325a7dc88464856c6fa3a0b6be8 Mon Sep 17 00:00:00 2001
+From: Pierre Kisters <pierrekisters@gmail.com>
+Date: Mon, 19 Oct 2026 18:54:08 +0000
+Subject: [PATCH] feat(java): import_file runs pre_scripts and post_scripts
+
+A target that needs preparing before analysis (a raw COM image given its
+segment) or fixing after it could not be imported through import_file:
+the client had to import, then run a script on the saved program, and a
+second client could see the half-prepared program in between.
+
+pre_scripts run on the loaded program before its first save, post_scripts
+after auto-analysis, each {path, args} like AnalyzeHeadless -preScript and
+-postScript. A failing pre-script imports nothing; a failing post-script
+removes the import, so a retry starts from the file. The response carries
+script_output; /analysis_status reports a failed wait=false import.
+
+Gated by GHIDRA_MCP_ALLOW_SCRIPTS like every other way to run a script,
+and by the new GHIDRA_MCP_IMPORT_SCRIPT_ROOTS (a path list) when set.
+Only absolute paths to .java files. Each script's directory is enabled as
+its own bundle instead of being copied into ~/ghidra_scripts.
+
+Script loads share one JVM-wide lock: Ghidra's bundle build takes a file
+lock meant for separate JVMs, and two threads of one JVM failed with
+OverlappingFileLockException. /run_ghidra_script took no lock and loaded
+its script twice (getScriptInstance, then runScript(name)); it now
+executes the instance it loaded, under the same lock.
+
+Depends on the import loader options change (ImportRequest, finishImport)
+and on the several-roots change (canonicalRoots/underAny).
+
+Tests: ImportScriptsTest (request shape, the gate, roots, symlink),
+ImportScriptsGhidraTest (real scripts: args, pre/post, failures leave
+nothing behind, refusals, concurrent loads and concurrent
+/run_ghidra_script, both failing without the lock), bridge payload and
+poll tests. tests/endpoints.json edited by hand (no Maven here).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .env.template                                 |   3 +
+ CHANGELOG.md                                  |  24 ++
+ README.md                                     |   1 +
+ docker/README.md                              |   1 +
+ docs/prompts/TOOL_USAGE_GUIDE.md              |   1 +
+ python/bridge_mcp_ghidra/import_tool.py       |  20 +-
+ .../java/com/xebyte/core/ImportRequest.java   |   6 +-
+ .../java/com/xebyte/core/ImportScripts.java   | 141 +++++++
+ .../com/xebyte/core/ProgramScriptService.java | 106 +++++-
+ .../xebyte/core/ProjectProgramProvider.java   |  22 +-
+ .../java/com/xebyte/core/SecurityConfig.java  |  23 +-
+ .../xebyte/core/ImportScriptsGhidraTest.java  | 343 ++++++++++++++++++
+ .../com/xebyte/core/ImportScriptsTest.java    | 114 ++++++
+ .../xebyte/core/ProgramImportGhidraTest.java  |   8 +-
+ .../com/xebyte/offline/ImportRequestTest.java |   9 +-
+ .../ProgramScriptServiceValidationTest.java   |   2 +-
+ .../offline/ProjectProgramProviderTest.java   |   2 +-
+ tests/endpoints.json                          |   4 +-
+ tests/unit/test_static_tools.py               |  44 +++
+ 19 files changed, 837 insertions(+), 37 deletions(-)
+ create mode 100644 src/main/java/com/xebyte/core/ImportScripts.java
+ create mode 100644 src/test/java/com/xebyte/core/ImportScriptsGhidraTest.java
+ create mode 100644 src/test/java/com/xebyte/core/ImportScriptsTest.java
+
+diff --git a/.env.template b/.env.template
+index 3d87fe6..367a7f2 100644
+--- a/.env.template
++++ b/.env.template
+@@ -72,6 +72,9 @@ GHIDRA_MCP_ALLOW_SCRIPTS=
+ # Paths are canonicalized and must resolve under this root. Unset = accept any.
+ # Several roots: separate them with the platform path separator (":" on Linux/macOS, ";" on Windows).
+ GHIDRA_MCP_FILE_ROOT=
++# Directories (same list syntax) that import_file's pre_scripts/post_scripts must lie under.
++# Scripts also need GHIDRA_MCP_ALLOW_SCRIPTS. Unset = any script, once scripts are allowed.
++GHIDRA_MCP_IMPORT_SCRIPT_ROOTS=
+ # Confine project-domain endpoints (open/delete/create) to a project folder
+ # prefix, e.g. /MyFolder/Subfolder. Unset = whole project in scope.
+ GHIDRA_MCP_PROJECT_FOLDER=
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 587f28d..e1f196f 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,30 @@ Complete version history for the Ghidra MCP Server project.
+ 
+ Changes on `dev` after 7.0.0.
+ 
++### Added — `import_file` runs pre- and post-scripts, as AnalyzeHeadless does
++
++A target that needs preparing before it is analyzed (a raw COM image given its segment, an
++analyzer option no loader argument covers, a no-return fix after analysis) could not be
++imported through `import_file`; the client had to import, then run a script on the saved
++program. `pre_scripts` run on the loaded program before its first save and analysis, and
++`post_scripts` after analysis, each `{"path": "/abs/Script.java", "args": [...]}` like
++`-preScript` / `-postScript`. A failing pre-script imports nothing; a failing post-script removes
++the import again, so a retry starts from the file. The response carries `script_output`; a
++`wait=false` import that fails is reported by `/analysis_status`.
++
++Scripts stay behind `GHIDRA_MCP_ALLOW_SCRIPTS`, and the new `GHIDRA_MCP_IMPORT_SCRIPT_ROOTS`
++(a path list) restricts them to vetted directories, so a server can run its own import scripts
++without clients naming arbitrary code. Only absolute paths to `.java` files are accepted. Each
++script's directory is enabled as its own bundle (not copied into `~/ghidra_scripts`).
++
++### Fixed — concurrent script runs collided in Ghidra's bundle build
++
++Ghidra guards a bundle build with a file lock meant for separate JVMs; two threads of one JVM
++building at once failed with `OverlappingFileLockException`. Every script load now takes one
++JVM-wide lock (`ImportScripts.LOAD_LOCK`). `/run_ghidra_script` also ran its script with
++`runScript(name, args)`, which loaded it a second time outside any lock; it now executes the
++instance it already loaded.
++
+ ### Added — `import_file` takes the loader options AnalyzeHeadless takes
+ 
+ A raw firmware image needs a load address, a DOS `.COM` needs `BinaryLoader` at `1000:0100`, an
+diff --git a/README.md b/README.md
+index 5e25c22..7a74d83 100644
+--- a/README.md
++++ b/README.md
+@@ -720,6 +720,7 @@ GhidraMCP is designed for **localhost-only development**. The default configurat
+ | `GHIDRA_MCP_AUTH_TOKEN` | When set, every HTTP request must carry `Authorization: Bearer <token>`. Timing-safe comparison. `/mcp/health` and `/check_connection` are exempt. |
+ | `GHIDRA_MCP_ALLOW_SCRIPTS` | Set to `1`, `true`, or `yes` to enable `/run_script_inline` and `/run_ghidra_script`. **Off by default as of v5.4.1** — these endpoints execute arbitrary Java against the Ghidra process. In headless mode this also triggers OSGi `BundleHost` initialization at server startup (Felix framework, ~hundreds of ms); leave it off if you don't need script execution. |
+ | `GHIDRA_MCP_FILE_ROOT` | When set to a directory path, filesystem-path endpoints (`/import_file`, `/open_project`, `/delete_file`, etc.) canonicalize the input and require it to fall under this root. Several roots may be given, separated by the platform path separator (`:` on Linux and macOS, `;` on Windows). Prevents path-traversal. |
++| `GHIDRA_MCP_IMPORT_SCRIPT_ROOTS` | Directories (same list syntax) that `/import_file`'s `pre_scripts` and `post_scripts` must lie under. Scripts run only with `GHIDRA_MCP_ALLOW_SCRIPTS`; unset, any script may run. Lets a server run vetted import scripts without letting clients name arbitrary code. |
+ 
+ Name-quality enforcement is separate from security. By default,
+ `rename_function` and global write endpoints reject names that fail
+diff --git a/docker/README.md b/docker/README.md
+index 6000073..35de647 100644
+--- a/docker/README.md
++++ b/docker/README.md
+@@ -127,6 +127,7 @@ mvn clean package -P docker -DskipTests
+ | `GHIDRA_MCP_BIND_ADDRESS` | `0.0.0.0` | Bind address |
+ | `GHIDRA_MCP_ALLOW_SCRIPTS` | unset | `1` enables `/run_script_inline` and `/run_ghidra_script` (arbitrary code) |
+ | `GHIDRA_MCP_FILE_ROOT` | unset | Confine filesystem-path endpoints such as `/import_file` to this directory; several roots separated by `:` |
++| `GHIDRA_MCP_IMPORT_SCRIPT_ROOTS` | unset | Directories (`:` list) that `/import_file` pre/post scripts must lie under; needs `GHIDRA_MCP_ALLOW_SCRIPTS` |
+ | `JAVA_OPTS` | `-Xmx4g -XX:+UseG1GC` | JVM options |
+ | `PROGRAM_FILE` | - | Path to binary file to load on startup |
+ | `PROJECT_PATH` | - | Path to Ghidra project directory |
+diff --git a/docs/prompts/TOOL_USAGE_GUIDE.md b/docs/prompts/TOOL_USAGE_GUIDE.md
+index e77f775..0051521 100644
+--- a/docs/prompts/TOOL_USAGE_GUIDE.md
++++ b/docs/prompts/TOOL_USAGE_GUIDE.md
+@@ -647,6 +647,7 @@ GhidraMCP defaults to localhost-unauthenticated — safe on a single-user dev bo
+ | `GHIDRA_MCP_AUTH_TOKEN` | When set, every HTTP request must carry `Authorization: Bearer <token>`. Timing-safe comparison. `/mcp/health` and `/check_connection` are always exempt. |
+ | `GHIDRA_MCP_ALLOW_SCRIPTS` | Set to `1`, `true`, or `yes` to enable `/run_script_inline` and `/run_ghidra_script`. **Off by default as of v5.4.1** (breaking change — these endpoints execute arbitrary Java against the Ghidra process). |
+ | `GHIDRA_MCP_FILE_ROOT` | When set, filesystem-path endpoints (`/import_file`, `/open_project`, `/delete_file`, etc.) canonicalize the input and require it to fall under this root (or one of several, separated by `:` on Linux/macOS, `;` on Windows). |
++| `GHIDRA_MCP_IMPORT_SCRIPT_ROOTS` | Directories `/import_file`'s `pre_scripts`/`post_scripts` must lie under (needs `GHIDRA_MCP_ALLOW_SCRIPTS`). Unset: any script. |
+ 
+ The headless server refuses to start on a non-loopback bind address (`0.0.0.0`, explicit external IP) unless `GHIDRA_MCP_AUTH_TOKEN` is set.
+ 
+diff --git a/python/bridge_mcp_ghidra/import_tool.py b/python/bridge_mcp_ghidra/import_tool.py
+index b6e3257..b7a215b 100644
+--- a/python/bridge_mcp_ghidra/import_tool.py
++++ b/python/bridge_mcp_ghidra/import_tool.py
+@@ -87,6 +87,20 @@ async def import_file(
+             )
+         ),
+     ] = True,
++    pre_scripts: Annotated[
++        list[dict] | None,
++        Field(
++            description=(
++                'Scripts run on the loaded program before analysis: [{"path": "/abs/X.java", '
++                '"args": ["..."]}]. Needs GHIDRA_MCP_ALLOW_SCRIPTS on the server (and the '
++                "script under GHIDRA_MCP_IMPORT_SCRIPT_ROOTS when set)"
++            )
++        ),
++    ] = None,
++    post_scripts: Annotated[
++        list[dict] | None,
++        Field(description="Scripts run after auto-analysis, same form as pre_scripts"),
++    ] = None,
+     ctx: Context | None = None,
+ ) -> str:
+     """
+@@ -109,6 +123,8 @@ async def import_file(
+         loader_args: Loader options by name, e.g. {"baseAddr": "0x8000"}
+         program_name: Name of the new program
+         analysis_options: Analyzer options set before analysis
++        pre_scripts: Scripts run before analysis
++        post_scripts: Scripts run after analysis
+         if_exists: reuse (same bytes only), error or unique
+         wait: false returns after the import; analysis continues in the background
+     """
+@@ -126,6 +142,8 @@ async def import_file(
+         ("loader_args", loader_args),
+         ("program_name", program_name),
+         ("analysis_options", analysis_options),
++        ("pre_scripts", pre_scripts),
++        ("post_scripts", post_scripts),
+     ):
+         if value:
+             payload[key] = value
+@@ -164,7 +182,7 @@ async def import_file(
+                     )
+                     status = json.loads(status_text)
+                     status_data = status.get("data", status)
+-                    import_error = status_data.get("import_error")
++                    import_error = status_data.get("import_error") or status_data.get("error")
+                     if import_error:
+                         await session.send_log_message(
+                             level="error",
+diff --git a/src/main/java/com/xebyte/core/ImportRequest.java b/src/main/java/com/xebyte/core/ImportRequest.java
+index fd59588..da6de85 100644
+--- a/src/main/java/com/xebyte/core/ImportRequest.java
++++ b/src/main/java/com/xebyte/core/ImportRequest.java
+@@ -27,10 +27,11 @@ import java.util.Map;
+  * @param ifExists       what to do when the folder already holds a program of that name:
+  *                       "reuse" it when it was imported from the same bytes (else refuse),
+  *                       "error", or import under a "unique" name
++ * @param preScripts     scripts run on the loaded program before it is saved and analyzed
+  */
+ public record ImportRequest(File file, String folder, String programName, String loader,
+         Map<String, String> loaderArgs, String languageId, String compilerSpecId,
+-        String ifExists) {
++        String ifExists, List<ImportScripts.Call> preScripts) {
+ 
+     public static final String REUSE = "reuse";
+     public static final String ERROR = "error";
+@@ -50,11 +51,12 @@ public record ImportRequest(File file, String folder, String programName, String
+         if (programName.contains("/")) {
+             throw new Refusal("program_name must not contain '/'");
+         }
++        preScripts = preScripts == null ? List.of() : List.copyOf(preScripts);
+     }
+ 
+     /** The original four-argument import: auto-detect, or BinaryLoader with a language. */
+     public static ImportRequest basic(File file, String folder, String languageId, String compilerSpecId) {
+-        return new ImportRequest(file, folder, null, "", null, languageId, compilerSpecId, REUSE);
++        return new ImportRequest(file, folder, null, "", null, languageId, compilerSpecId, REUSE, null);
+     }
+ 
+     /**
+diff --git a/src/main/java/com/xebyte/core/ImportScripts.java b/src/main/java/com/xebyte/core/ImportScripts.java
+new file mode 100644
+index 0000000..7b7c9cb
+--- /dev/null
++++ b/src/main/java/com/xebyte/core/ImportScripts.java
+@@ -0,0 +1,141 @@
++package com.xebyte.core;
++
++import generic.jar.ResourceFile;
++import ghidra.app.script.GhidraScript;
++import ghidra.app.script.GhidraScriptProvider;
++import ghidra.app.script.GhidraScriptUtil;
++import ghidra.app.script.GhidraState;
++import ghidra.app.script.ScriptControls;
++import ghidra.framework.model.Project;
++import ghidra.program.model.listing.Program;
++import ghidra.program.util.ProgramLocation;
++import ghidra.util.task.TaskMonitor;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.PrintWriter;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.Map;
++
++/**
++ * Scripts that run as part of an import, as AnalyzeHeadless's {@code -preScript} and
++ * {@code -postScript} do: on the loaded program before its first save and analysis, or after
++ * analysis.
++ *
++ * <p>Each script's directory is enabled as its own OSGi source bundle (a directory may ship
++ * its own bundle activator), not copied into {@code ~/ghidra_scripts} the way
++ * {@code /run_ghidra_script} does it, where a copy could replace a script of the same name.
++ * Loading is serialized through {@link #LOAD_LOCK}: Ghidra guards bundle builds with a file
++ * lock meant for separate JVMs, so two threads of one JVM building at once fail with
++ * {@code OverlappingFileLockException}.
++ *
++ * <p>Gated by {@code GHIDRA_MCP_ALLOW_SCRIPTS}, like every other way to run a script; with
++ * {@code GHIDRA_MCP_IMPORT_SCRIPT_ROOTS} set, a script must also lie under one of those
++ * directories.
++ */
++public final class ImportScripts {
++
++    /** Held while a script bundle is built and its class loaded; see the class comment. */
++    public static final Object LOAD_LOCK = new Object();
++
++    /** One script and its arguments; arguments are passed as given, never split. */
++    public record Call(String path, List<String> args) {
++        public Call {
++            if (path == null || path.isBlank()) {
++                throw new Refusal("a script needs a path");
++            }
++            args = args == null ? List.of() : List.copyOf(args);
++        }
++    }
++
++    private ImportScripts() {}
++
++    /**
++     * Parse {@code [{"path": "...", "args": ["...", ...]}, ...]} as the endpoint receives it
++     * (a list of maps; args may also be one string, taken as a single argument).
++     */
++    public static List<Call> parse(Object raw, String what) {
++        if (raw == null) {
++            return List.of();
++        }
++        if (!(raw instanceof List<?> list)) {
++            throw new Refusal(what + " must be a list of {path, args}");
++        }
++        List<Call> calls = new ArrayList<>();
++        for (Object item : list) {
++            if (!(item instanceof Map<?, ?> map) || map.get("path") == null) {
++                throw new Refusal(what + " entries need a path");
++            }
++            Object rawArgs = map.get("args");
++            List<String> args = new ArrayList<>();
++            if (rawArgs instanceof List<?> argList) {
++                for (Object a : argList) {
++                    args.add(String.valueOf(a));
++                }
++            } else if (rawArgs != null) {
++                args.add(String.valueOf(rawArgs));
++            }
++            calls.add(new Call(String.valueOf(map.get("path")), args));
++        }
++        return calls;
++    }
++
++    /** Refuse scripts when they are not allowed, or lie outside the configured roots. */
++    public static void check(List<Call> calls) throws IOException {
++        if (calls.isEmpty()) {
++            return;
++        }
++        SecurityConfig security = SecurityConfig.getInstance();
++        if (!security.areScriptsAllowed()) {
++            throw new Refusal("Import scripts need GHIDRA_MCP_ALLOW_SCRIPTS=1 on the server");
++        }
++        for (Call call : calls) {
++            File file = new File(call.path());
++            if (!file.isAbsolute() || !file.isFile() || !file.getName().endsWith(".java")) {
++                throw new Refusal("Import script is not an absolute path to a .java file: " + call.path());
++            }
++            Path canonical = file.getCanonicalFile().toPath();
++            if (!security.isImportScriptAllowed(canonical)) {
++                throw new Refusal("Import script is outside GHIDRA_MCP_IMPORT_SCRIPT_ROOTS: " + call.path());
++            }
++        }
++    }
++
++    /** Run each script on {@code program}, in order; the first failure stops the run. */
++    public static void run(List<Call> calls, Program program, Project project, PrintWriter out,
++            TaskMonitor monitor) throws Exception {
++        for (Call call : calls) {
++            monitor.checkCancelled();
++            GhidraScript script = load(new File(call.path()), out);
++            script.setScriptArgs(call.args().toArray(String[]::new));
++            ProgramLocation where = program.getMinAddress() == null ? null
++                : new ProgramLocation(program, program.getMinAddress());
++            out.println("--- " + new File(call.path()).getName() + " " + call.args());
++            script.execute(new GhidraState(null, project, program, where, null, null),
++                new ScriptControls(out, out, monitor));
++        }
++    }
++
++    /** A fresh instance of the script at {@code file}, its directory enabled as a bundle. */
++    public static GhidraScript load(File file, PrintWriter out) throws Exception {
++        ResourceFile source = new ResourceFile(file.getCanonicalFile());
++        synchronized (LOAD_LOCK) {
++            if (GhidraScriptUtil.getBundleHost() == null) {
++                // Headless: no script manager plugin owns the bundle host.
++                GhidraScriptUtil.acquireBundleHostReference();
++            }
++            GhidraScriptUtil.getBundleHost().enable(source.getParentFile());
++            GhidraScriptProvider provider = GhidraScriptUtil.getProvider(source);
++            if (provider == null) {
++                throw new IOException("No script provider for " + file);
++            }
++            GhidraScript script = provider.getScriptInstance(source, out);
++            if (script == null) {
++                throw new IOException("Could not load " + file);
++            }
++            return script;
++        }
++    }
++}
+diff --git a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/java/com/xebyte/core/ProgramScriptService.java
+index 89d5859..e6d7aa3 100644
+--- a/src/main/java/com/xebyte/core/ProgramScriptService.java
++++ b/src/main/java/com/xebyte/core/ProgramScriptService.java
+@@ -41,7 +41,9 @@ public class ProgramScriptService {
+     private final ProgramProvider programProvider;
+     private final ThreadingStrategy threadingStrategy;
+     private static final String AUTO_ANALYSIS_COMPLETION_MESSAGE = "Auto-analysis completed";
+-    private static final Object SCRIPT_BUNDLE_HOST_LOCK = new Object();
++    // The same lock import scripts load under: Ghidra's bundle build takes a file lock meant for
++    // separate JVMs, and two threads of this one fail with OverlappingFileLockException.
++    private static final Object SCRIPT_BUNDLE_HOST_LOCK = ImportScripts.LOAD_LOCK;
+ 
+     /**
+      * Upper bound on the OSGi build/activate output echoed back in an error
+@@ -1800,7 +1802,9 @@ if (map instanceof ObjectPropertyMap) {
+                 + "that program is opened instead (reused_existing: true); other bytes are refused unless "
+                 + "if_exists=unique. For raw firmware binaries, specify language (e.g. 'ARM:LE:32:Cortex') "
+                 + "and optionally compiler_spec, plus loader_args {\"baseAddr\": \"0x8000\"} for a load "
+-                + "address. loader picks a Ghidra loader as AnalyzeHeadless -loader does.",
++                + "address. loader picks a Ghidra loader as AnalyzeHeadless -loader does; pre_scripts and "
++                + "post_scripts run like -preScript/-postScript (GHIDRA_MCP_ALLOW_SCRIPTS, and "
++                + "GHIDRA_MCP_IMPORT_SCRIPT_ROOTS when set).",
+             category = "program", access = ToolAccess.WRITE)
+     public Response importFile(
+             @Param(value = "file_path", source = ParamSource.BODY, description = "Absolute path to the binary file on disk") String filePath,
+@@ -1813,7 +1817,9 @@ if (map instanceof ObjectPropertyMap) {
+             @Param(value = "program_name", source = ParamSource.BODY, defaultValue = "", description = "Name of the new program in the project; default: the file name") String programName,
+             @Param(value = "analysis_options", source = ParamSource.BODY, description = "Analyzer options set before auto-analysis, by option name, e.g. {\"Decompiler Switch Analysis\": \"false\"}; unknown names are refused") Map<String, ?> analysisOptions,
+             @Param(value = "if_exists", source = ParamSource.BODY, defaultValue = "reuse", description = "When the folder holds a program of that name: 'reuse' it if imported from the same bytes (else refuse), 'error', or 'unique' (import as name.1, name.2, ...)") String ifExists,
+-            @Param(value = "wait", source = ParamSource.BODY, defaultValue = "true", description = "false: return once the program is imported and saved; auto-analysis continues in the background (watch /analysis_status)") boolean waitForAnalysis) {
++            @Param(value = "wait", source = ParamSource.BODY, defaultValue = "true", description = "false: return once the program is imported and saved; auto-analysis continues in the background (watch /analysis_status)") boolean waitForAnalysis,
++            @Param(value = "pre_scripts", source = ParamSource.BODY, description = "Scripts run on the loaded program before it is saved and analyzed: [{\"path\": \"/abs/Script.java\", \"args\": [\"...\"]}]. A failure imports nothing. Needs GHIDRA_MCP_ALLOW_SCRIPTS") List<?> preScripts,
++            @Param(value = "post_scripts", source = ParamSource.BODY, description = "Scripts run after auto-analysis, same form. A failure removes the import again") List<?> postScripts) {
+ 
+         if (filePath == null || filePath.trim().isEmpty()) {
+             return Response.err("file_path is required");
+@@ -1838,11 +1844,16 @@ if (map instanceof ObjectPropertyMap) {
+             return Response.err("This server cannot import programs");
+         }
+ 
++        StringWriter scriptLog = new StringWriter();
++        PrintWriter scriptOut = new PrintWriter(scriptLog, true);
+         String entered = null;
+         try {
++            List<ImportScripts.Call> pre = ImportScripts.parse(preScripts, "pre_scripts");
++            List<ImportScripts.Call> post = ImportScripts.parse(postScripts, "post_scripts");
++            ImportScripts.check(post);  // the pre-scripts are checked by the import itself
+             ImportRequest request = new ImportRequest(file, projectFolder, programName, loader,
+                 ImportRequest.normalizeLoaderArgs(loaderArgs == null ? Map.of() : loaderArgs),
+-                languageId, compilerSpecId, ifExists);
++                languageId, compilerSpecId, ifExists, pre);
+             Map<String, String> options = optionsAsText(analysisOptions);
+             // One import per destination at a time. The existence check and the import are not
+             // atomic, and Ghidra saves a second import of the same name as "<name>.0", a
+@@ -1850,7 +1861,8 @@ if (map instanceof ObjectPropertyMap) {
+             String destination = ProjectPaths.normalize(request.folder()) + "\0" + request.programName();
+             enterImport(destination);
+             entered = destination;
+-            return importLocked(provider, request, autoAnalyze, options, waitForAnalysis);
++            return importLocked(provider, request, autoAnalyze, options, post, waitForAnalysis,
++                scriptOut, scriptLog);
+         } catch (Refusal r) {
+             return Response.err(r.getMessage());
+         } catch (Exception e) {
+@@ -1863,7 +1875,7 @@ if (map instanceof ObjectPropertyMap) {
+                 }
+             }
+             Msg.error(this, "Import failed", e);
+-            return Response.err("Import failed: " + msg);
++            return Response.err(withScriptOutput("Import failed: " + msg, scriptLog));
+         } finally {
+             if (entered != null) {
+                 leaveImport(entered);
+@@ -1905,9 +1917,9 @@ if (map instanceof ObjectPropertyMap) {
+     }
+ 
+     private Response importLocked(ProjectProgramProvider provider, ImportRequest request,
+-            boolean autoAnalyze, Map<String, String> analysisOptions, boolean waitForAnalysis)
+-            throws Exception {
+-        ProjectProgramProvider.Imported imported = provider.importFile(request);
++            boolean autoAnalyze, Map<String, String> analysisOptions, List<ImportScripts.Call> post,
++            boolean waitForAnalysis, PrintWriter scriptOut, StringWriter scriptLog) throws Exception {
++        ProjectProgramProvider.Imported imported = provider.importFile(request, scriptOut);
+         Program program = imported.program();
+         String path = ProjectProgramProvider.keyFor(program);
+ 
+@@ -1956,17 +1968,18 @@ if (map instanceof ObjectPropertyMap) {
+                 throw e;
+             }
+             if (waitForAnalysis) {
+-                out.put("auto_analyzed", analyzeImported(program, autoAnalyze));
++                out.put("auto_analyzed", finishImport(provider, program, autoAnalyze, post, scriptOut));
+             } else {
+                 importFailures.remove(path);
+                 pendingImports.add(path);
+                 Thread worker = new Thread(() -> {
+                     try {
+-                        if (!analyzeImported(program, autoAnalyze) && autoAnalyze) {
++                        if (!finishImport(provider, program, autoAnalyze, post, scriptOut) && autoAnalyze) {
+                             importFailures.put(path, "auto-analysis did not complete; see the server log");
+                         }
+                     } catch (Exception e) {
+-                        importFailures.put(path, e.getMessage() != null ? e.getMessage() : e.toString());
++                        importFailures.put(path, withScriptOutput(
++                            e.getMessage() != null ? e.getMessage() : e.toString(), scriptLog));
+                         Msg.error(this, "Background import of " + path + " failed", e);
+                     } finally {
+                         pendingImports.remove(path);
+@@ -1978,6 +1991,10 @@ if (map instanceof ObjectPropertyMap) {
+             }
+         }
+         out.put("function_count", program.getFunctionManager().getFunctionCount());
++        String scripts = scriptLog.toString();
++        if (!scripts.isEmpty()) {
++            out.put("script_output", boundTail(scripts, MAX_BUILD_OUTPUT_CHARS));
++        }
+         String shown = showInWorkbench(program);
+         if (shown != null) {
+             out.put("codebrowser", shown);
+@@ -1985,6 +2002,32 @@ if (map instanceof ObjectPropertyMap) {
+         return Response.ok(out);
+     }
+ 
++    /**
++     * After a fresh import: auto-analysis, then the post-scripts, then a save. A failed
++     * post-script removes the import, so a retry starts from the file again.
++     */
++    private boolean finishImport(ProjectProgramProvider provider, Program program, boolean autoAnalyze,
++            List<ImportScripts.Call> post, PrintWriter scriptOut) throws Exception {
++        boolean analyzed = analyzeImported(program, autoAnalyze);
++        if (!post.isEmpty()) {
++            try {
++                ImportScripts.run(post, program, provider.getProject(), scriptOut,
++                    new ConsoleTaskMonitor());
++                persistProgram(program, "Import post-scripts");
++            } catch (Exception e) {
++                discardImport(provider, program, e);
++                throw new IOException("post-script failed, import removed: " + e, e);
++            }
++        }
++        return analyzed;
++    }
++
++    private static String withScriptOutput(String message, StringWriter scriptLog) {
++        String scripts = scriptLog.toString();
++        return scripts.isEmpty() ? message
++            : message + "\n--- script output ---\n" + boundTail(scripts, MAX_BUILD_OUTPUT_CHARS);
++    }
++
+     /** Auto-analysis of a fresh import, or just the prompt flag when it is not wanted. */
+     private boolean analyzeImported(Program program, boolean autoAnalyze) throws Exception {
+         if (autoAnalyze) {
+@@ -2000,8 +2043,8 @@ if (map instanceof ObjectPropertyMap) {
+ 
+     /**
+      * Remove an import that could not be finished as asked (an analysis option that does not
+-     * exist), so a retry starts from the file instead of reusing a program that lacks what the
+-     * caller asked for.
++     * exist, a failed post-script), so a retry starts from the file instead of reusing a program
++     * that lacks what the caller asked for.
+      */
+     private void discardImport(ProjectProgramProvider provider, Program program, Exception cause) {
+         ghidra.framework.model.DomainFile df = program.getDomainFile();
+@@ -2137,7 +2180,7 @@ if (map instanceof ObjectPropertyMap) {
+ 
+         Program[] allPrograms = programProvider.getAllOpenPrograms();
+         if (allPrograms == null || allPrograms.length == 0) {
+-            return Response.err("No programs are currently open");
++            return notOpen(programName, "No programs are currently open");
+         }
+ 
+         Program only = null;
+@@ -2148,7 +2191,7 @@ if (map instanceof ObjectPropertyMap) {
+                 return ServiceUtils.fail(e);
+             }
+             if (only == null) {
+-                return Response.err("Program not open: " + programName);
++                return notOpen(programName, "Program not open: " + programName);
+             }
+         }
+ 
+@@ -2193,6 +2236,24 @@ if (map instanceof ObjectPropertyMap) {
+         return Response.ok(JsonHelper.mapOf("programs", results));
+     }
+ 
++    /**
++     * The answer for a program that is not open: a wait=false import that failed and was removed
++     * says why instead.
++     */
++    private Response notOpen(String programName, String message) {
++        if (programName != null && !programName.isBlank()) {
++            String name = programName.trim();
++            synchronized (importFailures) {
++                for (Map.Entry<String, String> failed : importFailures.entrySet()) {
++                    if (failed.getKey().equals(name) || failed.getKey().endsWith("/" + name)) {
++                        return Response.err("Import failed: " + failed.getValue());
++                    }
++                }
++            }
++        }
++        return Response.err(message);
++    }
++
+     // ========================================================================
+ 
+     /**
+@@ -2363,7 +2424,11 @@ if (map instanceof ObjectPropertyMap) {
+             capturedWriter = scriptWriter;
+             capturedPrintWriter = scriptPrintWriter;
+ 
+-            ghidra.app.script.GhidraScript script = provider.getScriptInstance(scriptFile, scriptPrintWriter);
++            // Serialized with every other script load in this JVM: see ImportScripts.LOAD_LOCK.
++            ghidra.app.script.GhidraScript script;
++            synchronized (ImportScripts.LOAD_LOCK) {
++                script = provider.getScriptInstance(scriptFile, scriptPrintWriter);
++            }
+             if (script == null) {
+                 resultMsg.append("ERROR: Failed to create script instance\n");
+                 return new ScriptRunOutcome(false, failure, resultMsg.toString());
+@@ -2398,8 +2463,11 @@ if (map instanceof ObjectPropertyMap) {
+ 
+             resultMsg.append("\n--- SCRIPT OUTPUT ---\n");
+ 
+-            // Execute the script
+-            script.runScript(scriptFile.getName(), args);
++            // Execute the instance loaded above. runScript(name, args) looked the script up by
++            // name and loaded it a second time, outside ImportScripts.LOAD_LOCK, so two
++            // concurrent runs still collided in Ghidra's bundle build.
++            script.execute(scriptState, new ghidra.app.script.ScriptControls(
++                scriptPrintWriter, scriptPrintWriter, scriptMonitor));
+ 
+             // Get script output
+             String scriptOutput = scriptWriter.toString();
+diff --git a/src/main/java/com/xebyte/core/ProjectProgramProvider.java b/src/main/java/com/xebyte/core/ProjectProgramProvider.java
+index 59d351e..a3de907 100644
+--- a/src/main/java/com/xebyte/core/ProjectProgramProvider.java
++++ b/src/main/java/com/xebyte/core/ProjectProgramProvider.java
+@@ -477,11 +477,11 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
+      * Import a binary into {@code folder} and open it, or open the file already there.
+      * The original four-argument import: auto-detect, or BinaryLoader with a language.
+      *
+-     * @see #importFile(ImportRequest)
++     * @see #importFile(ImportRequest, java.io.PrintWriter)
+      */
+     public Imported importFile(java.io.File file, String folder, String languageId,
+             String compilerSpecId) throws Exception {
+-        return importFile(ImportRequest.basic(file, folder, languageId, compilerSpecId));
++        return importFile(ImportRequest.basic(file, folder, languageId, compilerSpecId), null);
+     }
+ 
+     /**
+@@ -495,6 +495,9 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
+      * name would answer the next question about the wrong program. A program that records no
+      * hash (not made by an import) is reused as before. The caller learns which happened.
+      *
++     * <p>Pre-scripts run on the loaded program before its first save; if one fails, nothing is
++     * saved. Their output goes to {@code scriptOut} (may be null when there are none).
++     *
+      * <p>The importer's own references are dropped once the file is saved, and the saved
+      * file is opened through {@link #openDomainFile} like any other: the program then has
+      * exactly one reference, the cache's, which eviction and close manage. With no project
+@@ -503,13 +506,14 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
+      * @throws Refusal when the request cannot be served as asked (name taken, other bytes,
+      *                 unknown loader or language, no loader recognised the file)
+      */
+-    public Imported importFile(ImportRequest request) throws Exception {
++    public Imported importFile(ImportRequest request, java.io.PrintWriter scriptOut) throws Exception {
+         java.io.File file = request.file();
+         Project project = project();
+         String dest = request.folder();
+         String name = request.programName();
+         String language = request.languageId();
+         String compiler = request.compilerSpecId();
++        ImportScripts.check(request.preScripts());
+ 
+         if (project != null) {
+             // Normalize + scope (+ create missing) before the importer sees the path.
+@@ -567,6 +571,18 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
+                 + ": " + e.getMessage() + " " + log);
+         }
+ 
++        if (!request.preScripts().isEmpty()) {
++            Program loaded = results.getPrimaryDomainObject(consumer);
++            try {
++                ImportScripts.run(request.preScripts(), loaded, project, scriptOut, monitor);
++            } catch (Exception e) {
++                results.close();
++                throw new java.io.IOException("pre-script failed, nothing imported: " + e, e);
++            } finally {
++                loaded.release(consumer);
++            }
++        }
++
+         if (project == null) {
+             Program program = results.getPrimaryDomainObject(consumer);
+             results.close();
+diff --git a/src/main/java/com/xebyte/core/SecurityConfig.java b/src/main/java/com/xebyte/core/SecurityConfig.java
+index 2782d06..14d6c98 100644
+--- a/src/main/java/com/xebyte/core/SecurityConfig.java
++++ b/src/main/java/com/xebyte/core/SecurityConfig.java
+@@ -43,6 +43,10 @@ import java.util.List;
+  *       containment guard is project-folder scope
+  *       ({@link #isPathInProjectScope(String)}), which is enforced only when a project
+  *       scope is configured.</li>
++ *   <li>{@code GHIDRA_MCP_IMPORT_SCRIPT_ROOTS} — directories (path-separator list) that
++ *       {@code /import_file}'s pre- and post-scripts must lie under. Unset: any script, as
++ *       long as {@code GHIDRA_MCP_ALLOW_SCRIPTS} opts in. Lets a server run vetted import
++ *       scripts without handing clients arbitrary code execution through an import.</li>
+  * </ul>
+  *
+  * Also enforces a bind-hardening rule at headless startup:
+@@ -80,9 +84,10 @@ public final class SecurityConfig {
+     }
+ 
+     private final byte[] tokenBytes;     // null if auth disabled
+-    private final boolean scriptsAllowed;
++    private volatile boolean scriptsAllowed;
+     private final String fileRoot;       // null if disabled
+     private final List<Path> fileRootsCanonical; // empty if disabled
++    private volatile List<Path> importScriptRoots = List.of(); // empty: no restriction
+     private volatile String projectFolderScope; // null = no enforcement (default)
+ 
+     private SecurityConfig() {
+@@ -100,6 +105,7 @@ public final class SecurityConfig {
+         String rawRoot = System.getenv("GHIDRA_MCP_FILE_ROOT");
+         this.fileRootsCanonical = canonicalRoots(rawRoot);
+         this.fileRoot = fileRootsCanonical.isEmpty() ? null : rawRoot;
++        this.importScriptRoots = canonicalRoots(System.getenv("GHIDRA_MCP_IMPORT_SCRIPT_ROOTS"));
+ 
+         // Project-folder scope guard. When set, FrontEndProgramProvider
+         // refuses to return Programs whose DomainFile path falls outside
+@@ -156,6 +162,21 @@ public final class SecurityConfig {
+         return scriptsAllowed;
+     }
+ 
++    /** Whether an import script at {@code canonicalPath} may run (see {@code GHIDRA_MCP_IMPORT_SCRIPT_ROOTS}). */
++    public boolean isImportScriptAllowed(Path canonicalPath) {
++        List<Path> roots = importScriptRoots;
++        return roots.isEmpty() || underAny(canonicalPath, roots);
++    }
++
++    /** Package-private: the environment is the only way a server sets these; tests in this package set them here. */
++    void setScriptsAllowedForTest(boolean allowed) {
++        scriptsAllowed = allowed;
++    }
++
++    void setImportScriptRootsForTest(List<Path> roots) {
++        importScriptRoots = List.copyOf(roots);
++    }
++
+     /** True when {@code GHIDRA_MCP_PROJECT_FOLDER} is set (any value). */
+     public boolean hasProjectFolderScope() {
+         return projectFolderScope != null;
+diff --git a/src/test/java/com/xebyte/core/ImportScriptsGhidraTest.java b/src/test/java/com/xebyte/core/ImportScriptsGhidraTest.java
+new file mode 100644
+index 0000000..32f6cd3
+--- /dev/null
++++ b/src/test/java/com/xebyte/core/ImportScriptsGhidraTest.java
+@@ -0,0 +1,343 @@
++package com.xebyte.core;
++
++import com.xebyte.headless.DirectThreadingStrategy;
++import com.xebyte.headless.HeadlessProgramProvider;
++import ghidra.GhidraApplicationLayout;
++import ghidra.base.project.GhidraProject;
++import ghidra.framework.Application;
++import ghidra.framework.ApplicationConfiguration;
++import ghidra.framework.data.ContentHandler;
++import ghidra.framework.data.DomainObjectAdapter;
++import ghidra.program.database.DataTypeArchiveContentHandler;
++import ghidra.program.database.DataTypeArchiveDB;
++import ghidra.program.database.ProgramContentHandler;
++import ghidra.program.model.listing.Program;
++import ghidra.program.model.symbol.Symbol;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.io.File;
++import java.io.IOException;
++import java.io.PrintWriter;
++import java.io.StringWriter;
++import java.lang.reflect.Field;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.stream.Stream;
++
++import static org.junit.Assert.*;
++import static org.junit.Assume.assumeTrue;
++
++/**
++ * Pre- and post-scripts of {@code /import_file} against a real temp project: the scripts are
++ * compiled and run by Ghidra's own script providers, on the program they are named for, with
++ * their arguments, and a failure leaves nothing behind.
++ */
++public class ImportScriptsGhidraTest {
++
++    private static final String X86_REAL = "x86:LE:16:Real Mode";
++
++    /** Records its arguments as a bookmark at the first address: proves it ran, on this program. */
++    private static final String PRE_SCRIPT = """
++        import ghidra.app.script.GhidraScript;
++
++        public class PrepareImport extends GhidraScript {
++            @Override
++            protected void run() throws Exception {
++                currentProgram.getBookmarkManager().setBookmark(currentProgram.getMinAddress(),
++                    "Note", "pre", String.join("|", getScriptArgs()));
++            }
++        }
++        """;
++
++    /** Runs after analysis: labels the first address. */
++    private static final String POST_SCRIPT = """
++        import ghidra.app.script.GhidraScript;
++        import ghidra.program.model.symbol.SourceType;
++
++        public class FinishImport extends GhidraScript {
++            @Override
++            protected void run() throws Exception {
++                currentProgram.getSymbolTable().createLabel(currentProgram.getMinAddress(),
++                    getScriptArgs().length > 0 ? getScriptArgs()[0] : "post_ran", SourceType.USER_DEFINED);
++            }
++        }
++        """;
++
++    private static final String FAILING_SCRIPT = """
++        import ghidra.app.script.GhidraScript;
++
++        public class FailImport extends GhidraScript {
++            @Override
++            protected void run() throws Exception {
++                println("about to fail");
++                throw new IllegalStateException("script says no");
++            }
++        }
++        """;
++
++    private Path tmp;
++    private GhidraProject ghidraProject;
++    private HeadlessProgramProvider provider;
++    private ProgramScriptService service;
++    private boolean scriptsWereAllowed;
++
++    @BeforeClass
++    public static void initializeGhidra() throws Exception {
++        String installDir = System.getenv("GHIDRA_INSTALL_DIR");
++        assumeTrue("GHIDRA_INSTALL_DIR is required for real Ghidra tests",
++            installDir != null && !installDir.isBlank());
++        if (!Application.isInitialized()) {
++            ApplicationConfiguration configuration = new ApplicationConfiguration();
++            configuration.setInitializeLogging(false);
++            Application.initializeApplication(new GhidraApplicationLayout(new File(installDir)),
++                configuration);
++        }
++        ghidra.framework.protocol.ghidra.Handler.registerHandler();
++        installContentHandlers();
++        ghidra.util.classfinder.ClassSearcher.search(ghidra.util.task.TaskMonitor.DUMMY);
++    }
++
++    @SuppressWarnings("unchecked")
++    private static void installContentHandlers() throws Exception {
++        try {
++            DomainObjectAdapter.getContentHandler(DataTypeArchiveDB.class);
++            return;
++        } catch (IOException notFound) {
++            // fall through
++        }
++        Map<String, ContentHandler<?>> byType = new HashMap<>();
++        Map<Class<?>, ContentHandler<?>> byClass = new HashMap<>();
++        for (ContentHandler<?> h : List.of(new DataTypeArchiveContentHandler(), new ProgramContentHandler())) {
++            byType.put(h.getContentType(), h);
++            byClass.put(h.getDomainObjectClass(), h);
++        }
++        Field type = DomainObjectAdapter.class.getDeclaredField("contentHandlerTypeMap");
++        Field cls = DomainObjectAdapter.class.getDeclaredField("contentHandlerClassMap");
++        type.setAccessible(true);
++        cls.setAccessible(true);
++        type.set(null, new HashMap<>(byType));
++        cls.set(null, new HashMap<>(byClass));
++    }
++
++    @Before
++    public void setUp() throws Exception {
++        tmp = Files.createTempDirectory("import-scripts");
++        ghidraProject = GhidraProject.createProject(tmp.toString(), "scripts", false);
++        provider = new HeadlessProgramProvider(ghidraProject.getProject());
++        service = new ProgramScriptService(provider, new DirectThreadingStrategy());
++        scriptsWereAllowed = SecurityConfig.getInstance().areScriptsAllowed();
++        SecurityConfig.getInstance().setScriptsAllowedForTest(true);
++    }
++
++    @After
++    public void tearDown() throws Exception {
++        SecurityConfig.getInstance().setScriptsAllowedForTest(scriptsWereAllowed);
++        SecurityConfig.getInstance().setImportScriptRootsForTest(List.of());
++        for (Program p : provider.getAllOpenPrograms()) {
++            provider.closeProgramByPath(p.getDomainFile().getPathname());
++        }
++        ghidraProject.close();
++        try (Stream<Path> walk = Files.walk(tmp)) {
++            walk.sorted(Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
++        }
++    }
++
++    /** A script in a directory of its own, as a client would ship one. */
++    private Path script(String dir, String className, String source) throws IOException {
++        Path d = Files.createDirectories(tmp.resolve("scripts").resolve(dir));
++        return Files.writeString(d.resolve(className + ".java"), source).toRealPath();
++    }
++
++    private File firmware(String name) throws IOException {
++        File f = tmp.resolve(name).toFile();
++        Files.write(f.toPath(), new byte[64]);
++        return f;
++    }
++
++    private static Map<String, Object> call(Path script, String... args) {
++        return Map.of("path", script.toString(), "args", List.of(args));
++    }
++
++    private Response importWith(File f, List<?> pre, List<?> post, boolean wait) {
++        return service.importFile(f.getPath(), "/", X86_REAL, "", false, "", null, "", null, "reuse",
++            wait, pre, post);
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> ok(Response r) {
++        assertTrue("expected Ok, got " + r, r instanceof Response.Ok);
++        return (Map<String, Object>) ((Response.Ok) r).data();
++    }
++
++    private static String err(Response r) {
++        assertTrue("expected Err, got " + r, r instanceof Response.Err);
++        return ((Response.Err) r).message();
++    }
++
++    @Test
++    public void aPreScriptRunsOnTheLoadedProgramWithItsArgumentsBeforeTheFirstSave() throws Exception {
++        Path pre = script("pre", "PrepareImport", PRE_SCRIPT);
++
++        Map<String, Object> out = ok(importWith(firmware("fw.bin"),
++            List.of(call(pre, "x86:LE:16:Real Mode", "1000:0100")), null, true));
++
++        Program program = provider.getProgram("/fw.bin");
++        assertEquals("x86:LE:16:Real Mode|1000:0100",
++            program.getBookmarkManager().getBookmark(program.getMinAddress(), "Note", "pre").getComment());
++        assertTrue(String.valueOf(out.get("script_output")),
++            String.valueOf(out.get("script_output")).contains("PrepareImport.java"));
++    }
++
++    @Test
++    public void aPostScriptRunsAfterAnalysisAndItsEditsAreSaved() throws Exception {
++        Path post = script("post", "FinishImport", POST_SCRIPT);
++
++        ok(service.importFile(firmware("fw.bin").getPath(), "/", X86_REAL, "", true, "", null, "", null,
++            "reuse", true, null, List.of(call(post, "after_analysis"))));
++
++        Program program = provider.getProgram("/fw.bin");
++        List<String> labels = new ArrayList<>();
++        for (Symbol s : program.getSymbolTable().getSymbols(program.getMinAddress())) {
++            labels.add(s.getName());
++        }
++        assertTrue(labels.toString(), labels.contains("after_analysis"));
++        assertFalse("saved by the import, not left as an unsaved edit", program.isChanged());
++    }
++
++    @Test
++    public void aFailingPreScriptImportsNothing() throws Exception {
++        Path fail = script("fail", "FailImport", FAILING_SCRIPT);
++
++        String message = err(importWith(firmware("fw.bin"), List.of(call(fail)), null, true));
++
++        assertTrue(message, message.contains("pre-script failed, nothing imported"));
++        assertTrue(message, message.contains("about to fail"));
++        assertNull(provider.getProject().getProjectData().getFile("/fw.bin"));
++    }
++
++    @Test
++    public void aFailingPostScriptRemovesTheImportSoARetryStartsFromTheFile() throws Exception {
++        Path fail = script("fail", "FailImport", FAILING_SCRIPT);
++        File f = firmware("fw.bin");
++
++        String message = err(importWith(f, null, List.of(call(fail)), true));
++
++        assertTrue(message, message.contains("post-script failed, import removed"));
++        assertNull(provider.getProject().getProjectData().getFile("/fw.bin"));
++        assertEquals(0, provider.getAllOpenPrograms().length);
++
++        Path post = script("post", "FinishImport", POST_SCRIPT);
++        assertEquals(false, ok(importWith(f, null, List.of(call(post)), true)).get("reused_existing"));
++    }
++
++    @Test
++    public void aBackgroundImportWhosePostScriptFailsIsReportedByAnalysisStatus() throws Exception {
++        Path fail = script("fail", "FailImport", FAILING_SCRIPT);
++
++        ok(importWith(firmware("fw.bin"), null, List.of(call(fail)), false));
++
++        long deadline = System.currentTimeMillis() + 60_000;
++        String status;
++        do {
++            Thread.sleep(100);
++            Response r = service.analysisStatus("/fw.bin");
++            status = r instanceof Response.Err e ? e.message() : "still there: " + r;
++        } while (!status.startsWith("Import failed") && System.currentTimeMillis() < deadline);
++        assertTrue(status, status.contains("post-script failed, import removed"));
++    }
++
++    @Test
++    public void scriptsAreRefusedBeforeAnythingIsImportedWhenTheServerDidNotOptIn() throws Exception {
++        Path pre = script("pre", "PrepareImport", PRE_SCRIPT);
++        SecurityConfig.getInstance().setScriptsAllowedForTest(false);
++
++        String message = err(importWith(firmware("fw.bin"), List.of(call(pre)), null, true));
++
++        assertTrue(message, message.contains("GHIDRA_MCP_ALLOW_SCRIPTS"));
++        assertNull(provider.getProject().getProjectData().getFile("/fw.bin"));
++    }
++
++    @Test
++    public void aScriptOutsideTheConfiguredRootsIsRefused() throws Exception {
++        Path vetted = Files.createDirectories(tmp.resolve("vetted")).toRealPath();
++        SecurityConfig.getInstance().setImportScriptRootsForTest(List.of(vetted));
++        Path outside = script("elsewhere", "PrepareImport", PRE_SCRIPT);
++
++        String message = err(importWith(firmware("fw.bin"), null, List.of(call(outside)), true));
++
++        assertTrue(message, message.contains("GHIDRA_MCP_IMPORT_SCRIPT_ROOTS"));
++        assertNull(provider.getProject().getProjectData().getFile("/fw.bin"));
++    }
++
++    /** The same collision through /run_ghidra_script, which used to load each script twice. */
++    @Test
++    public void concurrentRunGhidraScriptCallsDoNotCollide() throws Exception {
++        ok(importWith(firmware("fw.bin"), null, null, true));
++        Program program = provider.getProgram("/fw.bin");
++        int threads = 4;
++        List<Path> scripts = new ArrayList<>();
++        for (int i = 0; i < threads; i++) {
++            scripts.add(script("run" + i, "RunNote" + i, """
++                import ghidra.app.script.GhidraScript;
++
++                public class RunNote%d extends GhidraScript {
++                    @Override
++                    protected void run() throws Exception {
++                        println("ran %d with " + getScriptArgs().length + " args");
++                    }
++                }
++                """.formatted(i, i)));
++        }
++        ExecutorService pool = Executors.newFixedThreadPool(threads);
++        try {
++            List<Callable<Response>> runs = new ArrayList<>();
++            for (Path s : scripts) {
++                runs.add(() -> service.runGhidraScript(s.toString(), "a b", program, 120));
++            }
++            for (Future<Response> done : pool.invokeAll(runs)) {
++                Map<String, Object> out = ok(done.get());
++                assertEquals(String.valueOf(out), true, out.get("success"));
++                assertTrue(String.valueOf(out), String.valueOf(out.get("console_output")).contains("with 2 args"));
++            }
++        } finally {
++            pool.shutdownNow();
++        }
++    }
++
++    /**
++     * Ghidra guards a bundle build with a file lock meant for separate JVMs: two threads of
++     * one JVM building scripts at the same time fail with OverlappingFileLockException.
++     */
++    @Test
++    public void scriptsLoadingAtTheSameTimeDoNotCollide() throws Exception {
++        int threads = 4;
++        List<Path> scripts = new ArrayList<>();
++        for (int i = 0; i < threads; i++) {
++            scripts.add(script("dir" + i, "FinishImport", POST_SCRIPT));
++        }
++        ExecutorService pool = Executors.newFixedThreadPool(threads);
++        try {
++            List<Callable<Object>> loads = new ArrayList<>();
++            for (Path s : scripts) {
++                loads.add(() -> ImportScripts.load(s.toFile(), new PrintWriter(new StringWriter())));
++            }
++            for (Future<Object> done : pool.invokeAll(loads)) {
++                assertNotNull(done.get());
++            }
++        } finally {
++            pool.shutdownNow();
++        }
++    }
++}
+diff --git a/src/test/java/com/xebyte/core/ImportScriptsTest.java b/src/test/java/com/xebyte/core/ImportScriptsTest.java
+new file mode 100644
+index 0000000..79cbc56
+--- /dev/null
++++ b/src/test/java/com/xebyte/core/ImportScriptsTest.java
+@@ -0,0 +1,114 @@
++package com.xebyte.core;
++
++import org.junit.After;
++import org.junit.Before;
++import org.junit.Test;
++
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.List;
++import java.util.Map;
++
++import static org.junit.Assert.*;
++
++/**
++ * What {@code /import_file} lets an import script be: the shape of the request, the
++ * {@code GHIDRA_MCP_ALLOW_SCRIPTS} gate and {@code GHIDRA_MCP_IMPORT_SCRIPT_ROOTS}. No Ghidra
++ * application is needed; running the scripts is covered by {@code ImportScriptsGhidraTest}.
++ */
++public class ImportScriptsTest {
++
++    private boolean scriptsWereAllowed;
++
++    @Before
++    public void remember() {
++        scriptsWereAllowed = SecurityConfig.getInstance().areScriptsAllowed();
++    }
++
++    @After
++    public void restore() {
++        SecurityConfig.getInstance().setScriptsAllowedForTest(scriptsWereAllowed);
++        SecurityConfig.getInstance().setImportScriptRootsForTest(List.of());
++    }
++
++    private static Path script(Path dir, String name) throws Exception {
++        Files.createDirectories(dir);
++        return Files.writeString(dir.resolve(name), "// not compiled by this test\n").toRealPath();
++    }
++
++    @Test
++    public void scriptListsParseWithArgsKeptWhole() {
++        List<ImportScripts.Call> calls = ImportScripts.parse(List.of(
++            Map.of("path", "/s/Prepare.java", "args", List.of("x86:LE:16:Real Mode", "1000:0100")),
++            Map.of("path", "/s/Fix.java", "args", "one string"),
++            Map.of("path", "/s/Plain.java")), "pre_scripts");
++
++        assertEquals(3, calls.size());
++        assertEquals(List.of("x86:LE:16:Real Mode", "1000:0100"), calls.get(0).args());
++        assertEquals(List.of("one string"), calls.get(1).args());
++        assertEquals(List.of(), calls.get(2).args());
++        assertEquals(List.of(), ImportScripts.parse(null, "pre_scripts"));
++    }
++
++    @Test
++    public void malformedScriptListsAreRefusedByName() {
++        Refusal notAList = assertThrows(Refusal.class, () -> ImportScripts.parse("x", "pre_scripts"));
++        assertEquals("pre_scripts must be a list of {path, args}", notAList.getMessage());
++        Refusal noPath = assertThrows(Refusal.class, () ->
++            ImportScripts.parse(List.of(Map.of("args", List.of())), "post_scripts"));
++        assertEquals("post_scripts entries need a path", noPath.getMessage());
++        assertThrows(Refusal.class, () -> new ImportScripts.Call(" ", List.of()));
++    }
++
++    @Test
++    public void scriptsAreRefusedUnlessTheServerOptedIn() throws Exception {
++        Path s = script(Files.createTempDirectory("scripts"), "Prepare.java");
++        List<ImportScripts.Call> calls = List.of(new ImportScripts.Call(s.toString(), List.of()));
++
++        SecurityConfig.getInstance().setScriptsAllowedForTest(false);
++        Refusal refused = assertThrows(Refusal.class, () -> ImportScripts.check(calls));
++        assertTrue(refused.getMessage(), refused.getMessage().contains("GHIDRA_MCP_ALLOW_SCRIPTS"));
++
++        SecurityConfig.getInstance().setScriptsAllowedForTest(true);
++        ImportScripts.check(calls);  // allowed, and no roots configured
++        ImportScripts.check(List.of());  // nothing to run is never refused
++    }
++
++    @Test
++    public void onlyAbsolutePathsToJavaFilesPass() throws Exception {
++        SecurityConfig.getInstance().setScriptsAllowedForTest(true);
++        Path dir = Files.createTempDirectory("scripts");
++        script(dir, "Notes.txt");
++
++        for (String bad : List.of("Relative.java", dir.resolve("Missing.java").toString(),
++                dir.resolve("Notes.txt").toString(), dir.toString())) {
++            Refusal r = assertThrows(bad, Refusal.class, () ->
++                ImportScripts.check(List.of(new ImportScripts.Call(bad, List.of()))));
++            assertTrue(r.getMessage(), r.getMessage().contains("absolute path to a .java file"));
++        }
++    }
++
++    @Test
++    public void withRootsAScriptMustLieUnderOneOfThem() throws Exception {
++        SecurityConfig.getInstance().setScriptsAllowedForTest(true);
++        Path base = Files.createTempDirectory("roots");
++        Path vetted = Files.createDirectories(base.resolve("vetted")).toRealPath();
++        Path other = Files.createDirectories(base.resolve("vetted-not")).toRealPath();
++        SecurityConfig.getInstance().setImportScriptRootsForTest(List.of(vetted));
++
++        ImportScripts.check(List.of(new ImportScripts.Call(script(vetted.resolve("sub"), "A.java").toString(), List.of())));
++        Refusal outside = assertThrows(Refusal.class, () -> ImportScripts.check(
++            List.of(new ImportScripts.Call(script(other, "B.java").toString(), List.of()))));
++        assertTrue(outside.getMessage(), outside.getMessage().contains("GHIDRA_MCP_IMPORT_SCRIPT_ROOTS"));
++
++        // a symlink inside the root to a script outside it is judged by where it really is
++        Path link = vetted.resolve("Link.java");
++        try {
++            Files.createSymbolicLink(link, other.resolve("B.java"));
++        } catch (UnsupportedOperationException | java.io.IOException noSymlinks) {
++            return;
++        }
++        assertThrows(Refusal.class, () ->
++            ImportScripts.check(List.of(new ImportScripts.Call(link.toString(), List.of()))));
++    }
++}
+diff --git a/src/test/java/com/xebyte/core/ProgramImportGhidraTest.java b/src/test/java/com/xebyte/core/ProgramImportGhidraTest.java
+index e05ed78..5e92e08 100644
+--- a/src/test/java/com/xebyte/core/ProgramImportGhidraTest.java
++++ b/src/test/java/com/xebyte/core/ProgramImportGhidraTest.java
+@@ -139,7 +139,7 @@ public class ProgramImportGhidraTest {
+             Map<String, ?> loaderArgs, String programName, Map<String, ?> analysisOptions,
+             String ifExists, boolean wait) {
+         return service.importFile(file.getPath(), folder, language, "", false, loader, loaderArgs,
+-            programName, analysisOptions, ifExists, wait);
++            programName, analysisOptions, ifExists, wait, null, null);
+     }
+ 
+     private Response importPlain(File file) {
+@@ -226,7 +226,7 @@ public class ProgramImportGhidraTest {
+         File f = file("fw.bin", bytes(32, 7));
+ 
+         String refused = err(service.importFile(f.getPath(), "/", X86_REAL, "", true, "", null, "",
+-            Map.of("No Such Analyzer Option", "true"), "reuse", true));
++            Map.of("No Such Analyzer Option", "true"), "reuse", true, null, null));
+ 
+         assertEquals("Unknown analysis option: No Such Analyzer Option", refused);
+         assertNull("a retry must start from the file", provider.getProject().getProjectData().getFile("/fw.bin"));
+@@ -239,7 +239,7 @@ public class ProgramImportGhidraTest {
+         String option = "Decompiler Switch Analysis";
+ 
+         ok(service.importFile(f.getPath(), "/", X86_REAL, "", true, "", null, "",
+-            Map.of(option, false), "reuse", true));
++            Map.of(option, false), "reuse", true, null, null));
+ 
+         Program program = provider.getProgram("/fw.bin");
+         assertEquals("false", program.getOptions(Program.ANALYSIS_PROPERTIES).getValueAsString(option));
+@@ -250,7 +250,7 @@ public class ProgramImportGhidraTest {
+         File f = file("fw.bin", bytes(256, 0x90));
+ 
+         Map<String, Object> out = ok(service.importFile(f.getPath(), "/", X86_REAL, "", true, "", null, "",
+-            null, "reuse", false));
++            null, "reuse", false, null, null));
+ 
+         assertEquals(true, out.get("analyzing"));
+         long deadline = System.currentTimeMillis() + 60_000;
+diff --git a/src/test/java/com/xebyte/offline/ImportRequestTest.java b/src/test/java/com/xebyte/offline/ImportRequestTest.java
+index ded1b0b..a6da7cb 100644
+--- a/src/test/java/com/xebyte/offline/ImportRequestTest.java
++++ b/src/test/java/com/xebyte/offline/ImportRequestTest.java
+@@ -34,12 +34,13 @@ public class ImportRequestTest {
+ 
+     @Test
+     public void blankFieldsTakeTheirDefaults() {
+-        ImportRequest r = new ImportRequest(new File("/w/fw.bin"), " ", null, null, null, null, null, null);
++        ImportRequest r = new ImportRequest(new File("/w/fw.bin"), " ", null, null, null, null, null, null, null);
+         assertEquals("/", r.folder());
+         assertEquals("fw.bin", r.programName());
+         assertEquals("", r.loader());
+         assertTrue(r.loaderArgs().isEmpty());
+         assertEquals(ImportRequest.REUSE, r.ifExists());
++        assertTrue(r.preScripts().isEmpty());
+     }
+ 
+     @Test
+@@ -54,15 +55,15 @@ public class ImportRequestTest {
+     @Test
+     public void ifExistsIsCaseInsensitiveAndOneOfThree() {
+         assertEquals(ImportRequest.UNIQUE,
+-            new ImportRequest(new File("/w/x"), "/", null, "", null, "", "", " Unique ").ifExists());
++            new ImportRequest(new File("/w/x"), "/", null, "", null, "", "", " Unique ", null).ifExists());
+         Refusal bad = assertThrows(Refusal.class, () ->
+-            new ImportRequest(new File("/w/x"), "/", null, "", null, "", "", "replace"));
++            new ImportRequest(new File("/w/x"), "/", null, "", null, "", "", "replace", null));
+         assertEquals("if_exists must be reuse, error or unique", bad.getMessage());
+     }
+ 
+     @Test
+     public void aProgramNameIsOneProjectFileNotAPath() {
+         assertThrows(Refusal.class, () ->
+-            new ImportRequest(new File("/w/x"), "/", "a/b", "", null, "", "", null));
++            new ImportRequest(new File("/w/x"), "/", "a/b", "", null, "", "", null, null));
+     }
+ }
+diff --git a/src/test/java/com/xebyte/offline/ProgramScriptServiceValidationTest.java b/src/test/java/com/xebyte/offline/ProgramScriptServiceValidationTest.java
+index 4704024..103cb60 100644
+--- a/src/test/java/com/xebyte/offline/ProgramScriptServiceValidationTest.java
++++ b/src/test/java/com/xebyte/offline/ProgramScriptServiceValidationTest.java
+@@ -40,7 +40,7 @@ public class ProgramScriptServiceValidationTest extends TestCase {
+     }
+ 
+     public void testImportFileRequiresFilePath() {
+-        Response r = scripts.importFile("", "/", "", "", true, "", null, "", null, "reuse", true);
++        Response r = scripts.importFile("", "/", "", "", true, "", null, "", null, "reuse", true, null, null);
+         assertTrue(r instanceof Response.Err);
+         assertTrue(((Response.Err) r).message().contains("file_path is required"));
+     }
+diff --git a/src/test/java/com/xebyte/offline/ProjectProgramProviderTest.java b/src/test/java/com/xebyte/offline/ProjectProgramProviderTest.java
+index cd0eb55..5abdd22 100644
+--- a/src/test/java/com/xebyte/offline/ProjectProgramProviderTest.java
++++ b/src/test/java/com/xebyte/offline/ProjectProgramProviderTest.java
+@@ -386,7 +386,7 @@ public class ProjectProgramProviderTest {
+         existingBlob(f, sha256Of(file));
+ 
+         try {
+-            f.importFile(new ImportRequest(file, "/fw", null, "", null, "", "", "error"));
++            f.importFile(new ImportRequest(file, "/fw", null, "", null, "", "", "error", null), null);
+             fail("if_exists=error must refuse even the same bytes");
+         } catch (Refusal r) {
+             assertEquals("/fw/blob.bin already exists", r.getMessage());
+diff --git a/tests/endpoints.json b/tests/endpoints.json
+index f84268b..ed2f9bd 100644
+--- a/tests/endpoints.json
++++ b/tests/endpoints.json
+@@ -1924,7 +1924,9 @@
+         "program_name",
+         "analysis_options",
+         "if_exists",
+-        "wait"
++        "wait",
++        "pre_scripts",
++        "post_scripts"
+       ],
+       "servers": [
+         "gui",
+diff --git a/tests/unit/test_static_tools.py b/tests/unit/test_static_tools.py
+index 263f5ae..5956b93 100644
+--- a/tests/unit/test_static_tools.py
++++ b/tests/unit/test_static_tools.py
+@@ -755,6 +755,22 @@ class TestImportFile(unittest.TestCase):
+             },
+         )
+ 
++    def test_scripts_are_forwarded_as_given(self):
++        scripts = [{"path": "/opt/scripts/Prepare.java", "args": ["x86:LE:16:Real Mode", "1000:0100"]}]
++        with (
++            isolated_bridge() as bridge,
++            patch.object(bridge.dispatch, "dispatch_post", return_value='{"data": {}}') as post,
++        ):
++            asyncio.run(
++                bridge.import_file(
++                    "/dos/hello.com", pre_scripts=scripts, post_scripts=[{"path": "/opt/scripts/Fix.java"}]
++                )
++            )
++
++        sent = post.call_args.args[1]
++        self.assertEqual(sent["pre_scripts"], scripts)
++        self.assertEqual(sent["post_scripts"], [{"path": "/opt/scripts/Fix.java"}])
++
+     def test_import_waits_for_analysis_for_up_to_the_script_timeout(self):
+         """wait=true covers auto-analysis, which takes minutes on a real binary."""
+         with isolated_bridge() as bridge:
+@@ -887,6 +903,34 @@ class TestImportFile(unittest.TestCase):
+         self.assertEqual(send.await_args.kwargs["level"], "error")
+         self.assertIn("did not complete", send.await_args.kwargs["data"])
+ 
++    def test_poll_stops_when_the_import_was_removed(self):
++        """A failed post-script removes the program: the status request then answers an
++        error, which ends the wait instead of polling for half an hour."""
++        fake = FakeAsyncio()
++        ctx = make_ctx()
++        removed = json.dumps({"error": "Import failed: post-script failed, import removed"})
++
++        async def scenario(bridge):
++            await bridge.import_file("/x.exe", ctx=ctx, wait=False)
++            await fake.tasks[0]
++
++        with (
++            isolated_bridge() as bridge,
++            patch.object(bridge.import_tool, "asyncio", fake),
++            patch.object(
++                bridge.dispatch,
++                "dispatch_post",
++                return_value=json.dumps({"data": {"analyzing": True, "name": "x.exe"}}),
++            ),
++            patch.object(bridge.dispatch, "dispatch_get", return_value=removed) as status_get,
++        ):
++            asyncio.run(scenario(bridge))
++
++        self.assertEqual(status_get.call_count, 1)
++        send = ctx.request_context.session.send_log_message
++        send.assert_awaited_once()
++        self.assertIn("import removed", send.await_args.kwargs["data"])
++
+     def test_poll_survives_transient_status_errors(self):
+         """A dropped connection mid-analysis must not kill the poll loop --
+         it retries until the status endpoint answers."""

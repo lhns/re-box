@@ -1,0 +1,1498 @@
+From 9e6430aaf3225d6e16ec4dbad20f4cdc3d0f8a01 Mon Sep 17 00:00:00 2001
+From: Pierre Kisters <pierrekisters@gmail.com>
+Date: Mon, 19 Oct 2026 18:39:39 +0000
+Subject: [PATCH 2/2] feat(java): import_file takes loader, loader_args,
+ program_name, analysis_options, if_exists, wait
+
+A raw firmware image needs a load address, a DOS .COM needs BinaryLoader
+at 1000:0100, an MZ executable needs MzLoader, and a client could ask for
+none of that: import_file auto-detected the format or, given a language,
+imported a raw binary at address 0. These are the options AnalyzeHeadless
+takes.
+
+- loader ("" as before, "auto", or a loader class name), loader_args
+  (-loader-<name>), program_name, analysis_options (set before
+  auto-analysis, unknown names refuse and remove the import) and wait
+  (false: analysis continues in the background; /analysis_status reports
+  analyzing and import_error). ProgramLoader replaces AutoImporter; the
+  destination still goes through ProjectPaths.
+- if_exists: reuse (default), error or unique. A same-named program is
+  now reused only when its recorded SHA-256 matches the file's; opening
+  another binary under the requested name answered every later question
+  about the wrong program.
+- Imports are serialized per destination folder and name. Two clients
+  importing one new file at once left a second program called <name>.0.
+- A program imported under another name is found by that name.
+- Bridge: import_file exposes the parameters and waits up to 1800 s (was
+  300) for the analysis a wait=true import covers.
+
+Tests: ImportRequestTest, three ProjectProgramProviderTest cases for the
+reuse rule, ProgramImportGhidraTest (real loaders: BinaryLoader at
+1000:0100, same bytes, unique, analysis options, wait=false, four
+concurrent imports) and the bridge's payload and poll tests.
+tests/endpoints.json edited by hand (no Maven here); the generators
+report nothing to change.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  |  33 ++
+ README.md                                     |   6 +
+ python/bridge_mcp_ghidra/config.py            |   2 +-
+ python/bridge_mcp_ghidra/import_tool.py       |  86 ++++-
+ .../java/com/xebyte/core/ImportRequest.java   |  82 +++++
+ .../com/xebyte/core/ProgramScriptService.java | 287 +++++++++++++----
+ .../xebyte/core/ProjectProgramProvider.java   | 144 +++++++--
+ .../xebyte/core/ProgramImportGhidraTest.java  | 294 ++++++++++++++++++
+ .../com/xebyte/offline/ImportRequestTest.java |  68 ++++
+ .../ProgramScriptServiceValidationTest.java   |   2 +-
+ .../offline/ProjectProgramProviderTest.java   |  77 +++++
+ tests/endpoints.json                          |   8 +-
+ tests/unit/test_static_tools.py               |  95 ++++++
+ 13 files changed, 1093 insertions(+), 91 deletions(-)
+ create mode 100644 src/main/java/com/xebyte/core/ImportRequest.java
+ create mode 100644 src/test/java/com/xebyte/core/ProgramImportGhidraTest.java
+ create mode 100644 src/test/java/com/xebyte/offline/ImportRequestTest.java
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 841a9fb..1edc843 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,39 @@ Complete version history for the Ghidra MCP Server project.
+ 
+ Changes on `dev` after 7.0.0.
+ 
++### Added — `import_file` takes the loader options AnalyzeHeadless takes
++
++A raw firmware image needs a load address, a DOS `.COM` needs `BinaryLoader` at `1000:0100`, an
++MZ executable needs `MzLoader` and a language only as a hint, and a client could ask for none of
++that: `import_file` auto-detected the format, or, given a `language`, imported a raw binary at
++address 0. New parameters, all optional (`ProgramLoader` replaces `AutoImporter`):
++
++- `loader`: `""` (as before: auto-detect, or `BinaryLoader` when a `language` is given), `"auto"`
++  (auto-detect, `language`/`compiler_spec` as hints) or a loader class name such as `MzLoader`.
++- `loader_args`: loader options by name, with or without the `-loader-` prefix
++  (`{"baseAddr": "0x8000"}`).
++- `program_name`: the new program's name in the project (default: the file name). A program
++  imported under another name is found by that name, though the loader names it after the file.
++- `analysis_options`: analyzer options set before auto-analysis, by name; an unknown name or a
++  value that does not parse refuses the call and removes the import again.
++- `if_exists`: `reuse` (default), `error` or `unique` (`name.1`, `name.2`, ...).
++- `wait`: `false` returns once the program is imported and saved; analysis continues in the
++  background, `/analysis_status` reports `analyzing` and, if it did not finish, `import_error`.
++
++Imports are serialized per destination folder and name: two clients importing one new file at
++once used to leave a second program called `<name>.0`; the second now reuses the first's. The
++bridge's `import_file` tool exposes the new parameters (sending only those that differ from the
++defaults) and waits up to 1800 s (was 300) for the analysis a `wait=true` import covers.
++
++### Changed — `import_file` reuses a same-named program only when it holds the same bytes
++
++A program of that name already in the folder was opened and reported as the import
++(`reused_existing: true`), whatever it held, so importing a different build of `D2Common.dll`
++under the same name answered every later question about the old one. It is now reused only when
++its recorded SHA-256 matches the file's (a program that records none is reused as before); other
++bytes are refused with a message that names `if_exists=unique`, another `program_name` or another
++folder.
++
+ ### Performance — `get_functions` opens one decompiler per call (#575)
+ 
+ Every decompile in a `get_functions` call -- each target and each caller decompiled for
+diff --git a/README.md b/README.md
+index 5b9b150..7fbbccc 100644
+--- a/README.md
++++ b/README.md
+@@ -1495,6 +1495,12 @@ AUTH="Authorization: Bearer $GHIDRA_MCP_AUTH_TOKEN"
+ curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
+      -d '{"file_path": "/data/program.exe"}' http://localhost:8089/import_file
+ 
++# 1b. A raw binary: its language, and the address it loads at (a DOS .COM at 1000:0100).
++#     "loader" picks a Ghidra loader as AnalyzeHeadless -loader does ("MzLoader", "ElfLoader", ...)
++curl -X POST -H "$AUTH" -H 'Content-Type: application/json' \
++     -d '{"file_path": "/data/hello.com", "language": "x86:LE:16:Real Mode",
++          "loader_args": {"baseAddr": "1000:0100"}}' http://localhost:8089/import_file
++
+ # 2. Re-run auto-analysis later if needed
+ curl -X POST -H "$AUTH" http://localhost:8089/run_analysis
+ 
+diff --git a/python/bridge_mcp_ghidra/config.py b/python/bridge_mcp_ghidra/config.py
+index 90ee69b..a853eab 100644
+--- a/python/bridge_mcp_ghidra/config.py
++++ b/python/bridge_mcp_ghidra/config.py
+@@ -39,7 +39,7 @@ ENDPOINT_TIMEOUTS = {
+     "disassemble_bytes": 120,
+     "bulk_fuzzy_match": 180,
+     "find_similar_functions_fuzzy": 60,
+-    "import_file": 300,
++    "import_file": 1800,  # waits for auto-analysis
+     "run_ghidra_script": 1800,
+     "run_script_inline": 1800,
+     # Ghidra's default decompile cap is 60s. The bridge must outlive it so the
+diff --git a/python/bridge_mcp_ghidra/import_tool.py b/python/bridge_mcp_ghidra/import_tool.py
+index 91b3831..b6e3257 100644
+--- a/python/bridge_mcp_ghidra/import_tool.py
++++ b/python/bridge_mcp_ghidra/import_tool.py
+@@ -38,6 +38,55 @@ async def import_file(
+     auto_analyze: Annotated[
+         bool, Field(description="Start auto-analysis after import (default: true)")
+     ] = True,
++    loader: Annotated[
++        str | None,
++        Field(
++            description=(
++                "Ghidra loader, as AnalyzeHeadless -loader: omit to auto-detect (BinaryLoader "
++                'when a language is given), "auto" to auto-detect with language/compiler_spec '
++                'as hints, or a loader class name such as "BinaryLoader", "MzLoader", "ElfLoader"'
++            )
++        ),
++    ] = None,
++    loader_args: Annotated[
++        dict[str, str] | None,
++        Field(
++            description=(
++                "Loader options by name, as AnalyzeHeadless -loader-<name>, e.g. "
++                '{"baseAddr": "0x8000"} for a raw binary\'s load address'
++            )
++        ),
++    ] = None,
++    program_name: Annotated[
++        str | None, Field(description="Name of the new program (default: the file name)")
++    ] = None,
++    analysis_options: Annotated[
++        dict[str, str] | None,
++        Field(
++            description=(
++                "Analyzer options set before auto-analysis, e.g. "
++                '{"Decompiler Switch Analysis": "false"}; unknown names are refused'
++            )
++        ),
++    ] = None,
++    if_exists: Annotated[
++        str,
++        Field(
++            description=(
++                'A program of that name already in the folder: "reuse" it if imported from '
++                'the same bytes (else refused), "error", or "unique" (name.1, name.2, ...)'
++            )
++        ),
++    ] = "reuse",
++    wait: Annotated[
++        bool,
++        Field(
++            description=(
++                "false: return once the file is imported; auto-analysis continues in the "
++                "background and a log notification reports the end (default: true)"
++            )
++        ),
++    ] = True,
+     ctx: Context | None = None,
+ ) -> str:
+     """
+@@ -47,8 +96,8 @@ async def import_file(
+     When analysis is enabled, sends a log notification when analysis completes.
+ 
+     For raw firmware binaries, specify language (e.g. "ARM:LE:32:Cortex") and
+-    optionally compiler_spec (e.g. "default"). Without language, Ghidra auto-detects
+-    the format (works for ELF, PE, Mach-O, etc.).
++    optionally compiler_spec (e.g. "default") and loader_args {"baseAddr": ...}.
++    Without language, Ghidra auto-detects the format (works for ELF, PE, Mach-O, etc.).
+ 
+     Args:
+         file_path: Absolute path to the binary file on disk
+@@ -56,6 +105,12 @@ async def import_file(
+         language: Language ID for raw binaries (e.g. "ARM:LE:32:Cortex", "x86:LE:64:default")
+         compiler_spec: Compiler spec ID (e.g. "default", "gcc"). Uses language default if omitted.
+         auto_analyze: Start auto-analysis after import (default: true)
++        loader: Ghidra loader class name, or "auto"
++        loader_args: Loader options by name, e.g. {"baseAddr": "0x8000"}
++        program_name: Name of the new program
++        analysis_options: Analyzer options set before analysis
++        if_exists: reuse (same bytes only), error or unique
++        wait: false returns after the import; analysis continues in the background
+     """
+     payload: dict = {
+         "file_path": file_path,
+@@ -66,6 +121,20 @@ async def import_file(
+         payload["language"] = language
+     if compiler_spec:
+         payload["compiler_spec"] = compiler_spec
++    for key, value in (
++        ("loader", loader),
++        ("loader_args", loader_args),
++        ("program_name", program_name),
++        ("analysis_options", analysis_options),
++    ):
++        if value:
++            payload[key] = value
++    # Only what differs from the server's defaults, so a call that uses none of the
++    # new options is the request it always was.
++    if if_exists != "reuse":
++        payload["if_exists"] = if_exists
++    if not wait:
++        payload["wait"] = False
+ 
+     result = await state.run_blocking_ghidra_call(dispatch.dispatch_post, "/import_file", payload)
+     # A refused import is a failed tool call, not a successful one that happens
+@@ -78,8 +147,10 @@ async def import_file(
+     except (json.JSONDecodeError, TypeError):
+         return result
+ 
+-    if data.get("data", {}).get("analyzing") and ctx is not None:
+-        program_name = data["data"].get("name", "unknown")
++    info = data.get("data", {}) if isinstance(data, dict) else {}
++    if info.get("analyzing") and ctx is not None:
++        # The path tells two programs of one name apart; the name is the fallback.
++        program_name = info.get("path") or info.get("name", "unknown")
+         # Capture the session before the tool call returns
+         session = ctx.request_context.session
+ 
+@@ -93,6 +164,13 @@ async def import_file(
+                     )
+                     status = json.loads(status_text)
+                     status_data = status.get("data", status)
++                    import_error = status_data.get("import_error")
++                    if import_error:
++                        await session.send_log_message(
++                            level="error",
++                            data=f"Analysis of {program_name} did not finish: {import_error}",
++                        )
++                        return
+                     if not status_data.get("analyzing", True):
+                         fn_count = status_data.get("function_count", "?")
+                         await session.send_log_message(
+diff --git a/src/main/java/com/xebyte/core/ImportRequest.java b/src/main/java/com/xebyte/core/ImportRequest.java
+new file mode 100644
+index 0000000..fd59588
+--- /dev/null
++++ b/src/main/java/com/xebyte/core/ImportRequest.java
+@@ -0,0 +1,82 @@
++package com.xebyte.core;
++
++import java.io.File;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Locale;
++import java.util.Map;
++
++/**
++ * What {@code /import_file} imports and how: the loader options AnalyzeHeadless takes
++ * ({@code -loader}, {@code -loader-<name>}, {@code -processor}, {@code -cspec}) and the name
++ * of the new program.
++ *
++ * @param file           the file to import
++ * @param folder         project folder as the caller wrote it; "/" when blank (resolved and
++ *                       scope-checked by {@link ProjectPaths} when the import runs)
++ * @param programName    name of the new program; the file name when blank
++ * @param loader         "" = auto-detect, or BinaryLoader when a language is given (the
++ *                       endpoint's original behaviour); "auto" = auto-detect with language and
++ *                       compiler spec as hints; otherwise a loader class name (BinaryLoader,
++ *                       MzLoader, ElfLoader, ...)
++ * @param loaderArgs     loader options by name, with or without the "-loader-" prefix
++ *                       (BinaryLoader's base address is "baseAddr")
++ * @param languageId     language ID or ""
++ * @param compilerSpecId compiler spec ID or ""
++ * @param ifExists       what to do when the folder already holds a program of that name:
++ *                       "reuse" it when it was imported from the same bytes (else refuse),
++ *                       "error", or import under a "unique" name
++ */
++public record ImportRequest(File file, String folder, String programName, String loader,
++        Map<String, String> loaderArgs, String languageId, String compilerSpecId,
++        String ifExists) {
++
++    public static final String REUSE = "reuse";
++    public static final String ERROR = "error";
++    public static final String UNIQUE = "unique";
++
++    public ImportRequest {
++        folder = folder == null || folder.isBlank() ? "/" : folder.trim();
++        programName = programName == null || programName.isBlank() ? file.getName() : programName.trim();
++        loader = loader == null ? "" : loader.trim();
++        loaderArgs = loaderArgs == null ? Map.of() : normalizeLoaderArgs(loaderArgs);
++        languageId = languageId == null ? "" : languageId.trim();
++        compilerSpecId = compilerSpecId == null ? "" : compilerSpecId.trim();
++        ifExists = ifExists == null || ifExists.isBlank() ? REUSE : ifExists.trim().toLowerCase(Locale.ROOT);
++        if (!List.of(REUSE, ERROR, UNIQUE).contains(ifExists)) {
++            throw new Refusal("if_exists must be reuse, error or unique");
++        }
++        if (programName.contains("/")) {
++            throw new Refusal("program_name must not contain '/'");
++        }
++    }
++
++    /** The original four-argument import: auto-detect, or BinaryLoader with a language. */
++    public static ImportRequest basic(File file, String folder, String languageId, String compilerSpecId) {
++        return new ImportRequest(file, folder, null, "", null, languageId, compilerSpecId, REUSE);
++    }
++
++    /**
++     * Keys as AnalyzeHeadless passes them to the loader ("-loader-&lt;name&gt;"); values as
++     * text, so a JSON number or boolean works as well as a string.
++     */
++    public static Map<String, String> normalizeLoaderArgs(Map<String, ?> raw) {
++        Map<String, String> out = new LinkedHashMap<>();
++        for (Map.Entry<String, ?> e : raw.entrySet()) {
++            String key = e.getKey() == null ? "" : e.getKey().trim();
++            if (key.isEmpty()) {
++                throw new Refusal("loader_args has an empty name");
++            }
++            out.put(key.startsWith("-loader-") ? key : "-loader-" + key,
++                e.getValue() == null ? "" : String.valueOf(e.getValue()));
++        }
++        return out;
++    }
++
++    List<generic.stl.Pair<String, String>> loaderArgPairs() {
++        List<generic.stl.Pair<String, String>> pairs = new ArrayList<>();
++        loaderArgs.forEach((k, v) -> pairs.add(new generic.stl.Pair<>(k, v)));
++        return pairs;
++    }
++}
+diff --git a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/java/com/xebyte/core/ProgramScriptService.java
+index c3b0411..89d5859 100644
+--- a/src/main/java/com/xebyte/core/ProgramScriptService.java
++++ b/src/main/java/com/xebyte/core/ProgramScriptService.java
+@@ -1796,16 +1796,24 @@ if (map instanceof ObjectPropertyMap) {
+ 
+     @McpTool(path = "/import_file", dryRun = false, method = "POST",
+             description = "Import a binary file from disk into the open project and open it. If the "
+-                + "destination folder already holds a file of that name, that file is opened instead "
+-                + "(reused_existing: true). For raw firmware binaries, specify language (e.g. "
+-                + "'ARM:LE:32:Cortex') and optionally compiler_spec (e.g. 'default').",
++                + "destination folder already holds a program of that name imported from the same bytes, "
++                + "that program is opened instead (reused_existing: true); other bytes are refused unless "
++                + "if_exists=unique. For raw firmware binaries, specify language (e.g. 'ARM:LE:32:Cortex') "
++                + "and optionally compiler_spec, plus loader_args {\"baseAddr\": \"0x8000\"} for a load "
++                + "address. loader picks a Ghidra loader as AnalyzeHeadless -loader does.",
+             category = "program", access = ToolAccess.WRITE)
+     public Response importFile(
+             @Param(value = "file_path", source = ParamSource.BODY, description = "Absolute path to the binary file on disk") String filePath,
+             @Param(value = "project_folder", source = ParamSource.BODY, defaultValue = "/", description = "Destination folder in the Ghidra project") String projectFolder,
+-            @Param(value = "language", source = ParamSource.BODY, defaultValue = "", description = "Language ID for raw binaries (e.g. 'ARM:LE:32:Cortex', 'x86:LE:64:default'). If omitted, auto-detect.") String languageId,
++            @Param(value = "language", source = ParamSource.BODY, defaultValue = "", description = "Language ID (e.g. 'ARM:LE:32:Cortex', 'x86:LE:64:default'). Without a loader it means a raw binary (BinaryLoader); with loader=auto or a named loader it is a hint. If omitted, auto-detect.") String languageId,
+             @Param(value = "compiler_spec", source = ParamSource.BODY, defaultValue = "", description = "Compiler spec ID (e.g. 'default', 'gcc', 'windows'). If omitted, uses language default.") String compilerSpecId,
+-            @Param(value = "auto_analyze", source = ParamSource.BODY, defaultValue = "true", description = "Run auto-analysis after import (not run on a reused existing file)") boolean autoAnalyze) {
++            @Param(value = "auto_analyze", source = ParamSource.BODY, defaultValue = "true", description = "Run auto-analysis after import (not run on a reused existing file)") boolean autoAnalyze,
++            @Param(value = "loader", source = ParamSource.BODY, defaultValue = "", description = "Ghidra loader: '' (auto-detect; BinaryLoader when a language is given), 'auto' (auto-detect, language/compiler_spec as hints), or a loader class name such as BinaryLoader, MzLoader, ElfLoader, PeLoader") String loader,
++            @Param(value = "loader_args", source = ParamSource.BODY, description = "Loader options by name, as AnalyzeHeadless -loader-<name> takes them, e.g. {\"baseAddr\": \"0x8000\"} for BinaryLoader") Map<String, ?> loaderArgs,
++            @Param(value = "program_name", source = ParamSource.BODY, defaultValue = "", description = "Name of the new program in the project; default: the file name") String programName,
++            @Param(value = "analysis_options", source = ParamSource.BODY, description = "Analyzer options set before auto-analysis, by option name, e.g. {\"Decompiler Switch Analysis\": \"false\"}; unknown names are refused") Map<String, ?> analysisOptions,
++            @Param(value = "if_exists", source = ParamSource.BODY, defaultValue = "reuse", description = "When the folder holds a program of that name: 'reuse' it if imported from the same bytes (else refuse), 'error', or 'unique' (import as name.1, name.2, ...)") String ifExists,
++            @Param(value = "wait", source = ParamSource.BODY, defaultValue = "true", description = "false: return once the program is imported and saved; auto-analysis continues in the background (watch /analysis_status)") boolean waitForAnalysis) {
+ 
+         if (filePath == null || filePath.trim().isEmpty()) {
+             return Response.err("file_path is required");
+@@ -1830,54 +1838,19 @@ if (map instanceof ObjectPropertyMap) {
+             return Response.err("This server cannot import programs");
+         }
+ 
++        String entered = null;
+         try {
+-            ProjectProgramProvider.Imported imported =
+-                provider.importFile(file, projectFolder, languageId, compilerSpecId);
+-            Program program = imported.program();
+-
+-            // NOTE: do NOT call markProgramNotToAskToAnalyze here, ahead of the
+-            // branches below. It mutates the program DB, and AutoAnalysisManager's
+-            // own DomainObjectListener reacts to *any* program change by scheduling
+-            // a background "Auto Analysis" task (the same mechanism documented on
+-            // ProgramSaves) -- confirmed root cause of a real, intermittent
+-            // bug: that premature background pass could already be "actively
+-            // running" by the time runAutoAnalysisAndPersistFlags below called its
+-            // own startAnalysis(), which per its own javadoc is then a no-op
+-            // ("if actively running... return immediately"), leaving
+-            // waitForAnalysis() to wait on whatever partial pass Ghidra's own
+-            // listener decided to run instead of the real one. Reproduced live:
+-            // a fresh import came back with function_count 9 instead of 530, with
+-            // analyzed:true and no error anywhere. Both branches below already set
+-            // this flag themselves, inside their own transaction, so the call here
+-            // was pure redundant risk with no benefit.
+-            boolean autoAnalyzed = false;
+-            if (autoAnalyze && !imported.reusedExisting()) {
+-                // force=true (reAnalyzeAll first): unconditionally re-queues every
+-                // analyzer regardless of anything Ghidra's own listeners may have
+-                // already scheduled, closing the race described above. Matches
+-                // /reanalyze, which has never shown this symptom.
+-                autoAnalyzed = runAutoAnalysisAndPersistFlags(program, true);
+-            } else {
+-                try {
+-                    suppressAnalysisPrompt(program);
+-                } catch (Exception e) {
+-                    Msg.warn(this, "Failed to save analysis prompt flags: " + e.getMessage());
+-                }
+-            }
+-
+-            String shown = showInWorkbench(program);
+-            Map<String, Object> out = new LinkedHashMap<>();
+-            out.put("success", true);
+-            out.put("name", program.getName());
+-            out.put("path", ProjectProgramProvider.keyFor(program));
+-            out.put("language", program.getLanguageID().getIdAsString());
+-            out.put("reused_existing", imported.reusedExisting());
+-            out.put("auto_analyzed", autoAnalyzed);
+-            out.put("function_count", program.getFunctionManager().getFunctionCount());
+-            if (shown != null) {
+-                out.put("codebrowser", shown);
+-            }
+-            return Response.ok(out);
++            ImportRequest request = new ImportRequest(file, projectFolder, programName, loader,
++                ImportRequest.normalizeLoaderArgs(loaderArgs == null ? Map.of() : loaderArgs),
++                languageId, compilerSpecId, ifExists);
++            Map<String, String> options = optionsAsText(analysisOptions);
++            // One import per destination at a time. The existence check and the import are not
++            // atomic, and Ghidra saves a second import of the same name as "<name>.0", a
++            // separate program; a waiting caller reuses the finished program instead.
++            String destination = ProjectPaths.normalize(request.folder()) + "\0" + request.programName();
++            enterImport(destination);
++            entered = destination;
++            return importLocked(provider, request, autoAnalyze, options, waitForAnalysis);
+         } catch (Refusal r) {
+             return Response.err(r.getMessage());
+         } catch (Exception e) {
+@@ -1891,9 +1864,209 @@ if (map instanceof ObjectPropertyMap) {
+             }
+             Msg.error(this, "Import failed", e);
+             return Response.err("Import failed: " + msg);
++        } finally {
++            if (entered != null) {
++                leaveImport(entered);
++            }
++        }
++    }
++
++    /** Destinations (folder + name) an import is running for; see {@link #enterImport}. */
++    private final Set<String> importsRunning = new HashSet<>();
++    /** Programs a wait=false import is still analyzing, and why one did not finish (see /analysis_status). */
++    private final Set<String> pendingImports = java.util.concurrent.ConcurrentHashMap.newKeySet();
++    private final Map<String, String> importFailures = Collections.synchronizedMap(
++        new LinkedHashMap<String, String>() {
++            @Override
++            protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
++                return size() > 64;
++            }
++        });
++
++    private void enterImport(String destination) throws IOException {
++        synchronized (importsRunning) {
++            while (!importsRunning.add(destination)) {
++                try {
++                    importsRunning.wait();
++                } catch (InterruptedException e) {
++                    Thread.currentThread().interrupt();
++                    throw new IOException("interrupted while waiting for another import of "
++                        + destination.replace('\0', '/'));
++                }
++            }
++        }
++    }
++
++    private void leaveImport(String destination) {
++        synchronized (importsRunning) {
++            importsRunning.remove(destination);
++            importsRunning.notifyAll();
+         }
+     }
+ 
++    private Response importLocked(ProjectProgramProvider provider, ImportRequest request,
++            boolean autoAnalyze, Map<String, String> analysisOptions, boolean waitForAnalysis)
++            throws Exception {
++        ProjectProgramProvider.Imported imported = provider.importFile(request);
++        Program program = imported.program();
++        String path = ProjectProgramProvider.keyFor(program);
++
++        // NOTE: do NOT call markProgramNotToAskToAnalyze here, ahead of the
++        // branches below. It mutates the program DB, and AutoAnalysisManager's
++        // own DomainObjectListener reacts to *any* program change by scheduling
++        // a background "Auto Analysis" task (the same mechanism documented on
++        // ProgramSaves) -- confirmed root cause of a real, intermittent
++        // bug: that premature background pass could already be "actively
++        // running" by the time runAutoAnalysisAndPersistFlags below called its
++        // own startAnalysis(), which per its own javadoc is then a no-op
++        // ("if actively running... return immediately"), leaving
++        // waitForAnalysis() to wait on whatever partial pass Ghidra's own
++        // listener decided to run instead of the real one. Reproduced live:
++        // a fresh import came back with function_count 9 instead of 530, with
++        // analyzed:true and no error anywhere. Both branches below already set
++        // this flag themselves, inside their own transaction, so the call here
++        // was pure redundant risk with no benefit.
++        Map<String, Object> out = new LinkedHashMap<>();
++        out.put("success", true);
++        // The project file's name: the loader names the program after the source file, whatever
++        // program_name said.
++        out.put("name", program.getDomainFile() != null ? program.getDomainFile().getName() : program.getName());
++        out.put("path", path);
++        out.put("language", program.getLanguageID().getIdAsString());
++        out.put("reused_existing", imported.reusedExisting());
++        if (imported.reusedExisting()) {
++            try {
++                suppressAnalysisPrompt(program);
++            } catch (Exception e) {
++                Msg.warn(this, "Failed to save analysis prompt flags: " + e.getMessage());
++            }
++            out.put("auto_analyzed", false);
++            if (pendingImports.contains(path)) {
++                out.put("analyzing", true);  // another caller's wait=false import is still analyzing it
++            }
++        } else {
++            // Options first, and synchronously: a name that does not exist fails this call,
++            // not a background thread nobody reads.
++            try {
++                if (!analysisOptions.isEmpty()) {
++                    applyAnalysisOptions(program, analysisOptions);
++                }
++            } catch (Exception e) {
++                discardImport(provider, program, e);
++                throw e;
++            }
++            if (waitForAnalysis) {
++                out.put("auto_analyzed", analyzeImported(program, autoAnalyze));
++            } else {
++                importFailures.remove(path);
++                pendingImports.add(path);
++                Thread worker = new Thread(() -> {
++                    try {
++                        if (!analyzeImported(program, autoAnalyze) && autoAnalyze) {
++                            importFailures.put(path, "auto-analysis did not complete; see the server log");
++                        }
++                    } catch (Exception e) {
++                        importFailures.put(path, e.getMessage() != null ? e.getMessage() : e.toString());
++                        Msg.error(this, "Background import of " + path + " failed", e);
++                    } finally {
++                        pendingImports.remove(path);
++                    }
++                }, "import-" + program.getName());
++                worker.setDaemon(true);
++                worker.start();
++                out.put("analyzing", true);
++            }
++        }
++        out.put("function_count", program.getFunctionManager().getFunctionCount());
++        String shown = showInWorkbench(program);
++        if (shown != null) {
++            out.put("codebrowser", shown);
++        }
++        return Response.ok(out);
++    }
++
++    /** Auto-analysis of a fresh import, or just the prompt flag when it is not wanted. */
++    private boolean analyzeImported(Program program, boolean autoAnalyze) throws Exception {
++        if (autoAnalyze) {
++            // force=true (reAnalyzeAll first): unconditionally re-queues every
++            // analyzer regardless of anything Ghidra's own listeners may have
++            // already scheduled, closing the race described above. Matches
++            // /reanalyze, which has never shown this symptom.
++            return runAutoAnalysisAndPersistFlags(program, true);
++        }
++        suppressAnalysisPrompt(program);
++        return false;
++    }
++
++    /**
++     * Remove an import that could not be finished as asked (an analysis option that does not
++     * exist), so a retry starts from the file instead of reusing a program that lacks what the
++     * caller asked for.
++     */
++    private void discardImport(ProjectProgramProvider provider, Program program, Exception cause) {
++        ghidra.framework.model.DomainFile df = program.getDomainFile();
++        try {
++            provider.closeProgramByPath(df.getPathname());
++            df.delete();
++        } catch (Exception e) {
++            cause.addSuppressed(e);
++            Msg.warn(this, "Could not remove the failed import " + df.getPathname() + ": " + e.getMessage());
++        }
++    }
++
++    /** JSON values as text: a number or boolean works as well as a string. */
++    private static Map<String, String> optionsAsText(Map<String, ?> raw) {
++        Map<String, String> out = new LinkedHashMap<>();
++        if (raw != null) {
++            raw.forEach((k, v) -> out.put(k, v == null ? "" : String.valueOf(v)));
++        }
++        return out;
++    }
++
++    /**
++     * Set analyzer options by name before the first analysis. An unknown name, a value that
++     * does not parse, or an option type import cannot set is refused and nothing is changed.
++     */
++    private void applyAnalysisOptions(Program program, Map<String, String> requested) throws Exception {
++        AutoAnalysisManager.getAnalysisManager(program).initializeOptions();
++        threadingStrategy.executeWrite(program, "Import analysis options", () -> {
++            Options options = program.getOptions(Program.ANALYSIS_PROPERTIES);
++            for (Map.Entry<String, String> e : requested.entrySet()) {
++                String name = e.getKey();
++                String value = e.getValue();
++                if (!options.contains(name)) {
++                    throw new Refusal("Unknown analysis option: " + name);
++                }
++                OptionType type = options.getType(name);
++                try {
++                    switch (type) {
++                        case BOOLEAN_TYPE -> options.setBoolean(name, parseBoolean(name, value));
++                        case INT_TYPE -> options.setInt(name, Integer.parseInt(value.trim()));
++                        case LONG_TYPE -> options.setLong(name, Long.parseLong(value.trim()));
++                        case DOUBLE_TYPE -> options.setDouble(name, Double.parseDouble(value.trim()));
++                        case STRING_TYPE -> options.setString(name, value);
++                        default -> throw new Refusal("Analysis option " + name + " has type " + type
++                            + ", which import cannot set");
++                    }
++                } catch (NumberFormatException bad) {
++                    throw new Refusal("Analysis option " + name + " is " + type + "; '" + value
++                        + "' is not a value of that type");
++                }
++            }
++            return null;
++        });
++    }
++
++    private static boolean parseBoolean(String name, String value) {
++        if ("true".equalsIgnoreCase(value.trim())) {
++            return true;
++        }
++        if ("false".equalsIgnoreCase(value.trim())) {
++            return false;
++        }
++        throw new Refusal("Analysis option " + name + " is a boolean; '" + value + "' is not true or false");
++    }
++
+     @McpTool(path = "/get_project_info",
+             description = "The open project: name, file count, whether it is bound to a Ghidra Server "
+                 + "(and which repository), and which programs are open. A shared project is what "
+@@ -1995,13 +2168,19 @@ if (map instanceof ObjectPropertyMap) {
+             } catch (Exception e) {
+                 // May not have an analysis manager in headless mode
+             }
+-            results.add(JsonHelper.mapOf(
++            String key = ProjectProgramProvider.keyFor(prog);
++            Map<String, Object> entry = new LinkedHashMap<>(JsonHelper.mapOf(
+                 "name", prog.getName(),
+-                "analyzing", analyzing,
++                "analyzing", analyzing || pendingImports.contains(key),
+                 "analyzed", analyzed,
+                 "should_ask_to_analyze", shouldAskToAnalyze,
+                 "function_count", prog.getFunctionManager().getFunctionCount()
+             ));
++            String importError = importFailures.get(key);
++            if (importError != null) {
++                entry.put("import_error", importError);  // a wait=false import that did not finish
++            }
++            results.add(entry);
+         }
+ 
+         if (programName != null && !programName.isEmpty() && results.isEmpty()) {
+diff --git a/src/main/java/com/xebyte/core/ProjectProgramProvider.java b/src/main/java/com/xebyte/core/ProjectProgramProvider.java
+index 228d9dd..59d351e 100644
+--- a/src/main/java/com/xebyte/core/ProjectProgramProvider.java
++++ b/src/main/java/com/xebyte/core/ProjectProgramProvider.java
+@@ -191,7 +191,10 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
+             }
+             return null;
+         }
+-        return unique(programs, s, p -> p.getName().equalsIgnoreCase(s));
++        // The project file's name counts as well as the program's own: a program imported with a
++        // program_name keeps the source file's name inside, but is the file the caller named.
++        return unique(programs, s, p -> p.getName().equalsIgnoreCase(s)
++            || (p.getDomainFile() != null && s.equalsIgnoreCase(p.getDomainFile().getName())));
+     }
+ 
+     private static Program matchSubstring(Collection<Program> programs, String wanted) {
+@@ -472,59 +475,96 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
+ 
+     /**
+      * Import a binary into {@code folder} and open it, or open the file already there.
++     * The original four-argument import: auto-detect, or BinaryLoader with a language.
+      *
+-     * <p>A file of the same name already in the folder is opened instead of re-imported:
+-     * a second import would fail on the duplicate name, and repeated imports are how a
+-     * scripted setup stays idempotent. The caller learns which happened.
++     * @see #importFile(ImportRequest)
++     */
++    public Imported importFile(java.io.File file, String folder, String languageId,
++            String compilerSpecId) throws Exception {
++        return importFile(ImportRequest.basic(file, folder, languageId, compilerSpecId));
++    }
++
++    /**
++     * Import as {@code request} says (loader, loader options, name) and open the result, or
++     * deal with the program the folder already holds under that name (see
++     * {@link ImportRequest#ifExists()}).
++     *
++     * <p>By default a program of the same name already in the folder is opened instead of
++     * re-imported, but only when it was imported from the same bytes: repeated imports are how
++     * a scripted setup stays idempotent, while opening a different binary under the requested
++     * name would answer the next question about the wrong program. A program that records no
++     * hash (not made by an import) is reused as before. The caller learns which happened.
+      *
+      * <p>The importer's own references are dropped once the file is saved, and the saved
+      * file is opened through {@link #openDomainFile} like any other: the program then has
+      * exactly one reference, the cache's, which eviction and close manage. With no project
+      * the program stays in memory under the provider's consumer.
+      *
+-     * @param languageId     empty to auto-detect the format; set for raw binaries
+-     * @param compilerSpecId empty for the language's default; only read with a language
++     * @throws Refusal when the request cannot be served as asked (name taken, other bytes,
++     *                 unknown loader or language, no loader recognised the file)
+      */
+-    public Imported importFile(java.io.File file, String folder, String languageId,
+-            String compilerSpecId) throws Exception {
++    public Imported importFile(ImportRequest request) throws Exception {
++        java.io.File file = request.file();
+         Project project = project();
+-        String dest = folder == null || folder.isBlank() ? "/" : folder;
+-        String language = languageId == null ? "" : languageId.trim();
+-        String compiler = compilerSpecId == null ? "" : compilerSpecId.trim();
++        String dest = request.folder();
++        String name = request.programName();
++        String language = request.languageId();
++        String compiler = request.compilerSpecId();
+ 
+         if (project != null) {
+             // Normalize + scope (+ create missing) before the importer sees the path.
+             ghidra.framework.model.DomainFolder target = ProjectPaths.folder(project, dest, true);
+             dest = target.getPathname();
+-            DomainFile existing = target.getFile(file.getName());
++            DomainFile existing = target.getFile(name);
+             if (existing != null) {
+-                return new Imported(openDomainFile(existing), true);
++                switch (request.ifExists()) {
++                    case ImportRequest.ERROR ->
++                        throw new Refusal(existing.getPathname() + " already exists");
++                    case ImportRequest.UNIQUE -> name = uniqueName(target, name);
++                    default -> {
++                        refuseOtherBytes(existing, file);
++                        return new Imported(openDomainFile(existing), true);
++                    }
++                }
+             }
+         } else {
+             dest = ProjectPaths.normalize(dest);
+         }
+ 
+         ghidra.app.util.importer.MessageLog log = new ghidra.app.util.importer.MessageLog();
++        ghidra.app.util.importer.ProgramLoader.Builder builder =
++            ghidra.app.util.importer.ProgramLoader.builder()
++                .source(file)
++                .project(project)
++                .projectFolderPath(dest)
++                .name(name)
++                .loaderArgs(request.loaderArgPairs())
++                .log(log)
++                .monitor(monitor);
++        String loader = request.loader();
++        if (loader.isEmpty() && !language.isEmpty()) {
++            loader = "BinaryLoader";  // the original meaning of a bare language: a raw binary
++        }
+         ghidra.app.util.opinion.LoadResults<Program> results;
+-        if (language.isEmpty()) {
+-            results = ghidra.app.util.importer.AutoImporter.importByUsingBestGuess(
+-                file, project, dest, consumer, log, monitor);
+-            if (results == null) {
+-                throw new java.io.IOException("no loader recognised " + file.getName()
+-                    + "; for a raw binary pass a language (e.g. 'ARM:LE:32:Cortex'). " + log);
++        try {
++            if (!loader.isEmpty() && !loader.equalsIgnoreCase("auto")) {
++                builder.loaders(loader);
+             }
+-        } else {
+-            ghidra.program.model.lang.Language lang = ghidra.program.util.DefaultLanguageService
+-                .getLanguageService().getLanguage(new ghidra.program.model.lang.LanguageID(language));
+-            ghidra.program.model.lang.CompilerSpec spec = compiler.isEmpty()
+-                ? lang.getDefaultCompilerSpec()
+-                : lang.getCompilerSpecByID(new ghidra.program.model.lang.CompilerSpecID(compiler));
+-            ghidra.app.util.opinion.Loaded<Program> loaded = ghidra.app.util.importer.AutoImporter
+-                .importAsBinary(file, project, dest, lang, spec, consumer, log, monitor);
+-            if (loaded == null) {
+-                throw new java.io.IOException("import as " + language + " produced nothing. " + log);
++            if (!language.isEmpty()) {
++                builder.language(language);
++                if (!compiler.isEmpty()) {
++                    builder.compiler(compiler);
++                }
+             }
+-            results = new ghidra.app.util.opinion.LoadResults<>(loaded);
++            results = builder.load();
++        } catch (ghidra.util.exception.InvalidInputException
++                | ghidra.program.model.lang.LanguageNotFoundException
++                | ghidra.app.util.opinion.LoadException e) {
++            throw new Refusal((loader.isEmpty()
++                ? "No loader recognised " + file.getName()
++                    + "; for a raw binary pass a language (e.g. 'ARM:LE:32:Cortex')"
++                : "Cannot import " + file.getName() + " with loader " + loader)
++                + ": " + e.getMessage() + " " + log);
+         }
+ 
+         if (project == null) {
+@@ -545,6 +585,50 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
+         return new Imported(openDomainFile(saved), false);
+     }
+ 
++    /**
++     * The domain-file metadata key under which a program stores {@code getExecutableSHA256()}
++     * (a private constant of ProgramDB). Read from the metadata, so a program that is not open
++     * need not be opened to be compared.
++     */
++    private static final String EXECUTABLE_SHA256_KEY = "Executable SHA256";
++
++    /** Refuse to reuse {@code existing} when it records a hash other than {@code file}'s. */
++    private static void refuseOtherBytes(DomainFile existing, java.io.File file) throws java.io.IOException {
++        String held = existing.getMetadata().get(EXECUTABLE_SHA256_KEY);
++        if (held == null || held.isBlank()) {
++            return;
++        }
++        String sha = sha256(file);
++        if (!held.equalsIgnoreCase(sha)) {
++            throw new Refusal(existing.getPathname() + " was imported from other bytes (sha256 "
++                + held + "; this file " + sha + "). Import with if_exists=unique, another "
++                + "program_name or another project_folder.");
++        }
++    }
++
++    /** {@code name}, or the first of {@code name.1}, {@code name.2}, ... the folder does not hold. */
++    static String uniqueName(ghidra.framework.model.DomainFolder folder, String name) {
++        for (int i = 1; ; i++) {
++            String candidate = name + "." + i;
++            if (folder.getFile(candidate) == null) {
++                return candidate;
++            }
++        }
++    }
++
++    static String sha256(java.io.File file) throws java.io.IOException {
++        try (java.io.InputStream in = new java.io.FileInputStream(file)) {
++            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
++            byte[] buf = new byte[1 << 16];
++            for (int n; (n = in.read(buf)) > 0; ) {
++                digest.update(buf, 0, n);
++            }
++            return java.util.HexFormat.of().formatHex(digest.digest());
++        } catch (java.security.NoSuchAlgorithmException e) {
++            throw new java.io.IOException(e);
++        }
++    }
++
+     /**
+      * Whether the open project is bound to a Ghidra Server: which repository, where
+      * ({@code serverInfo}, host:port, null when it cannot be read), and whether connected.
+diff --git a/src/test/java/com/xebyte/core/ProgramImportGhidraTest.java b/src/test/java/com/xebyte/core/ProgramImportGhidraTest.java
+new file mode 100644
+index 0000000..e05ed78
+--- /dev/null
++++ b/src/test/java/com/xebyte/core/ProgramImportGhidraTest.java
+@@ -0,0 +1,294 @@
++package com.xebyte.core;
++
++import com.xebyte.headless.DirectThreadingStrategy;
++import com.xebyte.headless.HeadlessProgramProvider;
++import ghidra.GhidraApplicationLayout;
++import ghidra.base.project.GhidraProject;
++import ghidra.framework.Application;
++import ghidra.framework.ApplicationConfiguration;
++import ghidra.framework.data.ContentHandler;
++import ghidra.framework.data.DomainObjectAdapter;
++import ghidra.framework.model.DomainFile;
++import ghidra.framework.model.Project;
++import ghidra.program.database.DataTypeArchiveContentHandler;
++import ghidra.program.database.DataTypeArchiveDB;
++import ghidra.program.database.ProgramContentHandler;
++import ghidra.program.model.listing.Program;
++import org.junit.After;
++import org.junit.Before;
++import org.junit.BeforeClass;
++import org.junit.Test;
++
++import java.io.File;
++import java.io.IOException;
++import java.lang.reflect.Field;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.ArrayList;
++import java.util.Comparator;
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.Callable;
++import java.util.concurrent.ExecutorService;
++import java.util.concurrent.Executors;
++import java.util.concurrent.Future;
++import java.util.stream.Stream;
++
++import static org.junit.Assert.*;
++import static org.junit.Assume.assumeTrue;
++
++/**
++ * {@code /import_file}'s loader options against a real temp project and the real loaders:
++ * a raw binary at a base address, a DOS .COM at 1000:0100, the same-bytes reuse rule,
++ * {@code if_exists}, analysis options, {@code wait=false}, and two clients importing one file.
++ */
++public class ProgramImportGhidraTest {
++
++    private static final String X86_REAL = "x86:LE:16:Real Mode";
++
++    private Path tmp;
++    private GhidraProject ghidraProject;
++    private HeadlessProgramProvider provider;
++    private ProgramScriptService service;
++
++    @BeforeClass
++    public static void initializeGhidra() throws Exception {
++        String installDir = System.getenv("GHIDRA_INSTALL_DIR");
++        assumeTrue("GHIDRA_INSTALL_DIR is required for real Ghidra tests",
++            installDir != null && !installDir.isBlank());
++        if (!Application.isInitialized()) {
++            ApplicationConfiguration configuration = new ApplicationConfiguration();
++            configuration.setInitializeLogging(false);
++            Application.initializeApplication(new GhidraApplicationLayout(new File(installDir)),
++                configuration);
++        }
++        ghidra.framework.protocol.ghidra.Handler.registerHandler();
++        installContentHandlers();
++        // The loaders (and the analyzers) are found by the class searcher, not by name.
++        ghidra.util.classfinder.ClassSearcher.search(ghidra.util.task.TaskMonitor.DUMMY);
++    }
++
++    @SuppressWarnings("unchecked")
++    private static void installContentHandlers() throws Exception {
++        try {
++            DomainObjectAdapter.getContentHandler(DataTypeArchiveDB.class);
++            return;
++        } catch (IOException notFound) {
++            // fall through
++        }
++        Map<String, ContentHandler<?>> byType = new HashMap<>();
++        Map<Class<?>, ContentHandler<?>> byClass = new HashMap<>();
++        for (ContentHandler<?> h : List.of(new DataTypeArchiveContentHandler(), new ProgramContentHandler())) {
++            byType.put(h.getContentType(), h);
++            byClass.put(h.getDomainObjectClass(), h);
++        }
++        Field type = DomainObjectAdapter.class.getDeclaredField("contentHandlerTypeMap");
++        Field cls = DomainObjectAdapter.class.getDeclaredField("contentHandlerClassMap");
++        type.setAccessible(true);
++        cls.setAccessible(true);
++        type.set(null, new HashMap<>(byType));
++        cls.set(null, new HashMap<>(byClass));
++    }
++
++    @Before
++    public void setUp() throws Exception {
++        tmp = Files.createTempDirectory("program-import");
++        ghidraProject = GhidraProject.createProject(tmp.toString(), "import", false);
++        Project project = ghidraProject.getProject();
++        provider = new HeadlessProgramProvider(project);
++        service = new ProgramScriptService(provider, new DirectThreadingStrategy());
++    }
++
++    @After
++    public void tearDown() throws Exception {
++        for (Program p : provider.getAllOpenPrograms()) {
++            provider.closeProgramByPath(p.getDomainFile().getPathname());
++        }
++        ghidraProject.close();
++        try (Stream<Path> walk = Files.walk(tmp)) {
++            walk.sorted(Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
++        }
++    }
++
++    private File file(String name, byte[] bytes) throws IOException {
++        File f = tmp.resolve(name).toFile();
++        Files.write(f.toPath(), bytes);
++        return f;
++    }
++
++    private static byte[] bytes(int length, int fill) {
++        byte[] b = new byte[length];
++        java.util.Arrays.fill(b, (byte) fill);
++        return b;
++    }
++
++    @SuppressWarnings("unchecked")
++    private static Map<String, Object> ok(Response r) {
++        assertTrue("expected Ok, got " + r, r instanceof Response.Ok);
++        return (Map<String, Object>) ((Response.Ok) r).data();
++    }
++
++    private static String err(Response r) {
++        assertTrue("expected Err, got " + r, r instanceof Response.Err);
++        return ((Response.Err) r).message();
++    }
++
++    /** The 11-argument form with everything not named left at the endpoint's defaults. */
++    private Response importFile(File file, String folder, String language, String loader,
++            Map<String, ?> loaderArgs, String programName, Map<String, ?> analysisOptions,
++            String ifExists, boolean wait) {
++        return service.importFile(file.getPath(), folder, language, "", false, loader, loaderArgs,
++            programName, analysisOptions, ifExists, wait);
++    }
++
++    private Response importPlain(File file) {
++        return importFile(file, "/", X86_REAL, "", null, "", null, "reuse", true);
++    }
++
++    @Test
++    public void aRawBinaryLoadsAtTheBaseAddressTheCallerNames() throws Exception {
++        File com = file("hello.com", bytes(64, 0x90));
++
++        Map<String, Object> out = ok(importFile(com, "/dos", X86_REAL, "", Map.of("baseAddr", "1000:0100"),
++            "", null, "reuse", true));
++
++        assertEquals("/dos/hello.com", out.get("path"));
++        assertEquals(false, out.get("reused_existing"));
++        Program program = provider.getProgram("/dos/hello.com");
++        assertEquals("1000:0100", program.getMemory().getMinAddress().toString());
++        assertEquals(X86_REAL, program.getLanguageID().getIdAsString());
++    }
++
++    @Test
++    public void aBareLanguageStillMeansBinaryLoader() throws Exception {
++        Map<String, Object> out = ok(importPlain(file("fw.bin", bytes(32, 1))));
++
++        assertEquals("/fw.bin", out.get("path"));
++        assertEquals("Raw Binary", provider.getProgram("/fw.bin").getExecutableFormat());
++    }
++
++    @Test
++    public void aNamedLoaderAndProgramNameAreHonoured() throws Exception {
++        Map<String, Object> out = ok(importFile(file("raw", bytes(32, 2)), "/", X86_REAL, "BinaryLoader",
++            Map.of("baseAddr", "0x4000"), "renamed.bin", null, "reuse", true));
++
++        assertEquals("/renamed.bin", out.get("path"));
++        assertEquals("renamed.bin", out.get("name"));
++        // The loader names the program after the file; the project file carries the new name,
++        // and a lookup by that name must find the open program all the same.
++        ok(service.analysisStatus("renamed.bin"));
++    }
++
++    @Test
++    public void anUnknownLoaderAndAnUnknownLanguageAreRefusals() throws Exception {
++        File f = file("fw.bin", bytes(32, 3));
++
++        String loader = err(importFile(f, "/", X86_REAL, "NoSuchLoader", null, "", null, "reuse", true));
++        assertTrue(loader, loader.contains("NoSuchLoader"));
++        assertFalse(loader, loader.startsWith("Import failed"));
++
++        String language = err(importFile(f, "/", "nowhere:LE:99:none", "", null, "", null, "reuse", true));
++        assertFalse(language, language.startsWith("Import failed"));
++        assertNull("nothing was imported", provider.getProject().getProjectData().getFile("/fw.bin"));
++    }
++
++    @Test
++    public void theSameBytesAreReusedAndOtherBytesRefused() throws Exception {
++        File f = file("fw.bin", bytes(32, 4));
++        assertEquals(false, ok(importPlain(f)).get("reused_existing"));
++
++        assertEquals(true, ok(importPlain(f)).get("reused_existing"));
++
++        Files.write(f.toPath(), bytes(32, 5));
++        String refused = err(importPlain(f));
++        assertTrue(refused, refused.contains("was imported from other bytes"));
++        assertEquals("still one program", 1, provider.getProject().getProjectData().getRootFolder().getFiles().length);
++    }
++
++    @Test
++    public void ifExistsUniqueAndErrorChooseTheName() throws Exception {
++        File f = file("fw.bin", bytes(32, 6));
++        ok(importPlain(f));
++
++        Map<String, Object> second = ok(importFile(f, "/", X86_REAL, "", null, "", null, "unique", true));
++        Map<String, Object> third = ok(importFile(f, "/", X86_REAL, "", null, "", null, "unique", true));
++        assertEquals("/fw.bin.1", second.get("path"));
++        assertEquals("/fw.bin.2", third.get("path"));
++        assertEquals(false, second.get("reused_existing"));
++
++        assertEquals("/fw.bin already exists",
++            err(importFile(f, "/", X86_REAL, "", null, "", null, "error", true)));
++    }
++
++    @Test
++    public void anUnknownAnalysisOptionRefusesAndLeavesNothingBehind() throws Exception {
++        File f = file("fw.bin", bytes(32, 7));
++
++        String refused = err(service.importFile(f.getPath(), "/", X86_REAL, "", true, "", null, "",
++            Map.of("No Such Analyzer Option", "true"), "reuse", true));
++
++        assertEquals("Unknown analysis option: No Such Analyzer Option", refused);
++        assertNull("a retry must start from the file", provider.getProject().getProjectData().getFile("/fw.bin"));
++        assertEquals(0, provider.getAllOpenPrograms().length);
++    }
++
++    @Test
++    public void aKnownAnalysisOptionIsSetBeforeAnalysis() throws Exception {
++        File f = file("fw.bin", bytes(32, 8));
++        String option = "Decompiler Switch Analysis";
++
++        ok(service.importFile(f.getPath(), "/", X86_REAL, "", true, "", null, "",
++            Map.of(option, false), "reuse", true));
++
++        Program program = provider.getProgram("/fw.bin");
++        assertEquals("false", program.getOptions(Program.ANALYSIS_PROPERTIES).getValueAsString(option));
++    }
++
++    @Test
++    public void waitFalseReturnsAtOnceAndAnalysisStatusReportsTheEnd() throws Exception {
++        File f = file("fw.bin", bytes(256, 0x90));
++
++        Map<String, Object> out = ok(service.importFile(f.getPath(), "/", X86_REAL, "", true, "", null, "",
++            null, "reuse", false));
++
++        assertEquals(true, out.get("analyzing"));
++        long deadline = System.currentTimeMillis() + 60_000;
++        Map<String, Object> status;
++        do {
++            Thread.sleep(100);
++            status = ok(service.analysisStatus("/fw.bin"));
++        } while (Boolean.TRUE.equals(status.get("analyzing")) && System.currentTimeMillis() < deadline);
++        assertEquals(false, status.get("analyzing"));
++        assertEquals(true, status.get("analyzed"));
++        assertFalse(status.containsKey("import_error"));
++    }
++
++    /** Two clients import the same new file at once: one program, not "<name>" and "<name>.0". */
++    @Test
++    public void concurrentImportsOfOneNewFileMakeOneProgram() throws Exception {
++        File f = file("fw.bin", bytes(32, 9));
++        ExecutorService pool = Executors.newFixedThreadPool(4);
++        try {
++            List<Callable<Response>> calls = new ArrayList<>();
++            for (int i = 0; i < 4; i++) {
++                calls.add(() -> importPlain(f));
++            }
++            int fresh = 0;
++            for (Future<Response> done : pool.invokeAll(calls)) {
++                if (Boolean.FALSE.equals(ok(done.get()).get("reused_existing"))) {
++                    fresh++;
++                }
++            }
++            assertEquals("exactly one call imports; the others reuse its program", 1, fresh);
++        } finally {
++            pool.shutdownNow();
++        }
++
++        List<String> names = new ArrayList<>();
++        for (DomainFile df : provider.getProject().getProjectData().getRootFolder().getFiles()) {
++            names.add(df.getName());
++        }
++        assertEquals(List.of("fw.bin"), names);
++    }
++}
+diff --git a/src/test/java/com/xebyte/offline/ImportRequestTest.java b/src/test/java/com/xebyte/offline/ImportRequestTest.java
+new file mode 100644
+index 0000000..ded1b0b
+--- /dev/null
++++ b/src/test/java/com/xebyte/offline/ImportRequestTest.java
+@@ -0,0 +1,68 @@
++package com.xebyte.offline;
++
++import com.xebyte.core.ImportRequest;
++import com.xebyte.core.Refusal;
++import org.junit.Test;
++
++import java.io.File;
++import java.util.LinkedHashMap;
++import java.util.Map;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertThrows;
++import static org.junit.Assert.assertTrue;
++
++/** What {@code /import_file} accepts: defaults, loader option names, and the refusals. */
++public class ImportRequestTest {
++
++    @Test
++    public void loaderArgsGetTheHeadlessPrefixOnce() {
++        Map<String, Object> raw = new LinkedHashMap<>();
++        raw.put("baseAddr", "1000:0100");
++        raw.put("-loader-applyLabels", true);
++        raw.put("blockName", 7);
++        assertEquals(
++            Map.of("-loader-baseAddr", "1000:0100", "-loader-applyLabels", "true",
++                "-loader-blockName", "7"),
++            ImportRequest.normalizeLoaderArgs(raw));
++    }
++
++    @Test
++    public void aLoaderArgWithoutANameIsRefused() {
++        assertThrows(Refusal.class, () -> ImportRequest.normalizeLoaderArgs(Map.of(" ", "1")));
++    }
++
++    @Test
++    public void blankFieldsTakeTheirDefaults() {
++        ImportRequest r = new ImportRequest(new File("/w/fw.bin"), " ", null, null, null, null, null, null);
++        assertEquals("/", r.folder());
++        assertEquals("fw.bin", r.programName());
++        assertEquals("", r.loader());
++        assertTrue(r.loaderArgs().isEmpty());
++        assertEquals(ImportRequest.REUSE, r.ifExists());
++    }
++
++    @Test
++    public void theFourArgumentImportKeepsItsMeaning() {
++        ImportRequest r = ImportRequest.basic(new File("/w/fw.bin"), "/fw", "ARM:LE:32:Cortex", "default");
++        assertEquals("", r.loader());  // the provider turns a bare language into BinaryLoader
++        assertEquals("ARM:LE:32:Cortex", r.languageId());
++        assertEquals("default", r.compilerSpecId());
++        assertEquals(ImportRequest.REUSE, r.ifExists());
++    }
++
++    @Test
++    public void ifExistsIsCaseInsensitiveAndOneOfThree() {
++        assertEquals(ImportRequest.UNIQUE,
++            new ImportRequest(new File("/w/x"), "/", null, "", null, "", "", " Unique ").ifExists());
++        Refusal bad = assertThrows(Refusal.class, () ->
++            new ImportRequest(new File("/w/x"), "/", null, "", null, "", "", "replace"));
++        assertEquals("if_exists must be reuse, error or unique", bad.getMessage());
++    }
++
++    @Test
++    public void aProgramNameIsOneProjectFileNotAPath() {
++        assertThrows(Refusal.class, () ->
++            new ImportRequest(new File("/w/x"), "/", "a/b", "", null, "", "", null));
++    }
++}
+diff --git a/src/test/java/com/xebyte/offline/ProgramScriptServiceValidationTest.java b/src/test/java/com/xebyte/offline/ProgramScriptServiceValidationTest.java
+index 5307fa2..4704024 100644
+--- a/src/test/java/com/xebyte/offline/ProgramScriptServiceValidationTest.java
++++ b/src/test/java/com/xebyte/offline/ProgramScriptServiceValidationTest.java
+@@ -40,7 +40,7 @@ public class ProgramScriptServiceValidationTest extends TestCase {
+     }
+ 
+     public void testImportFileRequiresFilePath() {
+-        Response r = scripts.importFile("", "/", "", "", true);
++        Response r = scripts.importFile("", "/", "", "", true, "", null, "", null, "reuse", true);
+         assertTrue(r instanceof Response.Err);
+         assertTrue(((Response.Err) r).message().contains("file_path is required"));
+     }
+diff --git a/src/test/java/com/xebyte/offline/ProjectProgramProviderTest.java b/src/test/java/com/xebyte/offline/ProjectProgramProviderTest.java
+index e639fa7..cd0eb55 100644
+--- a/src/test/java/com/xebyte/offline/ProjectProgramProviderTest.java
++++ b/src/test/java/com/xebyte/offline/ProjectProgramProviderTest.java
+@@ -3,8 +3,10 @@ package com.xebyte.offline;
+ import com.xebyte.core.AmbiguousProgramException;
+ import com.xebyte.core.AnnotationScanner;
+ import com.xebyte.core.EndpointDef;
++import com.xebyte.core.ImportRequest;
+ import com.xebyte.core.ProgramScriptService;
+ import com.xebyte.core.ProjectProgramProvider;
++import com.xebyte.core.Refusal;
+ import com.xebyte.core.Response;
+ import com.xebyte.headless.HeadlessProgramProvider;
+ import ghidra.framework.model.DomainFile;
+@@ -98,6 +100,15 @@ public class ProjectProgramProviderTest {
+         assertSame(v2, ProjectProgramProvider.match(List.of(v1, v2), "/1.13d/D2Common.dll"));
+     }
+ 
++    @Test
++    public void aProgramImportedUnderAnotherNameIsFoundByTheFileName() {
++        // The loader names the program after the source file; program_name names the project file.
++        Program p = programAt("/fw/renamed.bin");
++        when(p.getName()).thenReturn("raw");
++        assertSame(p, ProjectProgramProvider.match(List.of(p), "renamed.bin"));
++        assertSame(p, ProjectProgramProvider.match(List.of(p), "raw"));
++    }
++
+     @Test
+     public void bareNameShared_byTwoVersionsIsAmbiguousNotAGuess() {
+         Program v1 = programAt("/1.10/D2Common.dll");
+@@ -316,6 +327,72 @@ public class ProjectProgramProviderTest {
+         assertArrayEquals(new Program[] {existing}, f.getAllOpenPrograms());
+     }
+ 
++    /** A folder holding /fw/blob.bin, whose recorded hash is {@code held} (null: none recorded). */
++    private static Program existingBlob(Fixture f, String held) throws Exception {
++        Program existing = f.file("/fw/blob.bin");
++        DomainFile existingFile = existing.getDomainFile();
++        when(existingFile.getMetadata()).thenReturn(
++            held == null ? Map.of() : Map.of("Executable SHA256", held));
++        DomainFolder folder = mock(DomainFolder.class);
++        when(folder.getFile("blob.bin")).thenReturn(existingFile);
++        when(f.data.getFolder("/fw")).thenReturn(folder);
++        return existing;
++    }
++
++    private static java.io.File blobWith(String content) throws Exception {
++        // Named blob.bin like the project's file, in a directory of its own.
++        java.io.File file = new java.io.File(java.nio.file.Files.createTempDirectory("blob").toFile(), "blob.bin");
++        file.deleteOnExit();
++        java.nio.file.Files.writeString(file.toPath(), content);
++        return file;
++    }
++
++    private static String sha256Of(java.io.File file) throws Exception {
++        return java.util.HexFormat.of().formatHex(java.security.MessageDigest.getInstance("SHA-256")
++            .digest(java.nio.file.Files.readAllBytes(file.toPath())));
++    }
++
++    @Test
++    public void aSameNamedFileIsReusedWhenItWasImportedFromTheSameBytes() throws Exception {
++        Fixture f = new Fixture();
++        java.io.File file = blobWith("same bytes");
++        Program existing = existingBlob(f, sha256Of(file).toUpperCase());
++
++        ProjectProgramProvider.Imported imported = f.importFile(file, "/fw", "", "");
++
++        assertTrue(imported.reusedExisting());
++        assertSame(existing, imported.program());
++    }
++
++    @Test
++    public void aSameNamedFileFromOtherBytesIsRefusedNotOpened() throws Exception {
++        Fixture f = new Fixture();
++        existingBlob(f, sha256Of(blobWith("the first binary")));
++
++        try {
++            f.importFile(blobWith("another binary"), "/fw", "", "");
++            fail("opening a different binary under the requested name answers about the wrong program");
++        } catch (Refusal r) {
++            assertTrue(r.getMessage(), r.getMessage().contains("/fw/blob.bin was imported from other bytes"));
++            assertTrue(r.getMessage(), r.getMessage().contains("if_exists=unique"));
++        }
++        assertEquals("the refused program was not opened", 0, f.getAllOpenPrograms().length);
++    }
++
++    @Test
++    public void ifExistsErrorRefusesAnyFileOfThatName() throws Exception {
++        Fixture f = new Fixture();
++        java.io.File file = blobWith("same bytes");
++        existingBlob(f, sha256Of(file));
++
++        try {
++            f.importFile(new ImportRequest(file, "/fw", null, "", null, "", "", "error"));
++            fail("if_exists=error must refuse even the same bytes");
++        } catch (Refusal r) {
++            assertEquals("/fw/blob.bin already exists", r.getMessage());
++        }
++    }
++
+     @Test
+     public void projectInfoIsTheSameShapeWithoutAGui() throws Exception {
+         Fixture f = new Fixture();
+diff --git a/tests/endpoints.json b/tests/endpoints.json
+index ff90807..f84268b 100644
+--- a/tests/endpoints.json
++++ b/tests/endpoints.json
+@@ -1918,7 +1918,13 @@
+         "project_folder",
+         "language",
+         "compiler_spec",
+-        "auto_analyze"
++        "auto_analyze",
++        "loader",
++        "loader_args",
++        "program_name",
++        "analysis_options",
++        "if_exists",
++        "wait"
+       ],
+       "servers": [
+         "gui",
+diff --git a/tests/unit/test_static_tools.py b/tests/unit/test_static_tools.py
+index f48daed..263f5ae 100644
+--- a/tests/unit/test_static_tools.py
++++ b/tests/unit/test_static_tools.py
+@@ -719,6 +719,47 @@ class TestImportFile(unittest.TestCase):
+             },
+         )
+ 
++    def test_loader_options_are_forwarded_and_unset_ones_are_not(self):
++        """A DOS .COM needs BinaryLoader at 1000:0100: loader, loader_args and
++        program_name reach the server; an option left out is not sent."""
++        with (
++            isolated_bridge() as bridge,
++            patch.object(bridge.dispatch, "dispatch_post", return_value='{"data": {}}') as post,
++        ):
++            asyncio.run(
++                bridge.import_file(
++                    "/dos/hello.com",
++                    language="x86:LE:16:Real Mode",
++                    loader="BinaryLoader",
++                    loader_args={"baseAddr": "1000:0100"},
++                    program_name="hello.com.1",
++                    analysis_options={"Decompiler Switch Analysis": "false"},
++                    if_exists="unique",
++                    wait=False,
++                )
++            )
++
++        post.assert_called_once_with(
++            "/import_file",
++            {
++                "file_path": "/dos/hello.com",
++                "project_folder": "/",
++                "auto_analyze": True,
++                "language": "x86:LE:16:Real Mode",
++                "loader": "BinaryLoader",
++                "loader_args": {"baseAddr": "1000:0100"},
++                "program_name": "hello.com.1",
++                "analysis_options": {"Decompiler Switch Analysis": "false"},
++                "if_exists": "unique",
++                "wait": False,
++            },
++        )
++
++    def test_import_waits_for_analysis_for_up_to_the_script_timeout(self):
++        """wait=true covers auto-analysis, which takes minutes on a real binary."""
++        with isolated_bridge() as bridge:
++            self.assertEqual(bridge.dispatch.get_timeout("/import_file"), 1800)
++
+     def test_non_json_response_is_returned_verbatim(self):
+         """The Ghidra server can answer with a plain-text error; import_file
+         must pass it through instead of raising a JSONDecodeError."""
+@@ -792,6 +833,60 @@ class TestImportFile(unittest.TestCase):
+         self.assertIn("game.exe", message)
+         self.assertIn("1234", message)
+ 
++    def test_poll_names_the_program_by_path_when_the_server_gives_one(self):
++        """Two programs can share a name; the path says which one to watch."""
++        fake = FakeAsyncio()
++        ctx = make_ctx()
++        status = json.dumps({"data": {"analyzing": False, "function_count": 3}})
++
++        async def scenario(bridge):
++            await bridge.import_file("/x.exe", ctx=ctx, wait=False)
++            await fake.tasks[0]
++
++        with (
++            isolated_bridge() as bridge,
++            patch.object(bridge.import_tool, "asyncio", fake),
++            patch.object(
++                bridge.dispatch,
++                "dispatch_post",
++                return_value=json.dumps(
++                    {"data": {"analyzing": True, "name": "x.exe", "path": "/fw/x.exe"}}
++                ),
++            ),
++            patch.object(bridge.dispatch, "dispatch_get", return_value=status) as status_get,
++        ):
++            asyncio.run(scenario(bridge))
++
++        status_get.assert_called_with("/analysis_status", {"program": "/fw/x.exe"})
++
++    def test_poll_reports_a_background_import_that_did_not_finish(self):
++        fake = FakeAsyncio()
++        ctx = make_ctx()
++        failed = json.dumps(
++            {"data": {"analyzing": False, "import_error": "auto-analysis did not complete"}}
++        )
++
++        async def scenario(bridge):
++            await bridge.import_file("/x.exe", ctx=ctx, wait=False)
++            await fake.tasks[0]
++
++        with (
++            isolated_bridge() as bridge,
++            patch.object(bridge.import_tool, "asyncio", fake),
++            patch.object(
++                bridge.dispatch,
++                "dispatch_post",
++                return_value=json.dumps({"data": {"analyzing": True, "name": "x.exe"}}),
++            ),
++            patch.object(bridge.dispatch, "dispatch_get", return_value=failed),
++        ):
++            asyncio.run(scenario(bridge))
++
++        send = ctx.request_context.session.send_log_message
++        send.assert_awaited_once()
++        self.assertEqual(send.await_args.kwargs["level"], "error")
++        self.assertIn("did not complete", send.await_args.kwargs["data"])
++
+     def test_poll_survives_transient_status_errors(self):
+         """A dropped connection mid-analysis must not kill the poll loop --
+         it retries until the status endpoint answers."""

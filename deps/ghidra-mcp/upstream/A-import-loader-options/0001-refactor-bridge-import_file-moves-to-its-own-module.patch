@@ -1,0 +1,330 @@
+From 5f3fdeb43dda332cde1d343f902015b4d79aa1f0 Mon Sep 17 00:00:00 2001
+From: Pierre Kisters <pierrekisters@gmail.com>
+Date: Mon, 19 Oct 2026 18:31:05 +0000
+Subject: [PATCH 1/2] refactor(bridge): import_file moves to its own module
+
+static_tools.py is 794 lines against the 800-line cap, and import_file with
+its poll loop is the one tool in it that is not about instances or tool
+groups. A move only: the tool, its poll and its tests are unchanged; the
+tests patch asyncio in the new module.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CLAUDE.md                                |   2 +-
+ python/bridge_mcp_ghidra/__init__.py     |   3 +-
+ python/bridge_mcp_ghidra/import_tool.py  | 109 +++++++++++++++++++++++
+ python/bridge_mcp_ghidra/static_tools.py |  98 --------------------
+ tests/unit/test_static_tools.py          |   8 +-
+ 5 files changed, 116 insertions(+), 104 deletions(-)
+ create mode 100644 python/bridge_mcp_ghidra/import_tool.py
+
+diff --git a/CLAUDE.md b/CLAUDE.md
+index 5c22b99..897d9d5 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -81,7 +81,7 @@ AI Tools <-> MCP Bridge (python/bridge_mcp_ghidra/) <-> McpHttpServer (in the GU
+ 
+ - **HTTP**: `src/main/java/com/xebyte/core/McpHttpServer.java` -- the one HTTP server for every transport: the Unix socket (`ghidra-<pid>.sock`) and TCP (8089, falling back through the next ports), on both servers, from one `AnnotationScanner` per server. It also owns the identity routes `/mcp/schema`, `/mcp/instance_info`, `/mcp/health` and `/check_connection` (`{status, server_kind, version}`), identical on both servers bar `server_kind`.
+ - **Plugin**: `src/main/java/com/xebyte/GhidraMCPPlugin.java` -- builds the GUI service set and hands its scanner to `ServerManager`, the JVM-wide singleton that owns the GUI's `McpHttpServer` across every tool window. Menu: Tools > GhidraMCP > Start / Stop / Restart Server, Server Status.
+-- **Bridge**: `python/bridge_mcp_ghidra/` (package, split into focused modules: `config`, `state`, `server`, `validation`, `transport`, `discovery`, `schema`, `dispatch`, `registry`, `static_tools`, `debugger`, `cli`) -- dynamic tool registration from `/mcp/schema` + static tools (8 instance/tool-group/import: `list_instances`, `connect_instance`, `list_tool_groups`, `load_tool_group`, `unload_tool_group`, `check_tools`, `search_tools`, `import_file`; + 22 opt-in debugger proxies via `GHIDRA_DEBUGGER_URL`). Ships as the `ghidra-mcp-bridge` wheel; `bridge-mcp-ghidra` console script. Cross-module functions are called module-qualified (e.g. `transport.do_request`, `dispatch.dispatch_get`) and mutable runtime state lives in `state.py`, so each function has one canonical mock-patch target.
++- **Bridge**: `python/bridge_mcp_ghidra/` (package, split into focused modules: `config`, `state`, `server`, `validation`, `transport`, `discovery`, `schema`, `dispatch`, `registry`, `static_tools`, `import_tool`, `debugger`, `cli`) -- dynamic tool registration from `/mcp/schema` + static tools (8 instance/tool-group/import: `list_instances`, `connect_instance`, `list_tool_groups`, `load_tool_group`, `unload_tool_group`, `check_tools`, `search_tools`, `import_file`; + 22 opt-in debugger proxies via `GHIDRA_DEBUGGER_URL`). Ships as the `ghidra-mcp-bridge` wheel; `bridge-mcp-ghidra` console script. Cross-module functions are called module-qualified (e.g. `transport.do_request`, `dispatch.dispatch_get`) and mutable runtime state lives in `state.py`, so each function has one canonical mock-patch target.
+ - **Service Layer**: `src/main/java/com/xebyte/core/` -- 20 `*Service` classes (~30K lines), `@McpTool`/`@Param` annotated, plus `HeadlessManagementService` in `headless/`. `CoreServices.build(provider, threading)` constructs the 12 every server shares (listing, comment, symbol/label, function, xref/call graph, data type, documentation hash, analysis, malware/security, program/script, emulation, function bundle), once, for the plugin, the headless server and the offline tests. Both servers add `ProjectLifecycleService`, `VersionControlService`, `ServerLifecycleService` and `DocumentationBatchService`; the GUI adds `DebuggerService` (TraceRmi), `PromptPolicyService` and `GuiToolService`; headless adds `HeadlessManagementService`.
+ - **Program model**: `ProjectProgramProvider` -- the abstract base both `FrontEndProgramProvider` (GUI; adds the CodeBrowser layer, opens with `okToUpgrade=false`) and `HeadlessProgramProvider` (`okToUpgrade=true`) extend. A path-keyed LRU cache over the project (`GHIDRA_MCP_MAX_CACHED_PROGRAMS`, default 8, minimum 2) that opens a program the first time any endpoint names it; `ProjectProgramProvider.match` is the one name resolver.
+ - **Debugger (Python)**: MOVED 2026-08-11 to `d2-game-exe`. It was a standalone
+diff --git a/python/bridge_mcp_ghidra/__init__.py b/python/bridge_mcp_ghidra/__init__.py
+index e08487b..683689b 100644
+--- a/python/bridge_mcp_ghidra/__init__.py
++++ b/python/bridge_mcp_ghidra/__init__.py
+@@ -28,6 +28,7 @@ from . import schema  # noqa: F401
+ from . import dispatch  # noqa: F401
+ from . import registry  # noqa: F401
+ from . import static_tools  # noqa: F401
++from . import import_tool  # noqa: F401
+ from . import debugger  # noqa: F401
+ from . import cli  # noqa: F401
+ 
+@@ -103,13 +104,13 @@ from .static_tools import (  # noqa: F401
+     _start_auto_connect_retry,
+     check_tools,
+     connect_instance,
+-    import_file,
+     list_instances,
+     list_tool_groups,
+     load_tool_group,
+     search_tools,
+     unload_tool_group,
+ )
++from .import_tool import import_file  # noqa: F401
+ from .debugger import (  # noqa: F401
+     _DEBUGGER_ACTIVE,
+     _debugger_enabled,
+diff --git a/python/bridge_mcp_ghidra/import_tool.py b/python/bridge_mcp_ghidra/import_tool.py
+new file mode 100644
+index 0000000..91b3831
+--- /dev/null
++++ b/python/bridge_mcp_ghidra/import_tool.py
+@@ -0,0 +1,109 @@
++"""The import_file tool: import a binary into the open project, and say when analysis ends."""
++
++import asyncio
++import json
++from typing import Annotated
++
++from pydantic import Field
++
++from . import dispatch
++from . import state
++from .config import WRITE_TOOL, logger
++from .server import Context, mcp
++
++
++@mcp.tool(annotations=WRITE_TOOL, structured_output=False)
++async def import_file(
++    file_path: Annotated[str, Field(description="Absolute path to the binary file on disk")],
++    project_folder: Annotated[
++        str, Field(description='Destination folder in the Ghidra project (default: "/")')
++    ] = "/",
++    language: Annotated[
++        str | None,
++        Field(
++            description=(
++                'Language ID for raw binaries (e.g. "ARM:LE:32:Cortex", '
++                '"x86:LE:64:default")'
++            )
++        ),
++    ] = None,
++    compiler_spec: Annotated[
++        str | None,
++        Field(
++            description=(
++                'Compiler spec ID (e.g. "default", "gcc"). Uses language default if omitted.'
++            )
++        ),
++    ] = None,
++    auto_analyze: Annotated[
++        bool, Field(description="Start auto-analysis after import (default: true)")
++    ] = True,
++    ctx: Context | None = None,
++) -> str:
++    """
++    Import a binary file from disk into the current Ghidra project.
++
++    Imports the file, opens it in the CodeBrowser, and optionally starts auto-analysis.
++    When analysis is enabled, sends a log notification when analysis completes.
++
++    For raw firmware binaries, specify language (e.g. "ARM:LE:32:Cortex") and
++    optionally compiler_spec (e.g. "default"). Without language, Ghidra auto-detects
++    the format (works for ELF, PE, Mach-O, etc.).
++
++    Args:
++        file_path: Absolute path to the binary file on disk
++        project_folder: Destination folder in the Ghidra project (default: "/")
++        language: Language ID for raw binaries (e.g. "ARM:LE:32:Cortex", "x86:LE:64:default")
++        compiler_spec: Compiler spec ID (e.g. "default", "gcc"). Uses language default if omitted.
++        auto_analyze: Start auto-analysis after import (default: true)
++    """
++    payload: dict = {
++        "file_path": file_path,
++        "project_folder": project_folder,
++        "auto_analyze": auto_analyze,
++    }
++    if language:
++        payload["language"] = language
++    if compiler_spec:
++        payload["compiler_spec"] = compiler_spec
++
++    result = await state.run_blocking_ghidra_call(dispatch.dispatch_post, "/import_file", payload)
++    # A refused import is a failed tool call, not a successful one that happens
++    # to contain the word "error" (see dispatch.raise_on_failure).
++    dispatch.raise_on_failure(result)
++
++    # Parse result to check if analysis was started
++    try:
++        data = json.loads(result)
++    except (json.JSONDecodeError, TypeError):
++        return result
++
++    if data.get("data", {}).get("analyzing") and ctx is not None:
++        program_name = data["data"].get("name", "unknown")
++        # Capture the session before the tool call returns
++        session = ctx.request_context.session
++
++        async def _poll_analysis():
++            """Poll analysis_status until analysis completes, then send log notification."""
++            await asyncio.sleep(5)  # Initial delay
++            for _ in range(360):  # Up to 30 minutes
++                try:
++                    status_text = await state.run_blocking_ghidra_call(
++                        dispatch.dispatch_get, "/analysis_status", {"program": program_name}
++                    )
++                    status = json.loads(status_text)
++                    status_data = status.get("data", status)
++                    if not status_data.get("analyzing", True):
++                        fn_count = status_data.get("function_count", "?")
++                        await session.send_log_message(
++                            level="info",
++                            data=f"Analysis complete for {program_name}: {fn_count} functions found",
++                        )
++                        return
++                except Exception as e:
++                    logger.debug(f"Analysis poll error for {program_name}: {e}")
++                await asyncio.sleep(5)
++
++        asyncio.create_task(_poll_analysis())
++
++    return result
+diff --git a/python/bridge_mcp_ghidra/static_tools.py b/python/bridge_mcp_ghidra/static_tools.py
+index 27463ff..7cfa8aa 100644
+--- a/python/bridge_mcp_ghidra/static_tools.py
++++ b/python/bridge_mcp_ghidra/static_tools.py
+@@ -1,6 +1,5 @@
+ """Static MCP tools that are always available, plus startup auto-connect."""
+ 
+-import asyncio
+ import json
+ import os
+ import threading
+@@ -551,103 +550,6 @@ async def search_tools(
+     )
+ 
+ 
+-@mcp.tool(annotations=WRITE_TOOL, structured_output=False)
+-async def import_file(
+-    file_path: Annotated[str, Field(description="Absolute path to the binary file on disk")],
+-    project_folder: Annotated[
+-        str, Field(description='Destination folder in the Ghidra project (default: "/")')
+-    ] = "/",
+-    language: Annotated[
+-        str | None,
+-        Field(
+-            description=(
+-                'Language ID for raw binaries (e.g. "ARM:LE:32:Cortex", '
+-                '"x86:LE:64:default")'
+-            )
+-        ),
+-    ] = None,
+-    compiler_spec: Annotated[
+-        str | None,
+-        Field(
+-            description=(
+-                'Compiler spec ID (e.g. "default", "gcc"). Uses language default if omitted.'
+-            )
+-        ),
+-    ] = None,
+-    auto_analyze: Annotated[
+-        bool, Field(description="Start auto-analysis after import (default: true)")
+-    ] = True,
+-    ctx: Context | None = None,
+-) -> str:
+-    """
+-    Import a binary file from disk into the current Ghidra project.
+-
+-    Imports the file, opens it in the CodeBrowser, and optionally starts auto-analysis.
+-    When analysis is enabled, sends a log notification when analysis completes.
+-
+-    For raw firmware binaries, specify language (e.g. "ARM:LE:32:Cortex") and
+-    optionally compiler_spec (e.g. "default"). Without language, Ghidra auto-detects
+-    the format (works for ELF, PE, Mach-O, etc.).
+-
+-    Args:
+-        file_path: Absolute path to the binary file on disk
+-        project_folder: Destination folder in the Ghidra project (default: "/")
+-        language: Language ID for raw binaries (e.g. "ARM:LE:32:Cortex", "x86:LE:64:default")
+-        compiler_spec: Compiler spec ID (e.g. "default", "gcc"). Uses language default if omitted.
+-        auto_analyze: Start auto-analysis after import (default: true)
+-    """
+-    payload: dict = {
+-        "file_path": file_path,
+-        "project_folder": project_folder,
+-        "auto_analyze": auto_analyze,
+-    }
+-    if language:
+-        payload["language"] = language
+-    if compiler_spec:
+-        payload["compiler_spec"] = compiler_spec
+-
+-    result = await state.run_blocking_ghidra_call(dispatch.dispatch_post, "/import_file", payload)
+-    # A refused import is a failed tool call, not a successful one that happens
+-    # to contain the word "error" (see dispatch.raise_on_failure).
+-    dispatch.raise_on_failure(result)
+-
+-    # Parse result to check if analysis was started
+-    try:
+-        data = json.loads(result)
+-    except (json.JSONDecodeError, TypeError):
+-        return result
+-
+-    if data.get("data", {}).get("analyzing") and ctx is not None:
+-        program_name = data["data"].get("name", "unknown")
+-        # Capture the session before the tool call returns
+-        session = ctx.request_context.session
+-
+-        async def _poll_analysis():
+-            """Poll analysis_status until analysis completes, then send log notification."""
+-            await asyncio.sleep(5)  # Initial delay
+-            for _ in range(360):  # Up to 30 minutes
+-                try:
+-                    status_text = await state.run_blocking_ghidra_call(
+-                        dispatch.dispatch_get, "/analysis_status", {"program": program_name}
+-                    )
+-                    status = json.loads(status_text)
+-                    status_data = status.get("data", status)
+-                    if not status_data.get("analyzing", True):
+-                        fn_count = status_data.get("function_count", "?")
+-                        await session.send_log_message(
+-                            level="info",
+-                            data=f"Analysis complete for {program_name}: {fn_count} functions found",
+-                        )
+-                        return
+-                except Exception as e:
+-                    logger.debug(f"Analysis poll error for {program_name}: {e}")
+-                await asyncio.sleep(5)
+-
+-        asyncio.create_task(_poll_analysis())
+-
+-    return result
+-
+-
+ def _auto_connect() -> bool:
+     """Try to auto-connect to a single running instance on startup.
+ 
+diff --git a/tests/unit/test_static_tools.py b/tests/unit/test_static_tools.py
+index a4e0002..f48daed 100644
+--- a/tests/unit/test_static_tools.py
++++ b/tests/unit/test_static_tools.py
+@@ -734,7 +734,7 @@ class TestImportFile(unittest.TestCase):
+         fake = FakeAsyncio()
+         with (
+             isolated_bridge() as bridge,
+-            patch.object(bridge.static_tools, "asyncio", fake),
++            patch.object(bridge.import_tool, "asyncio", fake),
+             patch.object(
+                 bridge.dispatch,
+                 "dispatch_post",
+@@ -751,7 +751,7 @@ class TestImportFile(unittest.TestCase):
+         fake = FakeAsyncio()
+         with (
+             isolated_bridge() as bridge,
+-            patch.object(bridge.static_tools, "asyncio", fake),
++            patch.object(bridge.import_tool, "asyncio", fake),
+             patch.object(
+                 bridge.dispatch,
+                 "dispatch_post",
+@@ -775,7 +775,7 @@ class TestImportFile(unittest.TestCase):
+ 
+         with (
+             isolated_bridge() as bridge,
+-            patch.object(bridge.static_tools, "asyncio", fake),
++            patch.object(bridge.import_tool, "asyncio", fake),
+             patch.object(
+                 bridge.dispatch,
+                 "dispatch_post",
+@@ -805,7 +805,7 @@ class TestImportFile(unittest.TestCase):
+ 
+         with (
+             isolated_bridge() as bridge,
+-            patch.object(bridge.static_tools, "asyncio", fake),
++            patch.object(bridge.import_tool, "asyncio", fake),
+             patch.object(
+                 bridge.dispatch,
+                 "dispatch_post",

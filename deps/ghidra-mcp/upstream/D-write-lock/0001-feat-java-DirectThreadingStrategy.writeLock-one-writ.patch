@@ -1,4 +1,4 @@
-From 4589c9f272c4980064ea9d5161a2ddd074c6fa21 Mon Sep 17 00:00:00 2001
+From 530cbb13ef4ad5f534e8010d31738f9f4fb740e5 Mon Sep 17 00:00:00 2001
 From: Pierre Kisters <pierrekisters@gmail.com>
 Date: Mon, 19 Oct 2026 18:07:44 +0000
 Subject: [PATCH] feat(java): DirectThreadingStrategy.writeLock(), one write
@@ -20,8 +20,6 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../headless/DirectThreadingStrategy.java     | 16 +++++++-
  .../offline/DirectThreadingStrategyTest.java  | 41 +++++++++++++++++++
  3 files changed, 66 insertions(+), 1 deletion(-)
- mode change 100644 => 100755 src/main/java/com/xebyte/headless/DirectThreadingStrategy.java
- mode change 100644 => 100755 src/test/java/com/xebyte/offline/DirectThreadingStrategyTest.java
 
 diff --git a/CHANGELOG.md b/CHANGELOG.md
 index 841a9fb..b92bed5 100644
@@ -45,9 +43,7 @@ index 841a9fb..b92bed5 100644
  
  Every decompile in a `get_functions` call -- each target and each caller decompiled for
 diff --git a/src/main/java/com/xebyte/headless/DirectThreadingStrategy.java b/src/main/java/com/xebyte/headless/DirectThreadingStrategy.java
-old mode 100644
-new mode 100755
-index d30c69f..367c2b5
+index d30c69f..367c2b5 100644
 --- a/src/main/java/com/xebyte/headless/DirectThreadingStrategy.java
 +++ b/src/main/java/com/xebyte/headless/DirectThreadingStrategy.java
 @@ -32,7 +32,21 @@ import java.util.concurrent.locks.ReentrantLock;
@@ -74,9 +70,7 @@ index d30c69f..367c2b5
      @Override
      public <T> T executeRead(Callable<T> action) throws Exception {
 diff --git a/src/test/java/com/xebyte/offline/DirectThreadingStrategyTest.java b/src/test/java/com/xebyte/offline/DirectThreadingStrategyTest.java
-old mode 100644
-new mode 100755
-index 21874f5..90f2ab8
+index 21874f5..90f2ab8 100644
 --- a/src/test/java/com/xebyte/offline/DirectThreadingStrategyTest.java
 +++ b/src/test/java/com/xebyte/offline/DirectThreadingStrategyTest.java
 @@ -6,8 +6,11 @@ import org.junit.Test;

@@ -1,4 +1,4 @@
-From 147d875c3468e34904e7d83d26b753a3df61145b Mon Sep 17 00:00:00 2001
+From 6e97969cfa142ac5ebbb1e312a2ff5a75e308e23 Mon Sep 17 00:00:00 2001
 From: Pierre Kisters <pierrekisters@gmail.com>
 Date: Mon, 19 Oct 2026 18:06:39 +0000
 Subject: [PATCH] feat(java): GHIDRA_MCP_FILE_ROOT takes several roots
@@ -23,18 +23,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  .../java/com/xebyte/core/SecurityConfig.java  | 67 +++++++++++-------
  .../offline/SecurityConfigFileRootsTest.java  | 69 +++++++++++++++++++
  7 files changed, 125 insertions(+), 27 deletions(-)
- mode change 100644 => 100755 .env.template
- mode change 100644 => 100755 CHANGELOG.md
- mode change 100644 => 100755 README.md
- mode change 100644 => 100755 docker/README.md
- mode change 100644 => 100755 docs/prompts/TOOL_USAGE_GUIDE.md
- mode change 100644 => 100755 src/main/java/com/xebyte/core/SecurityConfig.java
- create mode 100755 src/test/java/com/xebyte/offline/SecurityConfigFileRootsTest.java
+ create mode 100644 src/test/java/com/xebyte/offline/SecurityConfigFileRootsTest.java
 
 diff --git a/.env.template b/.env.template
-old mode 100644
-new mode 100755
-index 937cc70..3d87fe6
+index 937cc70..3d87fe6 100644
 --- a/.env.template
 +++ b/.env.template
 @@ -70,6 +70,7 @@ GHIDRA_MCP_ALLOW_SCRIPTS=
@@ -46,9 +38,7 @@ index 937cc70..3d87fe6
  # Confine project-domain endpoints (open/delete/create) to a project folder
  # prefix, e.g. /MyFolder/Subfolder. Unset = whole project in scope.
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-old mode 100644
-new mode 100755
-index 841a9fb..01f3e89
+index 841a9fb..01f3e89 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -8,6 +8,15 @@ Complete version history for the Ghidra MCP Server project.
@@ -68,9 +58,7 @@ index 841a9fb..01f3e89
  
  Every decompile in a `get_functions` call -- each target and each caller decompiled for
 diff --git a/README.md b/README.md
-old mode 100644
-new mode 100755
-index 5b9b150..eca873e
+index 5b9b150..eca873e 100644
 --- a/README.md
 +++ b/README.md
 @@ -719,7 +719,7 @@ GhidraMCP is designed for **localhost-only development**. The default configurat
@@ -83,9 +71,7 @@ index 5b9b150..eca873e
  Name-quality enforcement is separate from security. By default,
  `rename_function` and global write endpoints reject names that fail
 diff --git a/docker/README.md b/docker/README.md
-old mode 100644
-new mode 100755
-index 5044915..6000073
+index 5044915..6000073 100644
 --- a/docker/README.md
 +++ b/docker/README.md
 @@ -126,7 +126,7 @@ mvn clean package -P docker -DskipTests
@@ -98,9 +84,7 @@ index 5044915..6000073
  | `PROGRAM_FILE` | - | Path to binary file to load on startup |
  | `PROJECT_PATH` | - | Path to Ghidra project directory |
 diff --git a/docs/prompts/TOOL_USAGE_GUIDE.md b/docs/prompts/TOOL_USAGE_GUIDE.md
-old mode 100644
-new mode 100755
-index a3be113..e77f775
+index a3be113..e77f775 100644
 --- a/docs/prompts/TOOL_USAGE_GUIDE.md
 +++ b/docs/prompts/TOOL_USAGE_GUIDE.md
 @@ -646,7 +646,7 @@ GhidraMCP defaults to localhost-unauthenticated — safe on a single-user dev bo
@@ -113,9 +97,7 @@ index a3be113..e77f775
  The headless server refuses to start on a non-loopback bind address (`0.0.0.0`, explicit external IP) unless `GHIDRA_MCP_AUTH_TOKEN` is set.
  
 diff --git a/src/main/java/com/xebyte/core/SecurityConfig.java b/src/main/java/com/xebyte/core/SecurityConfig.java
-old mode 100644
-new mode 100755
-index ca2799e..2782d06
+index ca2799e..2782d06 100644
 --- a/src/main/java/com/xebyte/core/SecurityConfig.java
 +++ b/src/main/java/com/xebyte/core/SecurityConfig.java
 @@ -5,6 +5,8 @@ import java.io.IOException;
@@ -229,7 +211,7 @@ index ca2799e..2782d06
  
      /**
 diff --git a/src/test/java/com/xebyte/offline/SecurityConfigFileRootsTest.java b/src/test/java/com/xebyte/offline/SecurityConfigFileRootsTest.java
-new file mode 100755
+new file mode 100644
 index 0000000..c25fcfa
 --- /dev/null
 +++ b/src/test/java/com/xebyte/offline/SecurityConfigFileRootsTest.java
