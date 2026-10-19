@@ -36,20 +36,21 @@ paths, so the paths your agent already uses stay valid, and so do the paths re-b
 Pulling needs `docker login ghcr.io` while the package is private.
 
 Ghidra runs only while a session is open: the first session starts it (about 40 s; the `gh_` tools
-appear when it is ready) and it stops 5 minutes after the last session closed
+call waits for it) and it stops 5 minutes after the last session closed
 (`REBOX_GHIDRA_IDLE_TIMEOUT`), so an idle container runs no Java.
 
 ### Windows
 
-Run docker from Git Bash with the work dir in its `/c/...` form on **both** sides of `-v`, and
-turn off Git Bash's path rewriting so docker sees it unchanged:
+Mount the Windows folder at its Git Bash form: the **host** side of `-v` is the Windows path, the
+**container** side and `RE_WORKDIR` the `/c/...` form (a `/c/...` host side fails under
+remote-docker). Run docker from Git Bash with `MSYS_NO_PATHCONV=1` so it does not rewrite the paths:
 
 ```sh
 export MSYS_NO_PATHCONV=1
 mkdir -p /c/Users/you/re
-docker run -d --name re-box --stop-timeout 120 --memory 6g \
+docker run -d --name re-box --stop-timeout 120 --memory 16g \
   -e REBOX_TOKEN_FILE=/run/secrets/rebox_token -v "$PWD/rebox_token:/run/secrets/rebox_token:ro" \
-  -e RE_WORKDIR=/c/Users/you/re -v /c/Users/you/re:/c/Users/you/re \
+  -e RE_WORKDIR=/c/Users/you/re -v 'C:\Users\you\re:/c/Users/you/re' \
   -p 127.0.0.1:8443:8443 ghcr.io/lhns/re-box:latest
 ```
 
@@ -60,8 +61,9 @@ with a native Linux path.
 ### Laptop
 
 Docker Desktop's VM must hold the container limit (Settings, Resources, or `memory=` in
-`.wslconfig`). For 8 GB: `-e REBOX_MAX_SESSIONS=2 -e JAVA_OPTS="-Xmx3g -XX:+UseG1GC"
--e GHIDRA_HEADLESS_MAXMEM=1g --memory 6g`. Sizing: [docs/OPERATIONS.md](docs/OPERATIONS.md), "Memory".
+`.wslconfig`). For an 8 GB VM: `-e REBOX_MAX_SESSIONS=2 -e JAVA_OPTS="-Xmx2g -XX:+UseG1GC"
+-e GHIDRA_HEADLESS_MAXMEM=1g --memory 7g`; the formula's worst case is 8 GiB, so this relies on the
+JVMs not peaking together. Sizing: [docs/OPERATIONS.md](docs/OPERATIONS.md), "Memory".
 
 ## Connect a client
 

@@ -27,7 +27,7 @@ Design: `aggregator/README.md`; why: `docs/DECISIONS.md`.
 | `REBOX_SESSION_ORPHAN_TIMEOUT` | `300` | the same, for a session with **no** open GET stream (`claude -p` that exited, a dead client), so its REA JVM does not linger; `0` = use the idle timeout for all |
 | `REBOX_SESSION_EVICT_MIN_IDLE` | `120` | at `REBOX_MAX_SESSIONS`, a new `initialize` evicts the longest-idle session with nothing in flight if it has been idle at least this long (its work is saved first; its client re-initializes on 404); 503 only when none qualifies |
 | `REBOX_PROGRESS_KEEPALIVE_INTERVAL` | `30` | seconds of silence after which a request carrying a `progressToken` gets a synthetic `notifications/progress`, so a client's no-progress abort does not kill a long import; `0` = off |
-| `REBOX_GHIDRA_IDLE_TIMEOUT` | `300` | seconds with no session before the ghidra-mcp server is saved and stopped; `0` = never stop (also for clients that ignore `tools/list_changed`, docs/CLIENTS.md) |
+| `REBOX_GHIDRA_IDLE_TIMEOUT` | `300` | seconds with no session before the ghidra-mcp server is saved and stopped; `0` = never stop |
 | `REBOX_EVIDENCE_RETENTION_DAYS` | `30` | REA evidence bundles older than this are deleted at start and daily; `0` = keep. Bundles with no records and no unknowns are deleted right after export |
 | `REBOX_INIT_TIMEOUT` | `120` | seconds a child may take to start and initialize at session open |
 | `REBOX_MAX_BODY_BYTES` | `16777216` | largest accepted POST body (413 above); a session also accepts at most 64 concurrent requests |
@@ -45,7 +45,7 @@ Design: `aggregator/README.md`; why: `docs/DECISIONS.md`.
 | `REA_JADX_HEAP_MIB` | `2048` | heap of REA's JADX JVM for Android work |
 | `GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS` | `1`, forced | every program-scoped ghidra-mcp call must name its program; the project is shared |
 | `GHIDRA_MCP_ALLOW_SCRIPTS` | `0` | `1` enables ghidra-mcp's script and inline-script tools (arbitrary code in the headless JVM) |
-| `GHIDRA_MCP_LAZY` | `1` | lazy tool groups; `0` for clients that ignore `tools/list_changed` |
+| `GHIDRA_MCP_LAZY` | `0` | `1` loads ghidra-mcp tool groups lazily (needs a client that follows `tools/list_changed`); `0` lists all 197 tools up front. Part of the catalog-cache key |
 | `GHIDRA_MCP_LOG_LEVEL` | `WARNING` | bridge log level |
 | `REA_ANALYSIS_PROVIDER` | `ghidra` | REA's default native provider |
 | `REA_MCP_INPUT_SCHEMA_PROFILE` | `full` | `compact` for clients with schema limits |
@@ -82,7 +82,7 @@ macOS-only features.
 - Mount the work directory at the **same absolute path** inside and out and set `RE_WORKDIR` to
   it: `-v /home/you/re:/home/you/re -e RE_WORKDIR=/home/you/re`. Paths from the harness then
   work unchanged. Nothing derives from `/work` except the default. On Windows use the Git Bash
-  form, `/c/Users/you/re` on both sides (README, "Windows").
+  form, `/c/Users/you/re` inside (README, "Windows").
 - State (Ghidra project, settings, caches, REA evidence) goes to `REBOX_STATE_DIR`, by default
   inside the work dir; mount a separate one the same way. Layout, save points and what survives a
   stop, kill or OOM kill: docs/PERSISTENCE.md. Only one container may use a state dir at a time
@@ -121,10 +121,12 @@ no Ghidra call yet costs about 0.2 GiB; the headless server idles at about 130 M
 and is gone entirely `REBOX_GHIDRA_IDLE_TIMEOUT` after the last session.
 
 **Laptop profile** (Docker Desktop / WSL2, 8 GB for the VM): `REBOX_MAX_SESSIONS=2`,
-`JAVA_OPTS="-Xmx3g -XX:+UseG1GC"` (+ the G1 flags above), `GHIDRA_HEADLESS_MAXMEM=1g`, container
-limit 6g: (3 + 1) + 2 × (1 + 1) + 1 = 9 GiB worst case, less in practice because the headless
-server and the REA JVMs are rarely at their ceilings together. Docker Desktop's VM limit (Settings,
-Resources, or `.wslconfig` `memory=`) must be at least the container limit. To fit less memory lower `REBOX_MAX_SESSIONS` first; to
+`JAVA_OPTS="-Xmx2g -XX:+UseG1GC"` (+ the G1 flags above), `GHIDRA_HEADLESS_MAXMEM=1g`, container
+limit 7g: the formula gives (2 + 1) + 2 × (1 + 1) + 1 = 8 GiB, so this runs 1 GiB below the worst
+case and relies on the headless server and the REA JVMs not peaking together (they rarely do; an
+OOM kill is what happens if they do). With a 10 GB VM use `--memory 8g` and `-Xmx3g`. Docker
+Desktop's VM limit (Settings, Resources, or `.wslconfig` `memory=`) must be at least the container
+limit. To fit less memory lower `REBOX_MAX_SESSIONS` first; to
 analyse very large binaries raise `GHIDRA_HEADLESS_MAXMEM` and `JAVA_OPTS` and the limit with
 them. Measured on the test fixtures: see docs/BUILDING.md.
 

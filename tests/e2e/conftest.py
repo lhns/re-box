@@ -32,20 +32,9 @@ def record(test: str, what: str, seconds: float) -> None:
     _durations.append((test, what, seconds))
 
 
-def wait_for_gh(s: Session, timeout: float = 300.0) -> tuple[bool, float]:
-    """Poll tools/list until the gh_ tools are there (Ghidra starts with the first session and the
-    bridge announces itself with tools/list_changed). Returns (a list_changed arrived on the session's
-    GET stream, seconds waited)."""
-    start = time.monotonic()
-    changed = False
-    while True:
-        while not s.background.empty():
-            changed |= s.background.get_nowait().get("method") == "notifications/tools/list_changed"
-        if "gh_get_metadata" in s.tool_names():
-            return changed, time.monotonic() - start
-        if time.monotonic() - start > timeout:
-            raise AssertionError(f"no gh_ tools {timeout:.0f} s after initialize")
-        time.sleep(1)
+def assert_gh_listed(s: Session) -> None:
+    """The gh_ tools are in the first tools/list even when Ghidra is cold (catalog cache or held initialize)."""
+    assert "gh_get_metadata" in s.tool_names(), "no gh_ tools in the first tools/list"
 
 
 _keeper: Session | None = None
@@ -80,8 +69,7 @@ def session(request):
         if listen:
             s.listen()
         opened.append(s)
-        changed, seconds = wait_for_gh(s)
-        record(request.node.name, "gh_ tools available after initialize", seconds)
+        assert_gh_listed(s)
         return s
 
     yield make

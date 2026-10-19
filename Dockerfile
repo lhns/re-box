@@ -79,6 +79,7 @@ tag_commit=$(git ls-remote origin "refs/tags/$GHIDRA_MCP_REF^{}" | cut -f1)
 [ "$tag_commit" = "$GHIDRA_MCP_COMMIT" ] || { echo "tag $GHIDRA_MCP_REF is $tag_commit, pinned $GHIDRA_MCP_COMMIT" >&2; exit 1; }
 git fetch -q --depth 1 origin "$GHIDRA_MCP_COMMIT"
 git checkout -q FETCH_HEAD
+echo "$GHIDRA_MCP_REF-$GHIDRA_MCP_COMMIT" > /src/ghidra-mcp.version  # keys the aggregator's catalog cache
 EOS
 
 FROM ghidra-mcp-src AS ghidra-mcp
@@ -94,6 +95,7 @@ cd /src/ghidra-mcp
 "$t/gradle-$GRADLE_VERSION/bin/gradle" --no-daemon -q jar -x test -PGHIDRA_INSTALL_DIR=/opt/ghidra
 mkdir -p /opt/ghidra-mcp
 cp build/libs/GhidraMCP-*.jar /opt/ghidra-mcp/GhidraMCP.jar
+cp /src/ghidra-mcp.version /opt/ghidra-mcp/VERSION
 rm -rf "$t" /root/.gradle
 EOS
 # The bridge's runtime deps come from upstream's uv.lock with hashes; the bridge itself from source.
@@ -181,7 +183,7 @@ ENV RE_WORKDIR=/work \
     JAVA_OPTS="-Xmx4g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30" \
     GHIDRA_HEADLESS_MAXMEM=1536m \
     GHIDRA_MCP_ALLOW_SCRIPTS=0 \
-    GHIDRA_MCP_LAZY=1 \
+    GHIDRA_MCP_LAZY=0 \
     GHIDRA_MCP_LOG_LEVEL=WARNING \
     REA_ANALYSIS_PROVIDER=ghidra \
     REA_MCP_INPUT_SCHEMA_PROFILE=full \

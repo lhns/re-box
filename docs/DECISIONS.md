@@ -131,8 +131,14 @@ groups already contain every tool the e2e ghidra flow needs (`import_file`, `fin
 `get_functions`, `rename_function`, `save_program`, `open_program`, `close_program`,
 `get_metadata`, `search_tools`, `load_tool_group`).
 
-**Decision:** keep ghidra-mcp lazy (`GHIDRA_MCP_LAZY=1`, upstream default in v7); the aggregator
-relays `list_changed`. Keep REA's profiles at upstream `full`, exposed as
+**Decision (revised):** ghidra-mcp runs **not lazy** (`GHIDRA_MCP_LAZY=0`, 197 tools, +144 KB). The
+first decision kept it lazy and relied on `tools/list_changed`; but Claude Code 2.1.303 ignored
+`list_changed` in a `claude -p` test (tools added by `gh_load_tool_group` never appeared: "No such
+tool available") and there are open reports of the same over Streamable HTTP and with tool search.
+With on-demand Ghidra a cold session would have no `gh_` tools at all, so the full catalog is in the
+first `tools/list` (Claude Code defers tool definitions via tool search, so the size costs little);
+lazy mode remains an opt-in (`GHIDRA_MCP_LAZY=1`; the e2e lazy test runs only then). The aggregator
+still relays `list_changed`. Keep REA's profiles at upstream `full`, exposed as
 `REA_MCP_INPUT_SCHEMA_PROFILE` / `REA_MCP_OUTPUT_SCHEMA_PROFILE`. REA's full catalog is 3 MB;
 docs/CLIENTS.md says when to switch to `compact`/`off`.
 
@@ -217,11 +223,23 @@ stops `REBOX_GHIDRA_IDLE_TIMEOUT` (300 s) after the last one closed; an idle con
   edits with it. (Stage 2 revisits this by hosting REA's bridge inside the ghidra-mcp JVM.)
 - **Start on the first session, not the first `gh_` call:** a bridge that boots without Ghidra
   shows only static tools, so the client would never see a `gh_` tool to call. `initialize` is not
-  held (39 s against client connect timeouts); the bridge starts at once, and when Ghidra is ready
-  the aggregator calls the bridge's `connect_instance(project="rebox")` (`[child.on_ready]`), which
-  discovers the server and sends `tools/list_changed`. The bridge's own 15 s retry stays as fallback.
-  Cost: clients that ignore `tools/list_changed` see no `gh_` tools on a cold session
-  (docs/CLIENTS.md).
+  held when a catalog cache exists (39 s against client connect timeouts); the bridge starts at once,
+  and when Ghidra is ready the aggregator calls the bridge's `connect_instance(project="rebox")`
+  (`[child.on_ready]`), which discovers the server (verified in the image: matches project `rebox`,
+  over TCP 8089). The bridge's own 15 s retry stays as fallback.
+- **Clients cannot be relied on to follow `tools/list_changed`** (Claude Code ignored it in a test),
+  so the full `gh_` catalog is in the first `tools/list` regardless: a per-child catalog cache
+  (`[child.catalog_cache]`, `$REBOX_STATE_DIR/cache/rebox-catalog/`, keyed by the ghidra-mcp
+  ref+commit, `GHIDRA_MCP_LAZY` and `GHIDRA_MCP_ALLOW_SCRIPTS`) holds what a connected bridge lists.
+  A session that opens while Ghidra is down advertises the cache; a `tools/call` for a cached tool
+  the bridge does not have yet is held (progress keepalive applies) until the live catalog replaces
+  the cache, bounded by `REBOX_HEADLESS_START_TIMEOUT`, and returns a tool error naming the Ghidra
+  state and reason on timeout or failure. The bridge's static tools stay callable immediately. If the
+  live catalog differs, the cache is rewritten and `list_changed` sent (best effort). With no cache
+  yet (new state dir, or a ghidra-mcp upgrade changed the key) the supervisor starts Ghidra at
+  container boot, lists the bridge once exactly as a session would, writes the cache, and lets the
+  idle stop take Ghidra down; a session opening before that holds its `initialize` reply until its
+  bridge is connected (bounded).
 - **Stop = save, then the shutdown escalation, but no instance-wide sweep** (it would kill a session
   opening concurrently). A session opening during the stop waits for the old process to exit, then
   starts a new one. A crash with sessions restarts with backoff; without sessions it stays stopped.

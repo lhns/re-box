@@ -15,7 +15,7 @@ import httpx2 as httpx
 import pytest
 
 from conftest import (COMPUTE_MARKERS, COMPUTE_MULTIPLIER, INSTANCE, PROJECTS, STATE, TOKEN, URL,
-                      fixture_path, keeper, record, release_keeper, wait_for_gh)
+                      fixture_path, keeper, record, release_keeper)
 from mcpclient import McpError, Session
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
@@ -56,23 +56,17 @@ def tag_of(session_id: str) -> str:
 
 # --- 1. catalog
 def test_01_catalog():
-    """First session of the run: Ghidra is not running yet. The gh_ tools must arrive through
-    tools/list_changed (or, failing that, the bridge's own retry); this session stays open for the
-    rest of the run (conftest.keeper) so Ghidra stays up."""
+    """First session of the run: Ghidra is cold. The full gh_ catalog must be in the very first
+    tools/list (no waiting for tools/list_changed, which clients may ignore), and a gh_ call made
+    right away must wait for Ghidra and succeed without the client listing again. This session stays
+    open for the rest of the run (conftest.keeper) so Ghidra stays up."""
     s = keeper()
-    first = s.tool_names()
-    changed, seconds = wait_for_gh(s)
-    record("01_catalog", "gh_ tools after the first initialize (cold Ghidra start)", seconds)
-    if not any(n.startswith("gh_") for n in first):
-        # Wait for the notification itself: it is what clients that follow list_changed rely on.
-        deadline = time.monotonic() + 30
-        while not changed and time.monotonic() < deadline:
-            try:
-                changed = s.background.get(timeout=1).get("method") == "notifications/tools/list_changed"
-            except Exception:
-                pass
-        assert changed, "gh_ tools appeared without a tools/list_changed notification"
     names = s.tool_names()
+    gh = [n for n in names if n.startswith("gh_")]
+    assert len(gh) > 150, f"only {len(gh)} gh_ tools in the first tools/list (GHIDRA_MCP_LAZY=0)"
+    first_call = s.tool("gh_list_open_programs", {})
+    record("01_catalog", "first gh_ call after initialize (waits for the cold Ghidra start)", first_call.seconds)
+    assert not first_call.result.get("isError"), first_call.text()[:500]
     for required in ("rea_open_binary", "rea_binary_overview", "gh_get_metadata", "gh_get_functions",
                      "gh_search_tools", "gh_import_file", "gh_find_functions", "gh_load_tool_group"):
         assert required in names, required
@@ -163,7 +157,9 @@ def test_03_ghidra_mcp_flow(session):
     assert (PROJECTS / "rebox.gpr").is_file() and (PROJECTS / "rebox.rep").is_dir()
 
 
-# --- 4. lazy tool groups and list_changed
+# --- 4. lazy tool groups and list_changed. Lazy mode is opt-in now (the image sets GHIDRA_MCP_LAZY=0:
+# clients cannot be relied on to follow list_changed); run with GHIDRA_MCP_LAZY=1 to exercise it.
+@pytest.mark.skipif(os.environ.get("GHIDRA_MCP_LAZY") != "1", reason="lazy tool groups are off by default")
 def test_04_lazy_groups(session):
     s = session(listen=True)
     before = set(s.tool_names())
@@ -311,7 +307,7 @@ def ghidra_server_pids() -> list[int]:
     return found
 
 
-def test_11_idle_stop_and_restart(session):
+def test_11_idle_stop_and_restart():
     assert ghidra_server_pids(), "the keeper session should have kept Ghidra running"
     release_keeper()  # every other session of the run is closed already
     t0 = time.monotonic()
@@ -324,7 +320,14 @@ def test_11_idle_stop_and_restart(session):
         health = http.get(URL.rsplit("/mcp", 1)[0] + "/healthz")
     assert health.status_code == 200 and health.json()["ghidra"] == "stopped", health.text
 
-    s = session()  # starts Ghidra again; the fixture waits for the gh_ tools
-    assert ghidra_server_pids()
-    opened = _json(s.tool("gh_open_program", {"path": "/hello_stripped"}))  # imported and saved by test_03
-    assert opened.get("success"), opened
+    # A cold session: the catalog comes from the cache at once, and a gh_ call waits for Ghidra.
+    s = Session(URL, TOKEN)
+    try:
+        s.initialize()
+        assert "gh_get_metadata" in s.tool_names()
+        opened = s.tool("gh_open_program", {"path": "/hello_stripped"})  # imported and saved by test_03
+        record("11_idle_stop", "first gh_ call of a cold session (restart included)", opened.seconds)
+        assert _json(opened).get("success"), opened.text()[:500]
+        assert ghidra_server_pids()
+    finally:
+        s.close()

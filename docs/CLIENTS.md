@@ -57,14 +57,20 @@ https://code.claude.com/docs/en/mcp.md):
 `MCP_TOOL_TIMEOUT` and the idle timeout can go in the shell or in `settings.json` under `env`.
 REA reports progress every 10 s while Ghidra starts, so REA calls do not hit the idle timeout.
 
-### Cold start: gh_ tools appear late
+### Cold start
 
-Ghidra starts with the first session (about 40 s). The session opens at once with REA's tools and
-the aggregator announces the `gh_` tools with `tools/list_changed` when the server is up. Claude
-Code follows it; the `initialize` instructions tell the agent to retry after about 40 s. A client
-that ignores `tools/list_changed` gets no `gh_` tools on a cold session: start the container with
-`REBOX_GHIDRA_IDLE_TIMEOUT=0` (keep Ghidra running; open one session to start it) next to
-`GHIDRA_MCP_LAZY=0`.
+Ghidra starts with the first session (about 40 s). No client support for `tools/list_changed` is
+needed: the full `gh_` catalog is in the first `tools/list` (from a cache in the state dir; the
+very first start of a new state dir fills it before answering `initialize`), and a `gh_` call made
+while Ghidra starts waits for it, then runs. The wait is bounded by
+`REBOX_HEADLESS_START_TIMEOUT` (300 s); on timeout or a failed start (for example the project is
+locked by another container) the call returns a tool error naming the reason. re-box sends progress
+notifications meanwhile for calls that carry a progress token.
+
+Timeouts: a 59 MB `gh_import_file` hit ghidra-mcp's bridge timeout of 300 s for `import_file`
+(a fixed table in the bridge's `config.py`, not an environment variable); the tool reports an error
+but the import continues in the Ghidra server. Check with `gh_list_open_programs` / `gh_analysis_status`
+before importing again.
 
 ### Session lifetime
 
@@ -84,8 +90,9 @@ client re-initializes; REA's in-session state is gone, its evidence is exported
   `REA_MCP_INPUT_SCHEMA_PROFILE=compact` and `REA_MCP_OUTPUT_SCHEMA_PROFILE=off` (220 KB).
 - Results above 25,000 tokens (`MAX_MCP_OUTPUT_TOKENS`) are cut; text over 50,000 characters is
   saved to a file. Raise `MAX_MCP_OUTPUT_TOKENS` if REA dossiers are truncated.
-- ghidra-mcp loads tool groups lazily and announces new ones with `tools/list_changed`, which
-  Claude Code follows (interactive and `-p`).
+- ghidra-mcp's whole catalog (197 tools, ~250 KB) is listed up front; lazy tool groups
+  (`GHIDRA_MCP_LAZY=1`) need a client that follows `tools/list_changed`, which Claude Code 2.1.303
+  did not in a `-p` test.
 
 ### REA's workflow skill
 
@@ -122,9 +129,8 @@ Anything that does streamable HTTP with a static header: point it at `/mcp` with
 - re-box speaks the session-based protocol versions (2024-11-05 to 2025-11-25). A client that
   first probes the sessionless 2026-07-28 protocol gets error `-32022` listing those versions and
   falls back to `initialize`, as the official SDKs and Claude Code do.
-- Clients that ignore `tools/list_changed` never see ghidra-mcp's lazily loaded groups, nor the
-  `gh_` tools of a cold session: start the container with `GHIDRA_MCP_LAZY=0` (all 197 ghidra
-  tools up front) and `REBOX_GHIDRA_IDLE_TIMEOUT=0` (above).
+- Clients that ignore `tools/list_changed` need nothing special: the image lists all 197 ghidra
+  tools up front (`GHIDRA_MCP_LAZY=0`) and a cold session advertises them from the cache.
 - Clients with small message or schema limits: see the schema profiles above, and
   `REA_MCP_MAX_RESPONSE_BYTES` (docs/OPERATIONS.md).
 - A session ends after `REBOX_SESSION_IDLE_TIMEOUT` (30 min) without requests (5 min without an

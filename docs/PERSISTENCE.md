@@ -36,9 +36,19 @@ directory and give the agent read access to it.
 
 "Same path" works on Linux and macOS: `/Users/you/re` is a valid Linux path too (Docker Desktop
 shares `/Users` with its VM), so `-v /Users/you/re:/Users/you/re` is fine. Only native Windows
-paths (`C:\...`) cannot exist in a Linux container; use the Git Bash form `/c/Users/you/re` on both
-sides of `-v` (README, "Windows"). Ghidra's project locks on Docker Desktop's or remote-docker's
-host-directory mounts are untested; prefer a named volume or a WSL2 path there.
+paths (`C:\...`) cannot exist in a Linux container: mount the Windows folder at the Git Bash form,
+`-v 'C:\Users\you\re:/c/Users/you/re' -e RE_WORKDIR=/c/Users/you/re` (host side a Windows path,
+container side `/c/...`; `MSYS_NO_PATHCONV=1` in Git Bash; README, "Windows"), and have the agent
+pass `/c/Users/you/re/...` paths.
+
+**Project locks on a Windows folder** (tested 2026-10-19 under lhns/remote-docker, which mounts
+Windows folders through NFSv3 `soft,nolock,local_lock=all`): Ghidra's lock refuses a second
+container on the same state dir (the second container reports it: `/healthz` is 503 with "project
+locked by another Ghidra instance"), stop/restart keeps the project, a `docker kill` after a save
+leaves a stale `rebox.lock` that the next start recovers, and a `docker kill` during a 59 MB import
+leaves the half-imported program absent and the project intact. A named volume was 25-35 % faster
+(import 26 s vs 38 s, stop 3.2 s vs 6.2 s) and avoids NFS ownership quirks (files show uid 10000,
+mode 777); it needs a one-time chown to uid 1000. Docker Desktop was not tested.
 
 ## What is in it
 
@@ -50,6 +60,7 @@ host-directory mounts are untested; prefer a named volume or a WSL2 path there.
 | `home/ghidra_scripts/` | user Ghidra scripts (only with `GHIDRA_MCP_ALLOW_SCRIPTS=1`) | scripts an agent wrote | small |
 | `home/.config`, `home/.local`, `home/.cache` | other tools' user state when run directly: rizin, gdb/pwndbg history and config, adb keys (`.android/`), Chrome profile, NSS db | device pairings, histories | small |
 | `cache/` (`XDG_CACHE_HOME`) | Ghidra's cache (`rebox-ghidramcp/`: `fscache2`, `packed-db-cache`, `debuginfo-cache` with downloaded debug symbols), pwndbg, fontconfig, Chrome | faster opens, no repeated symbol downloads. **Safe to delete** while the container is stopped | 100s of MB, grows with symbol downloads |
+| `cache/rebox-catalog/ghidra-<key>.json` | the aggregator's catalog cache: the full tool list of the ghidra-mcp bridge, advertised to sessions while Ghidra starts | a cold session lists the `gh_` tools at once. **Safe to delete** (refilled at the next start, which then runs Ghidra once) | ~250 KB |
 | `rea/evidence/<session>.json` | REA evidence bundles, one per MCP session: every Evidence record and unknown the session produced, written by the aggregator ("When things are saved") | REA's in-session analysis is discarded when its session ends; this is what is left. Restore with `rea_import_evidence_bundle {"path": ...}` | KBs to tens of MB per session; pruned automatically (below) |
 | `.gitignore` | `*`, written once at start | the default state dir sits inside the work dir, which is often a git repo | bytes |
 
