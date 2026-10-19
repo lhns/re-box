@@ -552,7 +552,6 @@ async def supervise(cfg: SupervisorConfig, app: App) -> int:
     return 0
 
 
-
 def main() -> None:
     import argparse
 

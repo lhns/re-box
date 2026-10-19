@@ -114,6 +114,17 @@ async def test_quiet_request_gets_synthetic_progress():
     assert msgs[-1]["result"]["content"][0]["text"] == "slept"
 
 
+async def test_child_progress_after_keepalive_stays_increasing():
+    with run_app(progress_keepalive=0.3) as r:
+        async with r.raw() as http:
+            sid, _ = await raw_init(http, r.url)
+            msgs = await raw_call(http, r.url, sid, "tools/call", {
+                "name": "a_sleep", "arguments": {"seconds": 1.0, "then_progress": 0},
+                "_meta": {"progressToken": "tk"}})
+    values = [m["params"]["progress"] for m in msgs if m.get("method") == "notifications/progress"]
+    assert len(values) >= 3 and values == sorted(set(values))
+
+
 async def test_no_synthetic_progress_without_token_or_when_child_reports():
     with run_app(progress_keepalive=0.4) as r:
         async with r.raw() as http:

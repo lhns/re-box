@@ -64,6 +64,9 @@ async def call(rid, name, args, meta):
         return text("saved")
     if name == "sleep":
         await asyncio.sleep(float(args.get("seconds", 1)))
+        if "then_progress" in args:  # a late, small real progress value after quiet time
+            send({"jsonrpc": "2.0", "method": "notifications/progress",
+                  "params": {"progressToken": meta["progressToken"], "progress": args["then_progress"]}})
         return text("slept")
     if name == "connect_instance":
         connects.append(args)

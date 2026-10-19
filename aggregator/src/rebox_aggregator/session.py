@@ -804,7 +804,9 @@ class Session:
                 fl.progress_at = time.monotonic()
                 value = params.get("progress")
                 if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    fl.progress = max(fl.progress, float(value))
+                    if value <= fl.progress:  # keepalives went past it; progress must keep increasing
+                        params = {**params, "progress": fl.progress + 0.001}
+                    fl.progress = float(params["progress"])
             await self._notify_down(method, params, related)
         elif method == "notifications/cancelled" and isinstance(params, dict):
             rid = params.get("requestId")
