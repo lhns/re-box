@@ -81,6 +81,25 @@ git fetch -q --depth 1 origin "$GHIDRA_MCP_COMMIT"
 git checkout -q FETCH_HEAD
 echo "$GHIDRA_MCP_REF-$GHIDRA_MCP_COMMIT" > /src/ghidra-mcp.version  # keys the aggregator's catalog cache
 EOS
+# re-box's patches (deps/ghidra-mcp/patches; each header says why and where upstream stands). One
+# that no longer applies fails the build; one already upstream (applies in reverse) fails it too,
+# so it gets dropped. The patch hash joins the version, which keys the catalog cache.
+RUN --mount=type=bind,source=deps/ghidra-mcp/patches,target=/run/patches <<'EOS'
+set -eu
+cd /src/ghidra-mcp
+for p in /run/patches/*.patch; do
+  if git apply --check "$p" 2>/dev/null; then
+    git apply "$p"
+  elif git apply --reverse --check "$p" 2>/dev/null; then
+    echo "$(basename "$p") is already in ghidra-mcp $(cat /src/ghidra-mcp.version): drop it" >&2; exit 1
+  else
+    git apply --check "$p" || true
+    echo "$(basename "$p") does not apply to ghidra-mcp $(cat /src/ghidra-mcp.version): rebase it" >&2; exit 1
+  fi
+done
+echo "+rebox-$(cat /run/patches/*.patch | sha256sum | cut -c1-12)" >> /src/ghidra-mcp.version
+tr -d '\n' < /src/ghidra-mcp.version > /tmp/v && mv /tmp/v /src/ghidra-mcp.version
+EOS
 
 FROM ghidra-mcp-src AS ghidra-mcp
 RUN --mount=type=bind,from=pins,source=/pins/gradle.env,target=/run/pins.env <<'EOS'
@@ -131,6 +150,7 @@ RUN --mount=type=bind,source=deps/rea-attach,target=/src/rea-attach <<'EOS'
 set -eu
 cd /src/rea-attach
 REA_PACKAGE=/opt/rea/node_modules/rea-agents python3 -B -m unittest -q test_patch_rea
+REA_PACKAGE=/opt/rea/node_modules/rea-agents node --test helper.test.mjs
 python3 -B patch-rea.py /opt/rea/node_modules/rea-agents /opt/rebox/rea-attach/ghidra_scripts
 install -m 0644 ReboxReaAttach.java helper.mjs /opt/rebox/rea-attach/
 EOS
