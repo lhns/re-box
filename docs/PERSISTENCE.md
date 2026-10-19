@@ -56,10 +56,10 @@ mode 777); it needs a one-time chown to uid 1000. Docker Desktop was not tested.
 | --- | --- | --- | --- |
 | `ghidra-projects/rebox.gpr`, `rebox.rep/` | the shared Ghidra project: every program imported with `ghidra_import_file` or opened with `rea_open_binary` (by file name; a different file of the same name goes to `/rea/<sha256 prefix>/`), its auto-analysis, and all `ghidra_` and REA edits (renames, types, comments, bookmarks) | the long-running work. Re-importing a large binary costs its auto-analysis again (hours for big targets) and loses every annotation | several times each imported binary: MBs for small ELFs, GBs for large firmware |
 | `home/` | `HOME` of every service and tool | | small |
-| `home/.config/ghidramcp/ghidramcp_12.1.4_PUBLIC/` | the headless server's Ghidra settings: preferences, tool state, `application.log` (Ghidra's own log, more detail than the container log); `home/.config/ghidra*`, `rebox-ghidra` are the first-start project creation's | diagnosing after a restart; preferences | < 10 MB |
+| `home/.config/ghidramcp/ghidramcp_12.1.4_PUBLIC/` | the headless server's Ghidra settings: preferences, tool state, `application.log` and `script.log` (Ghidra's own logs, more detail than the container log); `home/.config/ghidra*`, `rebox-ghidra` are the first-start project creation's | diagnosing after a restart; preferences | small; logs roll at 50 MB (below) |
 | `home/ghidra_scripts/` | `ReboxReaAttach.java`, which starts REA's bridge in the Ghidra JVM (copied from the image at every Ghidra start), and Ghidra's script bundle state | nothing to keep; rewritten at start. Clients cannot run scripts (the aggregator denies ghidra-mcp's script tools) | small |
 | `home/.config`, `home/.local`, `home/.cache` | other tools' user state when run directly: rizin, gdb/pwndbg history and config, adb keys (`.android/`), Chrome profile, NSS db | device pairings, histories | small |
-| `cache/` (`XDG_CACHE_HOME`) | Ghidra's cache (`rebox-ghidramcp/`: `fscache2`, `packed-db-cache`, `debuginfo-cache` with downloaded debug symbols), pwndbg, fontconfig, Chrome | faster opens, no repeated symbol downloads. **Safe to delete** while the container is stopped | 100s of MB, grows with symbol downloads |
+| `cache/` (`XDG_CACHE_HOME`) | Ghidra's cache (`rebox-ghidramcp/`: `fscache2`, `packed-db-cache`, `debuginfo-cache` with downloaded debug symbols), pwndbg, fontconfig, Chrome | faster opens, no repeated symbol downloads. **Safe to delete** while the container is stopped. Ghidra purges its own caches: `fscache2` files unused for 1 day, `packed-db-cache` and downloaded symbols after 7 days | 100s of MB |
 | `cache/rebox-catalog/ghidra-<key>.json` | the aggregator's catalog cache: the full tool list of the ghidra-mcp bridge, advertised to sessions while Ghidra starts | a cold session lists the `ghidra_` tools at once. **Safe to delete** (refilled at the next start, which then runs Ghidra once) | ~250 KB |
 | `rea/evidence/<session>.json` | REA evidence bundles, one per MCP session: every Evidence record and unknown the session produced, written by the aggregator ("When things are saved") | REA's in-session state (its evidence, findings, caches) ends with the session; this is what is left of it. Renames and comments REA made are in the Ghidra project instead. Restore with `rea_import_evidence_bundle {"path": ...}` | KBs to tens of MB per session; pruned automatically (below) |
 | `.gitignore` | `*`, written once at start | the default state dir sits inside the work dir, which is often a git repo | bytes |
@@ -70,6 +70,21 @@ keeps everything) are deleted at start and daily. Bundles are only data for REA'
 (no renames are re-applied), so age-based pruning loses little; annotations that must last belong
 in the `ghidra_` project.
 
+**Other housekeeping**, logged as the events named:
+
+- `rea/evidence/.rea-write-*`: REA writes an export through a temp directory next to its
+  destination; a kill mid-export leaves it. Removed at start (`evidence_partial_removed`).
+- Ghidra's `application.log` and `script.log` roll at 50 MB (20 files per day), but Ghidra never
+  deletes rolled files of earlier days. Rolled files (`*.log-DATE-N.log`) not modified for 30 days
+  (fixed, not configurable) are deleted at start and daily (`ghidra_logs_pruned`).
+- `/tmp`: REA's per-session `rea-ghidra-*` directory (it holds a full copy of the target) is
+  deleted on a normal `rea_close_binary` but survives a `docker kill` or a crash, and the attach
+  helper's `rebox-attach-locks/*.lock` stay. The supervisor removes `rea-*` entries and those lock
+  files from the temp dir at each start (`tmp_swept`, count and bytes), before any session exists.
+  Limit: a session that is SIGKILLed while the container keeps running leaves its `rea-ghidra-*`
+  until the next container start. Ghidra's own temp files clean up after themselves.
+- The size of `ghidra-projects/` is logged as `project_size` at every Ghidra start.
+
 Suggested places for an agent's own REA exports (not created automatically): `rea/exports/` for
 `rea_export_evidence_bundle`, `rea/snapshots/` for `rea_close_binary {"snapshot_path": ...}`.
 
@@ -77,7 +92,7 @@ Suggested places for an agent's own REA exports (not created automatically): `re
 
 | what | where | why not |
 | --- | --- | --- |
-| REA's per-session runtime (`rea-ghidra-*`: descriptor, socket, target snapshot, logs; for targets in REA's own JVM also its throwaway project) | `/tmp` | REA creates it privately per session and deletes it when the session closes the binary. Only targets ghidra-mcp's import cannot express (raw, DOS COM/MZ, PSP, language overrides, seeds, disabled analyzers, MIPS soft-float, targets outside `RE_WORKDIR`) still run in REA's own JVM with that throwaway project; their edits survive only as the evidence export |
+| REA's per-session runtime (`rea-ghidra-*`: descriptor, socket, target snapshot, logs; for targets in REA's own JVM also its throwaway project) | `/tmp` | REA creates it privately per session and deletes it when the session closes the binary (leftovers of killed sessions are swept at start, above). Only targets ghidra-mcp's import cannot express (raw, DOS COM/MZ, PSP, language overrides, seeds, disabled analyzers, MIPS soft-float, targets outside `RE_WORKDIR`) still run in REA's own JVM with that throwaway project; their edits survive only as the evidence export |
 | mitmproxy config and CA, apktool frameworks, extraction scratch | `/tmp`, per REA operation | REA gives each run its own directory (`confdir=<run dir>`, `--frame-path <run dir>`), so there is no long-lived CA to keep or trust. Extraction output a caller wants kept goes to a path the caller names |
 | Ghidra temp files, JVM perf data, ghidra-mcp's socket | `/tmp` | scratch |
 | aggregator and supervisor logs | stdout | the container runtime's logging driver keeps them; Ghidra's own log is under `home/` |
@@ -135,8 +150,38 @@ restart `rea_open_binary` the target (it reopens the same program, annotations i
 targets in REA's own JVM (see "Not in it") annotations end with the session; keep those in a
 `ghidra_` import of the file.
 
+## Removing programs
+
+Nothing deletes programs from the shared project automatically: they are the long-running work,
+and re-importing costs the analysis again. The project grows by every binary imported (REA's
+`rea_open_binary` imports under `/rea/<sha256 prefix>/`). To remove ones you no longer need,
+ask the agent to:
+
+1. list them with `ghidra_list_project_files`;
+2. `rea_close_binary` first if REA has the program open (deleting under an attached REA session
+   is untested);
+3. call `ghidra_delete_file {"filePath": "/path/in/project"}`. It removes the program from the
+   project (closing it first if it is open), never the source file on disk. The response is
+   `{"success": true, "deleted": true}`; an unknown path gives `"deleted": false` and no error, so
+   check `deleted`.
+
+Emptied folders (such as `/rea/<sha12>/`) stay: there is no folder-delete tool, and they are
+small. `delete_project` is hidden by the aggregator, since it would drop the whole shared project.
+A state dir in an agent's scratchpad is removed with the scratchpad, which is the other way to
+start clean. The `project_size` log line shows how large the project has grown.
+
 ## Backups
 
-Copy the state dir while the container is stopped. A copy of a running container's state dir
-can catch a Ghidra save half way; take it between autosaves at least, and expect to fall back to
-an older copy if Ghidra refuses to open that program.
+Ghidra's undo history lives in memory and is gone after any restart (idle stop included). A
+deleted program or a bad edit can therefore only be recovered from a copy of the state dir made
+while the container was stopped:
+
+```sh
+docker compose stop            # or: docker stop --time 120 re-box   (saves everything)
+cp -a "$RE_WORKDIR/re-box-state" "$RE_WORKDIR/re-box-state.bak"   # or your REBOX_STATE_DIR
+docker compose start
+```
+
+A copy of a running container's state dir can catch a Ghidra save half way; take it between
+autosaves at least, and expect to fall back to an older copy if Ghidra refuses to open that
+program.

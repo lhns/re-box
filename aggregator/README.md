@@ -17,6 +17,7 @@ Why custom, and the protocol-era decision: `docs/DECISIONS.md`, "5.2".
 | `app.py` | ASGI app: auth, `/healthz`, `/mcp` session manager (cap, idle reaping, era rejection) |
 | `supervisor.py` | headless JVM lifecycle (on demand), Ghidra project, evidence pruning, runs the app, signal handling |
 | `evidence.py` | REA evidence bundles: drop an empty export, prune old ones |
+| `housekeeping.py` | leftovers nothing else removes: `/tmp` sweep at start, half-written exports, rolled Ghidra logs, project size |
 | `catalogcache.py` | per-child catalog cache (key, atomic save/load) and the session-less listing used by the warm-up |
 | `log.py` | JSON-lines logging to stdout |
 
@@ -63,7 +64,7 @@ key = "{file:/opt/ghidra-mcp/VERSION}-lazy{GHIDRA_MCP_LAZY}"   # {NAME}: env var
 **Deny list:** `deny` names tools by the child's own (unprefixed) names. They are dropped from
 `tools/list` (again after every `list_changed` refresh), and a `tools/call` to one fails with
 `-32602` "Tool ghidra_x is disabled by this re-box's configuration" without reaching the child. The
-shipped config denies ghidra-mcp's `run_ghidra_script` and `run_script_inline`.
+shipped config denies ghidra-mcp's `run_ghidra_script`, `run_script_inline` and `delete_project`.
 
 **on_ready:** the Ghidra server starts with the first session, so a bridge usually boots before it
 and shows only static tools. When the server becomes ready (and the client has sent
@@ -203,7 +204,7 @@ JSON lines on stdout, one object per line, always `ts`, `level`, `event`:
 `session_open` (session tag, children with pid), `session_close` (reason, duration, leftovers
 killed), `session_refused` (reason), `session_evicted`, `get_stream_open` / `get_stream_closed`,
 `on_ready`, `headless_state` (state, reason), `headless_idle_stop`, `evidence_dropped`,
-`evidence_pruned`, `child_exit`, `tool_call` (session, tool, duration_ms,
+`evidence_pruned`, `evidence_partial_removed`, `tmp_swept`, `ghidra_logs_pruned`, `project_size` (bytes, files; at each Ghidra start), `child_exit`, `tool_call` (session, tool, duration_ms,
 outcome `ok` / `tool_error` / `rpc_error` / `cancelled`, error code), `catalog_rejected`,
 `child_stderr` (session, child, line truncated to 2000 chars). **Never tool arguments or
 results.**
@@ -221,7 +222,9 @@ results.**
 2. Export `HOME=$STATE/home`, `XDG_{CONFIG,DATA,STATE}_HOME` below it and `XDG_CACHE_HOME=$STATE/cache`
    (inherited by the JVM and every child). Set `REBOX_INSTANCE` to a random id in its own environment, unless it is already set (the
    test-stage runner sets it to find every process of the instance).
-3. Serve at once (the port opens; no JVM runs yet). The headless server is **on demand**: the app
+3. Before anything else runs, remove what killed processes left in the temp dir (`sweep_tmp`:
+   `rea-*` and `rebox-attach-locks/*.lock` only; logged as `tmp_swept`). No session exists yet,
+   so none of it is in use. Then serve at once (the port opens; no JVM runs yet). The headless server is **on demand**: the app
    calls `want(True)` when a session is created and `want(False)` when the last one is gone. State:
    `stopped`, `starting`, `ready`, `failed` (crashed, backing off), `stopping` (idle stop),
    `shutting_down`. While wanted, start the headless server in its own process group:
@@ -234,7 +237,7 @@ results.**
    `analyzeHeadless <dir> rebox -preScript ReboxNoop.java` (the HTTP API cannot create projects
    outside the file root); its output relayed as `headless_log` lines.
 4. Wait for `GET http://127.0.0.1:8089/check_connection` to answer `{"status":"ok",...}`
-   (`REBOX_HEADLESS_START_TIMEOUT`, 300 s). Then check the project: `GET /get_project_info`;
+   (`REBOX_HEADLESS_START_TIMEOUT`, 300 s). Then check the project (and log its size on disk as `project_size`): `GET /get_project_info`;
    if `has_project` is false (fallback, works only inside the file root), `POST /open_project {"path": "<dir>/rebox.gpr"}` when it exists,
    else `POST /create_project {"parentDir": "<dir>", "name": "rebox"}` (JSON bodies).
 5. `/healthz` is 200 with `"ghidra": "<state>"` when stopped, stopping, ready, or starting within
@@ -252,7 +255,9 @@ results.**
 7. At start, if a child with a `catalog_cache` has none for its current key, the server is started
    without a session, the child listed against it, the cache written and the server released to the
    normal idle stop (`warm_up`).
-8. REA evidence bundles older than `REBOX_EVIDENCE_RETENTION_DAYS` are deleted at start and daily.
+8. At start and daily: REA evidence bundles older than `REBOX_EVIDENCE_RETENTION_DAYS` are deleted,
+   and rolled Ghidra logs (`application.log-*.log`, `script.log-*.log`) older than 30 days. At start
+   only: `.rea-write-*` directories left in `rea/evidence/` by an export that was killed.
 9. SIGTERM/SIGINT: at once `POST /save_all_programs` (concurrently with closing the sessions, so a
    short `docker stop` grace cannot lose it; waited for at most 30 s), refuse new sessions, close all sessions, `POST /exit_ghidra` (saves all
    programs), wait up to 60 s for the JVM, then SIGTERM/SIGKILL its group, then SIGKILL anything

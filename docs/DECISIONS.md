@@ -290,7 +290,7 @@ Rejected:
 - One Ghidra JVM; REA's edits persist in the shared project (autosave, shutdown save) and are
   visible to ghidra_ tools and to other sessions at once. REA's own texts ("ephemeral",
   `project_ephemeral`, `persists_after_close: false`) are stale under re-box.
-- ghidra-mcp runs with scripts enabled; `run_ghidra_script`/`run_script_inline` are denied in
+- ghidra-mcp runs with scripts enabled; `run_ghidra_script`/`run_script_inline` (and `delete_project`, which would drop the shared project) are denied in
   the aggregator (8089 stays loopback-only, as before). The supervisor copies the host script into
   `$REBOX_STATE_DIR/home/ghidra_scripts` at every JVM start: ghidra-mcp runs scripts only from
   there. That script must stay free of compile-time references to `ghidra.app.plugin.core.osgi`
