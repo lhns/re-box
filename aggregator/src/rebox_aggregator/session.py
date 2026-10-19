@@ -627,11 +627,17 @@ class Session:
         """Replace a cached catalog with the child's live one."""
         try:
             part = await self._fetch(child, ("tools", "prompts", "resources"), self.parts.get(child.name))
+            if self._partial(child, part):
+                return  # not connected after all; its own list_changed brings the full listing
             if self._adopt(child, part):
                 for kind in ("tools",):
                     await self._notify_down(f"notifications/{kind}/list_changed", None, None, droppable=False)
         except (ChildError, CatalogError) as e:
             log("refresh_failed", "warn", session=self.tag, child=child.name, error=str(e)[:500])
+
+    def _partial(self, child: Child, part: ChildCatalog) -> bool:
+        """A listing smaller than the cached catalog still advertised for this child: not connected yet."""
+        return child.name in self._cached and len(part.tools) < len(self.parts[child.name].tools)
 
     def _adopt(self, child: Child, part: ChildCatalog) -> bool:
         """Install a freshly listed catalog part, remember it in the cache. True when the client must be told."""
@@ -651,13 +657,17 @@ class Session:
         """A child with a catalog cache booted: decide what the session advertises for it."""
         part = self.parts[spec.name]
         self._boot_tools[spec.name] = {t.get("name") for t in part.tools}
-        if self.backend_ready():  # booted against a live backend: the listing is complete
+        cached = catalogcache.load(self.settings.state_dir, spec)
+        # A live backend does not mean the child has connected to it yet: a listing smaller than the
+        # cache is still the bridge's static one (the rule catalogcache.save uses too).
+        if self.backend_ready() and (cached is None or len(part.tools) >= len(cached.tools)):
             self._tg.start_soon(self._save_cache, spec, part)
             return
-        cached = catalogcache.load(self.settings.state_dir, spec)
         if cached is not None:  # advertised now; calls wait for the live catalog (_wait_live)
             self.parts[spec.name] = cached
             self._cached.add(spec.name)
+            if spec.on_ready:
+                self._pending_ready.add(spec.name)  # told to connect once the client is initialized
             return
         # Nothing cached: hold the initialize reply until the child is connected, so the first list is complete.
         with anyio.move_on_after(self.settings.start_timeout) as waited:
@@ -842,7 +852,7 @@ class Session:
                 self._refreshing[child.name] = set()
                 try:
                     part = await self._fetch(child, kinds, self.parts.get(child.name))
-                    if child.name in self._cached and not self.backend_ready():
+                    if child.name in self._cached and (not self.backend_ready() or self._partial(child, part)):
                         continue  # still the bridge's partial listing; the cached one stays
                     changed = self._adopt(child, part)
                 except ChildError as e:
