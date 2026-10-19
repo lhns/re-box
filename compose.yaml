@@ -1,0 +1,29 @@
+# Example deployment (also deployable as a Swarm stack). docs/OPERATIONS.md explains each knob.
+services:
+  re-box:
+    image: ${REBOX_IMAGE:-registry.example/re-box:latest}
+    # Started as root only so the entrypoint can give `rebox` the host user's PUID/PGID; it drops
+    # to that user before anything else runs. Without PUID/PGID needs, delete `user` and the
+    # three cap_add entries: the image defaults to uid 1000.
+    user: "0:0"
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      REBOX_TOKEN: ${REBOX_TOKEN:?set REBOX_TOKEN in .env}
+      RE_WORKDIR: ${RE_WORKDIR:?set RE_WORKDIR in .env}
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
+    volumes:
+      # Same absolute path inside as outside: paths the harness sends are valid here as-is.
+      - ${RE_WORKDIR}:${RE_WORKDIR}
+      - rebox-tmp:/tmp
+    ports:
+      - "8443:8443"
+    deploy:
+      resources:
+        limits:
+          memory: 16g
+    stop_grace_period: 90s
+volumes:
+  rebox-tmp:

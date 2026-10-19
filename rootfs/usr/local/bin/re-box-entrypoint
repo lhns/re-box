@@ -1,0 +1,27 @@
+#!/bin/bash
+# Started as root (e.g. compose `user: "0:0"`): give `rebox` the uid/gid PUID/PGID, so files on
+# the bind mount get the host user's ownership, then drop to it for good. Started as any other
+# uid (the image default 1000, or Kubernetes runAsUser): no remap, run as is.
+set -euo pipefail
+
+if [ "$(id -u)" = 0 ]; then
+  puid=${PUID:-1000} pgid=${PGID:-1000}
+  case "$puid$pgid" in *[!0-9]*) echo "re-box: PUID and PGID must be numeric" >&2; exit 2 ;; esac
+  if [ "$puid" = 0 ] || [ "$pgid" = 0 ]; then
+    echo "re-box: refusing to run the services as root (PUID/PGID 0)" >&2; exit 2
+  fi
+  [ "$(id -g rebox)" = "$pgid" ] || groupmod -o -g "$pgid" rebox
+  [ "$(id -u rebox)" = "$puid" ] || usermod -o -u "$puid" rebox  # also re-owns /home/rebox
+  export HOME=/home/rebox USER=rebox LOGNAME=rebox
+  exec setpriv --reuid=rebox --regid=rebox --init-groups --no-new-privs --inh-caps=-all -- "$@"
+fi
+
+if { [ -n "${PUID:-}" ] && [ "$PUID" != "$(id -u)" ]; } || { [ -n "${PGID:-}" ] && [ "$PGID" != "$(id -g)" ]; }; then
+  echo "re-box: running as $(id -u):$(id -g); PUID/PGID need the container started as root, ignoring them" >&2
+fi
+# An arbitrary uid (e.g. OpenShift) cannot write /home/rebox; Ghidra needs a writable home.
+if ! [ -w "${HOME:-/nonexistent}" ]; then
+  export HOME=/tmp/rebox-home
+  mkdir -p "$HOME"
+fi
+exec "$@"

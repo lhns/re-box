@@ -13,7 +13,7 @@ RUN <<'EOS'
 set -eu
 cd /pins
 split() { grep -E "^($2)=" versions.env > "$1.env" || true; }
-split ghidra 'GHIDRA_VERSION|GHIDRA_RELEASE_DATE|GHIDRA_SHA256'
+split ghidra 'GHIDRA_VERSION|GHIDRA_RELEASE_DATE|GHIDRA_URL|GHIDRA_SHA256'
 split ghidra-mcp 'GHIDRA_MCP_[A-Z0-9_]+'
 split rea 'REA_VERSION'
 split runtimes 'NODE_[A-Z0-9_]+|JDK_[A-Z0-9_]+'
@@ -37,12 +37,10 @@ set -eu
 . /run/pins.env
 . /usr/local/lib/rebox/fetch.sh
 t=$(mktemp -d)
-jdk_tag=$(printf 'jdk-%s' "$JDK_VERSION" | sed 's/+/%2B/')
-jdk_file=$(printf 'OpenJDK21U-jdk_x64_linux_hotspot_%s.tar.gz' "$JDK_VERSION" | tr + _)
-fetch "https://github.com/adoptium/temurin21-binaries/releases/download/$jdk_tag/$jdk_file" "$JDK_SHA256" "$t/jdk.tgz"
+fetch "$JDK_URL" "$JDK_SHA256" "$t/jdk.tgz"
 mkdir -p /opt/java && tar -xzf "$t/jdk.tgz" -C /opt/java --strip-components=1
 rm -rf /opt/java/lib/src.zip /opt/java/man
-fetch "https://nodejs.org/dist/v$NODE_VERSION/node-v$NODE_VERSION-linux-x64.tar.xz" "$NODE_SHA256" "$t/node.txz"
+fetch "$NODE_URL" "$NODE_SHA256" "$t/node.txz"
 tar -xJf "$t/node.txz" -C /usr/local --strip-components=1 \
   --exclude='*/share/doc' --exclude='*/share/man' --exclude='*/*.md' --exclude='*/LICENSE'
 rm -rf "$t"
@@ -62,8 +60,7 @@ set -eu
 . /run/pins.env
 . /usr/local/lib/rebox/fetch.sh
 t=$(mktemp -d)
-fetch "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_${GHIDRA_VERSION}_build/ghidra_${GHIDRA_VERSION}_PUBLIC_${GHIDRA_RELEASE_DATE}.zip" \
-  "$GHIDRA_SHA256" "$t/ghidra.zip"
+fetch "$GHIDRA_URL" "$GHIDRA_SHA256" "$t/ghidra.zip"
 unzip -q "$t/ghidra.zip" -d "$t"
 mv "$t/ghidra_${GHIDRA_VERSION}_PUBLIC" /opt/ghidra
 # Jython is no longer enabled by default since 12.1; unpacked as upstream ghidra-mcp's image does.
@@ -90,7 +87,7 @@ set -eu
 . /run/pins.env
 . /usr/local/lib/rebox/fetch.sh
 t=$(mktemp -d)
-fetch "https://services.gradle.org/distributions/gradle-$GRADLE_VERSION-bin.zip" "$GRADLE_SHA256" "$t/gradle.zip"
+fetch "$GRADLE_URL" "$GRADLE_SHA256" "$t/gradle.zip"
 unzip -q "$t/gradle.zip" -d "$t"
 cd /src/ghidra-mcp
 # Compile only: the Java unit tests would pull junit/mockito from Maven Central unverified.
@@ -136,8 +133,9 @@ mkdir -p /fixtures
 gcc -g -O0 -o /fixtures/hello_debug /src/hello.c
 gcc -O2 -s -o /fixtures/hello_stripped /src/hello.c
 x86_64-w64-mingw32-gcc -O2 -o /fixtures/hello.exe /src/hello.c
-cp /fixtures/hello_debug /fixtures/hello_debug_b
-printf 'rebox' >> /fixtures/hello_debug_b
+# Same code, different bytes: a second target for the session-isolation test.
+cp /fixtures/hello_debug /fixtures/other_debug
+printf rebox >> /fixtures/other_debug
 EOS
 
 # --- runtime-core: Ghidra, ghidra-mcp and REA, before the extra tools and the aggregator.
@@ -147,3 +145,65 @@ COPY --from=ghidra-mcp /opt/ghidra-mcp /opt/ghidra-mcp
 COPY --from=rea /opt/rea /opt/rea
 RUN ln -s /opt/rea/node_modules/.bin/rea /usr/local/bin/rea
 ENV GHIDRA_INSTALL_DIR=/opt/ghidra
+
+# --- runtime: everything the release image needs.
+FROM runtime-core AS runtime
+# Ubuntu's image ships a uid-1000 user `ubuntu`; rebox takes that id.
+RUN userdel -r ubuntu 2>/dev/null; groupadd -g 1000 rebox && useradd -u 1000 -g 1000 -m -s /bin/bash rebox
+COPY aggregator /src/aggregator
+RUN UV_PROJECT_ENVIRONMENT=/opt/rebox/venv uv sync -q --frozen --no-dev --no-editable --project /src/aggregator \
+ && rm -rf /src /root/.cache
+COPY --chmod=0755 rootfs/usr/local/bin/ /usr/local/bin/
+COPY rootfs/usr/local/lib/rebox/ /usr/local/lib/rebox/
+COPY rootfs/etc/rebox/ /etc/rebox/
+# REA's workflow skill for the client side, with tool names prefixed as the aggregator serves
+# them (spec 11). Extract: docker run --rm <image> tar -C /opt/rebox/skills -c . | tar -x -C ~/.claude/skills
+RUN python3 /usr/local/lib/rebox/rewrite-skill.py /opt/rea/node_modules/rea-agents/skills /opt/rebox/skills rea_
+# Defaults; docs/OPERATIONS.md explains each. Memory: JAVA_OPTS heap (headless server) plus up
+# to REBOX_MAX_SESSIONS x GHIDRA_HEADLESS_MAXMEM (one REA Ghidra JVM per session) must fit the
+# container limit with overhead; these fit 16 GiB.
+ENV RE_WORKDIR=/work \
+    REBOX_PORT=8443 \
+    REBOX_MAX_SESSIONS=4 \
+    REBOX_SESSION_IDLE_TIMEOUT=1800 \
+    JAVA_OPTS="-Xmx4g -XX:+UseG1GC" \
+    GHIDRA_HEADLESS_MAXMEM=1536m \
+    GHIDRA_MCP_ALLOW_SCRIPTS=0 \
+    GHIDRA_MCP_LAZY=1 \
+    GHIDRA_MCP_LOG_LEVEL=WARNING \
+    REA_ANALYSIS_PROVIDER=ghidra \
+    REA_MCP_INPUT_SCHEMA_PROFILE=full \
+    REA_MCP_OUTPUT_SCHEMA_PROFILE=full \
+    REA_LOG_LEVEL=warn \
+    HOME=/home/rebox
+EXPOSE 8443
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5m --retries=3 CMD ["/usr/local/bin/re-box-healthcheck"]
+USER 1000:1000
+WORKDIR /home/rebox
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/re-box-entrypoint"]
+CMD ["/opt/rebox/venv/bin/rebox-supervisor"]
+
+# --- ghidra-mcp-test: upstream's offline tier at the pinned ref (spec 8.1), no Ghidra needed.
+FROM ghidra-mcp-src AS ghidra-mcp-test
+RUN <<'EOS'
+set -eu
+cd /src/ghidra-mcp
+uv sync -q --frozen --no-default-groups --group test
+uv run --no-sync pytest -q -p no:cacheprovider --no-cov tests/offline/
+uv run --no-sync pytest -q -p no:cacheprovider --no-cov -p tests.offline.replay_plugin tests/integration/test_readonly_endpoints.py
+touch /ghidra-mcp-offline-passed
+EOS
+
+# --- test: the whole suite (spec 8). Root, to exercise the PUID/PGID remap; tests/run-tests.sh.
+FROM runtime AS test
+USER root
+COPY --from=ghidra-mcp-test /ghidra-mcp-offline-passed /opt/rebox/
+COPY --from=fixtures /fixtures /opt/rebox/fixtures
+COPY aggregator /src/aggregator
+RUN UV_PROJECT_ENVIRONMENT=/opt/rebox/test-venv uv sync -q --frozen --project /src/aggregator
+COPY --chmod=0755 tests /src/tests
+RUN /src/tests/run-tests.sh
+
+# --- final: the release image. The marker exists only if `test` passed.
+FROM runtime AS final
+COPY --from=test /opt/rebox/tests-passed /opt/rebox/tests-passed

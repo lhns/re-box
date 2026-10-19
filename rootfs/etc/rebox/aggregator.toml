@@ -1,0 +1,17 @@
+# Children of each MCP session (aggregator/README.md, "Configuration"). [child.env] values are
+# forced over the container env; everything else is inherited minus REBOX_*.
+
+[[child]]
+name = "rea"
+prefix = "rea_"
+command = ["/usr/local/bin/rea", "mcp"]
+
+[[child]]
+name = "ghidra"
+prefix = "gh_"
+command = ["/opt/ghidra-mcp/venv/bin/bridge-mcp-ghidra", "--transport", "stdio"]
+[child.env]
+GHIDRA_MCP_URL = "http://127.0.0.1:8089"
+# The headless server and its project are shared by all sessions: never let a call fall back to
+# another session's "current program".
+GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS = "1"

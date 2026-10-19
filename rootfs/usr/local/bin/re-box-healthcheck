@@ -1,0 +1,6 @@
+#!/bin/sh
+# Docker HEALTHCHECK: the aggregator's /healthz, which is ready only while the ghidra-mcp
+# headless server answers and its project is open.
+scheme=http
+[ -n "${REBOX_TLS_CERT:-}" ] && scheme=https
+exec curl -fsS -k --max-time 8 -o /dev/null "$scheme://127.0.0.1:${REBOX_PORT:-8443}/healthz"

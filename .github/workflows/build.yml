@@ -1,0 +1,42 @@
+# Builds the `test` target: the whole suite (docs/DECISIONS.md, tests/run-tests.sh) runs inside
+# the build, so a green build is a passed suite. Nothing is pushed: the release image is built
+# in-cluster by ImageBuild with target `final` (docs/IMAGEBUILD.md).
+name: build
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: versions.env digests match their URLs
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/check-pins.py
+
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Free disk space
+        # The build context grows past the runner's free space otherwise (Ghidra, JDK, tools,
+        # plus the test stage's layers).
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the test stage (runs the suite)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: test
+          platforms: linux/amd64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
