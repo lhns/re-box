@@ -191,10 +191,9 @@ const main = async () => {
 			program,
 			timeout_seconds: 1800,
 		};
-		// Ghidra guards script bundle builds with a file lock meant for separate JVMs. ghidra-mcp
-		// serializes its loads (patch 0002), but /run_ghidra_script then runs the script through
-		// GhidraScript.runScript, which loads it once more outside that lock: two attaches at once
-		// can still meet OverlappingFileLockException there. Take turns.
+		// Ghidra guards script bundle builds with a file lock meant for separate JVMs: two attaches
+		// at once met OverlappingFileLockException. Patch 0002 serializes script loads; this retry
+		// keeps attaching working against a ghidra-mcp without it.
 		for (let attempt = 1; ; attempt++) {
 			try {
 				await call("/run_ghidra_script", body);

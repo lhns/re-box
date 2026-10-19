@@ -101,7 +101,8 @@ def test_concurrent_rea_sessions_share_one_program(session):
     assert len(helpers()) == 2 and len(ghidra_mcp_jvm()) == 1 and not rea_jvms()
     # Both opened the same new file at once: one program, not a "shared_debug.0" copy as well.
     programs = jtext(ok(a.tool("ghidra_list_open_programs", {})))["programs"]
-    paths = [p["path"] for p in programs if p["name"].startswith("shared_debug")]
+    # By project path: inside Ghidra the program keeps the snapshot's name (target-<sha>.bin).
+    paths = [p["path"] for p in programs if "/shared_debug" in p["path"]]
     assert paths == [rea_program_path(a, target)], programs
     ok(a.tool("rea_annotate_native_function", {"procedure": "compute", "name": "SharedCompute"}))
     # One program: b, still open since before, sees a's rename at once.

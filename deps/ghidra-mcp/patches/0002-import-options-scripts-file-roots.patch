@@ -538,6 +538,19 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
                      if (script == null) {
                          resultMsg.append("ERROR: Failed to create script instance\n");
                          return;
+@@ -2398,8 +2544,10 @@
+ 
+                     resultMsg.append("\n--- SCRIPT OUTPUT ---\n");
+ 
+-                    // Execute the script
+-                    script.runScript(scriptFile.getName(), args);
++                    // Execute the instance loaded above. runScript(name, args) looked the script
++                    // up by name and loaded it a second time, outside ImportScripts.LOAD_LOCK.
++                    script.execute(scriptState, new ghidra.app.script.ScriptControls(
++                        scriptPrintWriter, scriptPrintWriter, scriptMonitor));
+ 
+                     // Get script output
+                     String scriptOutput = scriptWriter.toString();
 diff -ruN a/src/main/java/com/xebyte/core/ProjectProgramProvider.java b/src/main/java/com/xebyte/core/ProjectProgramProvider.java
 --- a/src/main/java/com/xebyte/core/ProjectProgramProvider.java
 +++ b/src/main/java/com/xebyte/core/ProjectProgramProvider.java
