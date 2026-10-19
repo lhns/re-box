@@ -1,42 +1,102 @@
-# Builds the `test` target: the whole suite (docs/DECISIONS.md, tests/run-tests.sh) runs inside
-# the build, so a green build is a passed suite. Nothing is pushed: the release image is built
-# in-cluster by ImageBuild with target `final` (docs/IMAGEBUILD.md).
+# Pins and aggregator unit tests on every push and PR. The image's test stage (the whole suite,
+# docs/BUILDING.md) on PRs without pushing; on main and v* tags the release image is pushed to
+# ghcr.io/<owner>/re-box.
 name: build
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
   workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+  CACHE: ghcr.io/${{ github.repository }}:buildcache
+
 jobs:
   pins:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: versions.env digests match their URLs
         env:
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/check-pins.py
 
-  test:
+  unit:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Aggregator unit tests (fake children, no image)
+        working-directory: aggregator
+        run: |
+          pipx install uv==0.13.1  # the Dockerfile's uv stage
+          uv sync --frozen
+          uv run --no-sync pytest -q -p no:cacheprovider tests
+
+  image:
+    needs: [pins, unit]
+    # Repository variable REBOX_RUNNER (JSON) moves this job off the hosted runner, e.g. '"re-box"'
+    # for an ARC scale set; REBOX_BUILD_TIMEOUT raises the limit there (hosted jobs stop at 360).
+    runs-on: ${{ fromJSON(vars.REBOX_RUNNER || '"ubuntu-24.04"') }}
+    timeout-minutes: ${{ fromJSON(vars.REBOX_BUILD_TIMEOUT || '330') }}
+    permissions:
+      contents: read
+      packages: write
     steps:
       - name: Free disk space
-        # The build context grows past the runner's free space otherwise (Ghidra, JDK, tools,
-        # plus the test stage's layers).
-        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
-      - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - name: Build the test stage (runs the suite)
-        uses: docker/build-push-action@v6
+        # A hosted runner starts with ~20 GB free; layers, test stage and cache need more.
+        if: runner.environment == 'github-hosted'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell
+          df -h /
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=sha
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=re-box
+            org.opencontainers.image.description=Ghidra, REA and ghidra-mcp behind one authenticated MCP endpoint
+      - name: Test stage (runs the whole suite)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           target: test
           platforms: linux/amd64
           push: false
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=${{ env.CACHE }}
+      - name: Release image
+        # Reuses the test stage from the builder; `final` cannot exist without it passing.
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          target: final
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=min
+          cache-from: type=registry,ref=${{ env.CACHE }}
+          # Registry, not gha: the gha cache is capped at 10 GB per repo, below this build's layers.
+          cache-to: type=registry,ref=${{ env.CACHE }},mode=max,image-manifest=true,oci-mediatypes=true
