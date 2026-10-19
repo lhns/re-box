@@ -25,6 +25,10 @@ from .housekeeping import dir_size, prune_rolled_logs, remove_partial_exports, s
 from .log import log
 
 HEADLESS_PORT = 8089
+# REA's TMPDIR (the rea child's [child.env] in aggregator.toml): its runtime roots, with the
+# target snapshot the attach helper has ghidra-mcp import, live here, so it is a file root too.
+# Created at start by the service user; REA makes its own 0700 directories inside.
+REA_TMP = Path("/tmp/rebox-rea")
 PROJECT_NAME = "rebox"
 POLL_INTERVAL = 10.0
 SUBDIRS = ("ghidra-projects", "home", "cache", "rea/evidence")
@@ -354,7 +358,9 @@ class Headless:
             if self._stopping:
                 return
             env = {k: v for k, v in os.environ.items() if not k.startswith("REBOX_")}
-            env["GHIDRA_MCP_FILE_ROOT"] = str(self.cfg.workdir)
+            env["GHIDRA_MCP_FILE_ROOT"] = f"{self.cfg.workdir}:{REA_TMP}"
+            # Only REA's own scripts may run as part of an import (the attach helper's).
+            env["GHIDRA_MCP_IMPORT_SCRIPT_ROOTS"] = str(self.cfg.rea_attach_dir / "ghidra_scripts")
             env["REBOX_INSTANCE"] = self.instance  # lets the shutdown sweep find a stuck JVM too
             started = time.monotonic()
             self._fail = ""
@@ -606,6 +612,7 @@ def main() -> None:
     harden()
     try:
         cfg = validate(os.environ)
+        _ensure_writable(REA_TMP, "REA's TMPDIR")
         apply_state_env(cfg)
         settings = load_settings()
     except ConfigError as e:

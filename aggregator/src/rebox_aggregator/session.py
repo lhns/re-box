@@ -584,12 +584,11 @@ class Session:
             "re-box: Ghidra (ghidra_ tools) and REA (rea_ tools) behind one endpoint.",
             "ghidra_: one persistent Ghidra project shared by all sessions. Pass the program selector on every call; "
             "ghidra_import_file only reads files under RE_WORKDIR" + (f" ({os.environ['RE_WORKDIR']})." if os.environ.get("RE_WORKDIR") else "."),
-            "rea_: REA works on the same project: rea_open_binary imports the file (by its name; a different file "
-            "of the same name goes to /rea/<sha256 prefix>/) and REA's renames and comments persist there, visible "
-            "to ghidra_ tools and other sessions, whatever REA's own texts say about an ephemeral project. rea_ tools "
-            "see edits made meanwhile by ghidra_ tools or other sessions. REA's evidence "
-            "and in-session state still end with the session. Raw, DOS COM and similar targets run in a private "
-            "Ghidra whose edits are discarded.",
+            "rea_: REA works in the same Ghidra project: rea_open_binary imports the file into "
+            "/rea/<sha256 prefix>-<REA profile>/<file name> (open it with ghidra_ tools there), and REA's renames and "
+            "comments persist, whatever REA's own texts say about an ephemeral project. rea_ tools see edits made "
+            "meanwhile by ghidra_ tools or other sessions. REA's evidence and in-session state still end with the "
+            "session.",
             "Paths: the container sees host paths unchanged (same-path mount). On Windows send the Git Bash form "
             "(/c/Users/you/re/x.bin), not C:\\... .",
             "Ghidra starts with the first session (about 40 s). A ghidra_ call made while it starts waits for it; "

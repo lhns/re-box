@@ -125,6 +125,9 @@ def test_shipped_config_denies_scripts_and_connects_on_ready():
     assert specs["ghidra"].deny == ("run_ghidra_script", "run_script_inline", "delete_project")
     assert (specs["ghidra"].on_ready.tool, dict(specs["ghidra"].on_ready.arguments)) == ("connect_instance", {"project": "rebox"})
     assert specs["rea"].autosave.prune_empty and not specs["rea"].deny
+    from rebox_aggregator.supervisor import REA_TMP
+
+    assert specs["rea"].env["TMPDIR"] == str(REA_TMP)  # the supervisor makes it a file root
 
 
 def test_catalog_cache_parsed_and_shipped(tmp_path):
