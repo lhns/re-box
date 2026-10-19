@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -14,7 +15,7 @@ from pathlib import Path
 import httpx2 as httpx
 import pytest
 
-from conftest import (COMPUTE_MARKERS, COMPUTE_MULTIPLIER, INSTANCE, PROJECTS, STATE, TOKEN, URL,
+from conftest import (COMPUTE_MARKERS, COMPUTE_MULTIPLIER, INSTANCE, PROJECTS, STATE, TOKEN, URL, WORKDIR,
                       fixture_path, keeper, record, release_keeper)
 from mcpclient import McpError, Session
 
@@ -155,6 +156,36 @@ def test_03_ghidra_mcp_flow(session):
     found = _json(s.tool("ghidra_find_functions", {"program": program, "name_pattern": "ComputeFixtureValue"}))
     assert [f["address"] for f in found["functions"]] == [compute["address"]]
     assert (PROJECTS / "rebox.gpr").is_file() and (PROJECTS / "rebox.rep").is_dir()
+
+
+def test_03b_delete_program(session):
+    """ghidra_delete_file removes a program from the project (open or not), not the source file; a
+    re-import then works. A copy keeps hello_stripped, which later tests and the restart phase use."""
+    src = Path(fixture_path("hello_stripped"))
+    copy = WORKDIR / "hello_delete"
+    shutil.copyfile(src, copy)
+    s = session()
+    first = _json(s.tool("ghidra_import_file", {"file_path": str(copy)}))
+    assert first.get("success"), first
+    name = first["name"]
+    assert name in s.tool("ghidra_list_open_programs", {}).text()
+    assert name in s.tool("ghidra_list_project_files", {}).text()
+
+    deleted = _json(s.tool("ghidra_delete_file", {"filePath": first["path"]}))
+    assert deleted.get("success") and deleted.get("deleted") is True, deleted
+    assert copy.is_file(), "the source file must stay"
+    assert name not in s.tool("ghidra_list_open_programs", {}).text()
+    assert name not in s.tool("ghidra_list_project_files", {}).text()
+    assert _json(s.tool("ghidra_delete_file", {"filePath": first["path"]})).get("deleted") is False
+
+    again = _json(s.tool("ghidra_import_file", {"file_path": str(copy)}))
+    assert again.get("success"), again
+    assert _json(s.tool("ghidra_delete_file", {"filePath": again["path"]})).get("deleted") is True
+
+
+def test_03c_delete_project_is_hidden(session):
+    s = session()
+    assert "ghidra_delete_project" not in s.tool_names()
 
 
 # --- 4. lazy tool groups and list_changed. Lazy mode is opt-in now (the image sets GHIDRA_MCP_LAZY=0:
