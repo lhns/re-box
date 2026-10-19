@@ -286,7 +286,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
  
          if (filePath == null || filePath.trim().isEmpty()) {
              return Response.err("file_path is required");
-@@ -2018,10 +2030,17 @@
+@@ -2018,10 +2030,39 @@
              return Response.err("This server cannot import programs");
          }
  
@@ -300,13 +300,35 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
 +            ImportScripts.check(post);
 +            ImportRequest request = new ImportRequest(file, projectFolder, programName, loader,
 +                loaderArgs, languageId, compilerSpecId, ifExists, pre);
++            // One import per destination at a time, through analysis and post-scripts: the
++            // existence check and the import are not atomic, and Ghidra saves a second import of
++            // the same name as "<name>.0", a separate program. A waiting caller then reuses the
++            // finished program.
++            Object destination = IMPORT_LOCKS.computeIfAbsent(
++                request.folder() + "\0" + request.programName(), k -> new Object());
++            synchronized (destination) {
++                return importLocked(provider, request, scriptOut, scriptLog, autoAnalyze,
++                    analysisOptions, post, waitForAnalysis);
++            }
++        } catch (Exception e) {
++            return importFailure(e, scriptLog);
++        }
++    }
++
++    private static final Map<String, Object> IMPORT_LOCKS = new java.util.concurrent.ConcurrentHashMap<>();
++
++    private Response importLocked(ProjectProgramProvider provider, ImportRequest request,
++            PrintWriter scriptOut, StringWriter scriptLog, boolean autoAnalyze,
++            Map<String, String> analysisOptions, List<ImportScripts.Call> post,
++            boolean waitForAnalysis) throws Exception {
++        {
 +            ProjectProgramProvider.Imported imported = provider.importFile(request, scriptOut);
              Program program = imported.program();
 +            String path = ProjectProgramProvider.keyFor(program);
  
              // NOTE: do NOT call markProgramNotToAskToAnalyze here, ahead of the
              // branches below. It mutates the program DB, and AutoAnalysisManager's
-@@ -2038,30 +2057,45 @@
+@@ -2038,46 +2079,137 @@
              // analyzed:true and no error anywhere. Both branches below already set
              // this flag themselves, inside their own transaction, so the call here
              // was pure redundant risk with no benefit.
@@ -369,15 +391,30 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
              if (shown != null) {
                  out.put("codebrowser", shown);
              }
-@@ -2076,8 +2110,82 @@
-                 }
-             }
-             Msg.error(this, "Import failed", e);
--            return Response.err("Import failed: " + msg);
-+            String scripts = scriptLog.toString();
-+            return Response.err("Import failed: " + msg
-+                + (scripts.isEmpty() ? "" : "\n--- script output ---\n" + boundTail(scripts, MAX_BUILD_OUTPUT_CHARS)));
+             return Response.ok(out);
+-        } catch (Exception e) {
+-            String msg = e.getMessage();
+-            if (msg == null || msg.isEmpty()) {
+-                msg = e.getClass().getName();
+-                if (e.getCause() != null) {
+-                    msg += ": " + (e.getCause().getMessage() != null
+-                        ? e.getCause().getMessage() : e.getCause().getClass().getName());
 +        }
++    }
++
++    private Response importFailure(Exception e, StringWriter scriptLog) {
++        String msg = e.getMessage();
++        if (msg == null || msg.isEmpty()) {
++            msg = e.getClass().getName();
++            if (e.getCause() != null) {
++                msg += ": " + (e.getCause().getMessage() != null
++                    ? e.getCause().getMessage() : e.getCause().getClass().getName());
++            }
++        }
++        Msg.error(this, "Import failed", e);
++        String scripts = scriptLog.toString();
++        return Response.err("Import failed: " + msg
++            + (scripts.isEmpty() ? "" : "\n--- script output ---\n" + boundTail(scripts, MAX_BUILD_OUTPUT_CHARS)));
 +    }
 +
 +    /** The original five-parameter import (auto-detect, or BinaryLoader with a language). */
@@ -406,7 +443,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
 +            analyzed = runAutoAnalysisAndPersistFlags(program, true);
 +        } else {
 +            suppressAnalysisPrompt(program);
-         }
++        }
 +        if (!post.isEmpty()) {
 +            try {
 +                ImportScripts.run(post, program, programProvider.getProject(), scriptOut,
@@ -419,10 +456,12 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
 +                    df.delete();
 +                } catch (Exception deleteFailure) {
 +                    e.addSuppressed(deleteFailure);
-+                }
+                 }
 +                throw new IOException("post-script failed, import removed: " + e, e);
-+            }
-+        }
+             }
+-            Msg.error(this, "Import failed", e);
+-            return Response.err("Import failed: " + msg);
+         }
 +        return analyzed;
 +    }
 +
@@ -453,7 +492,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
      }
  
      @McpTool(path = "/get_project_info",
-@@ -2164,6 +2272,10 @@
+@@ -2164,6 +2296,10 @@
                  return Response.err(e.getMessage());
              }
              if (only == null) {
@@ -464,7 +503,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
                  return Response.err("Program not open: " + programName);
              }
          }
-@@ -2184,13 +2296,19 @@
+@@ -2184,13 +2320,19 @@
              } catch (Exception e) {
                  // May not have an analysis manager in headless mode
              }
@@ -486,7 +525,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
          }
  
          if (programName != null && !programName.isEmpty() && results.isEmpty()) {
-@@ -2363,7 +2481,11 @@
+@@ -2363,7 +2505,11 @@
                      scriptWriterHolder[0] = scriptWriter;
                      scriptPrintWriterHolder[0] = scriptPrintWriter;
  
@@ -943,6 +982,19 @@ diff -ruN a/src/test/java/com/xebyte/offline/ImportExtensionTest.java b/src/test
 +        assertFalse(DirectThreadingStrategy.writeLock().isLocked());
 +    }
 +}
+Binary files a/python/bridge_mcp_ghidra/__pycache__/__init__.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/__init__.cpython-312.pyc differ
+Binary files a/python/bridge_mcp_ghidra/__pycache__/cli.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/cli.cpython-312.pyc differ
+Binary files a/python/bridge_mcp_ghidra/__pycache__/config.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/config.cpython-312.pyc differ
+Binary files a/python/bridge_mcp_ghidra/__pycache__/debugger.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/debugger.cpython-312.pyc differ
+Binary files a/python/bridge_mcp_ghidra/__pycache__/discovery.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/discovery.cpython-312.pyc differ
+Binary files a/python/bridge_mcp_ghidra/__pycache__/dispatch.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/dispatch.cpython-312.pyc differ
+Binary files a/python/bridge_mcp_ghidra/__pycache__/registry.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/registry.cpython-312.pyc differ
+Binary files a/python/bridge_mcp_ghidra/__pycache__/schema.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/schema.cpython-312.pyc differ
+Binary files a/python/bridge_mcp_ghidra/__pycache__/server.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/server.cpython-312.pyc differ
+Binary files a/python/bridge_mcp_ghidra/__pycache__/state.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/state.cpython-312.pyc differ
+Binary files a/python/bridge_mcp_ghidra/__pycache__/static_tools.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/static_tools.cpython-312.pyc differ
+Binary files a/python/bridge_mcp_ghidra/__pycache__/transport.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/transport.cpython-312.pyc differ
+Binary files a/python/bridge_mcp_ghidra/__pycache__/validation.cpython-312.pyc and b/python/bridge_mcp_ghidra/__pycache__/validation.cpython-312.pyc differ
 diff -ruN a/python/bridge_mcp_ghidra/config.py b/python/bridge_mcp_ghidra/config.py
 --- a/python/bridge_mcp_ghidra/config.py
 +++ b/python/bridge_mcp_ghidra/config.py

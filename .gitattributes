@@ -1,2 +1,4 @@
 * text=auto eol=lf
 *.exe binary
+# Upstream sources with CRLF lines: a patch must keep them byte for byte.
+deps/ghidra-mcp/patches/*.patch -text
