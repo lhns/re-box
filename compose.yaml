@@ -49,6 +49,12 @@ services:
       start_period: 30s
       retries: 3
     restart: unless-stopped
+    # json-file never rotates by default; cap the container log (docs/OPERATIONS.md).
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
     # Shutdown saves every Ghidra program and exports each REA session's evidence; Docker's
     # default 10 s can SIGKILL that half way (docs/PERSISTENCE.md).
     stop_grace_period: 120s

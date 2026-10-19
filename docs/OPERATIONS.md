@@ -44,7 +44,7 @@ Design: `aggregator/README.md`; why: `docs/DECISIONS.md`.
 | `GHIDRA_HEADLESS_MAXMEM` | `1536m` | heap of a REA session that still runs its own Ghidra JVM: raw, DOS COM/MZ, PSP and similar targets (REA's own variable; upstream default 2G) |
 | `REA_JADX_HEAP_MIB` | `2048` | heap of REA's JADX JVM for Android work |
 | `GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS` | `1`, forced | every program-scoped ghidra-mcp call must name its program; the project is shared |
-| `GHIDRA_MCP_ALLOW_SCRIPTS` | `1` | needed by REA's attach (its bridge is started through ghidra-mcp's script endpoint); clients still cannot run scripts, the aggregator denies `run_ghidra_script` and `run_script_inline`. `0` breaks REA's Ghidra sessions unless `REBOX_REA_ATTACH_HELPER` is also removed from the rea child's `[child.env]` (REA then runs its own JVMs) |
+| `GHIDRA_MCP_ALLOW_SCRIPTS` | `1` | needed by REA's attach (its bridge is started through ghidra-mcp's script endpoint); clients still cannot run scripts, the aggregator denies `run_ghidra_script`, `run_script_inline` and `delete_project`. `0` breaks REA's Ghidra sessions unless `REBOX_REA_ATTACH_HELPER` is also removed from the rea child's `[child.env]` (REA then runs its own JVMs) |
 | `GHIDRA_MCP_LAZY` | `0` | `1` loads ghidra-mcp tool groups lazily (needs a client that follows `tools/list_changed`); `0` lists all 197 tools up front. Part of the catalog-cache key |
 | `GHIDRA_MCP_LOG_LEVEL` | `WARNING` | bridge log level |
 | `REA_ANALYSIS_PROVIDER` | `ghidra` | REA's default native provider |
@@ -146,6 +146,11 @@ them. Measured on the test fixtures: see docs/BUILDING.md.
   `headless_state`, `headless_log`, `child_stderr`, ... Tool arguments and results are never
   logged. Readable with `docker logs re-box | jq -r 'select(.level != "info") | [.event, .error // .reason // ""] | @tsv'`
   (drop the `select` for everything; `docker compose logs --no-log-prefix re-box` for compose).
+  Housekeeping lines: `project_size` (bytes and files of the Ghidra project, at each Ghidra start:
+  cheap disk-usage visibility), `tmp_swept`, `evidence_pruned`, `ghidra_logs_pruned`.
+- Docker's default `json-file` driver never rotates, so the container log grows without bound.
+  compose.yaml caps it; for `docker run` add `--log-opt max-size=50m --log-opt max-file=5` (or set
+  the same `log-opts` in `/etc/docker/daemon.json` for every container).
 - SIGTERM: new sessions are refused, the headless server starts saving all programs, each session
   exports its REA evidence and is closed, then the headless server saves again and exits. Give it
   time: `stop_grace_period: 120s` / `docker run --stop-timeout 120`; Docker's default is 10 s
@@ -185,7 +190,8 @@ docker create --name rebox-skill ghcr.io/lhns/re-box:latest \
 ```
 
 Open sessions end with the stop; clients re-initialize on their next request. `mkdir` the work dir
-before the first `compose up`, or Docker creates it as root.
+before the first `compose up`, or Docker creates it as root. Old image versions stay on disk
+(until pruned): `docker image prune` removes the ones no container uses.
 
 ## Upgrades (building)
 

@@ -25,7 +25,7 @@ name = "ghidra"
 prefix = "ghidra_"
 command = ["/opt/ghidra-mcp/venv/bin/bridge-mcp-ghidra", "--transport", "stdio"]
 # Hidden from tools/list and refused on call. The child's own names, without the prefix.
-deny = ["run_ghidra_script", "run_script_inline"]
+deny = ["run_ghidra_script", "run_script_inline", "delete_project"]
 [child.env]
 GHIDRA_MCP_URL = "http://127.0.0.1:8089"
 # The headless server and its project are shared by all sessions: never let a call fall back to

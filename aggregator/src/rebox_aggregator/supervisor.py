@@ -5,6 +5,7 @@ import os
 import shutil
 import signal
 import sys
+import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from .app import App, make_server
 from .children import kill_by_command, kill_leftovers
 from .config import ConfigError, harden, load_settings, read_token
 from .evidence import prune_old
+from .housekeeping import dir_size, prune_rolled_logs, remove_partial_exports, sweep_tmp
 from .log import log
 
 HEADLESS_PORT = 8089
@@ -447,6 +449,8 @@ class Headless:
             return
         self._healthy = True
         self._set("ready")
+        size, files = await anyio.to_thread.run_sync(dir_size, self.cfg.projects_dir)
+        log("project_size", bytes=size, files=files)
         if self.on_ready:
             self.on_ready()
         while True:
@@ -510,12 +514,21 @@ class Headless:
                 tg.start_soon(skipped)
 
 
+def _housekeep(cfg: SupervisorConfig, first: bool) -> None:
+    evidence = str(cfg.state_dir / "rea" / "evidence")
+    if first:
+        remove_partial_exports(evidence)
+    prune_old(evidence, cfg.evidence_retention_days)
+    prune_rolled_logs(str(cfg.state_dir))
+
+
 async def prune_evidence_loop(cfg: SupervisorConfig) -> None:
-    """Delete REA evidence bundles older than the retention, at start and then daily."""
+    """At start and then daily: drop old REA evidence bundles (when a retention is set), half-written
+    exports (at start only) and old rolled Ghidra logs."""
+    first = True
     while True:
-        await anyio.to_thread.run_sync(prune_old, str(cfg.state_dir / "rea" / "evidence"), cfg.evidence_retention_days)
-        if cfg.evidence_retention_days <= 0:
-            return
+        await anyio.to_thread.run_sync(_housekeep, cfg, first)
+        first = False
         await anyio.sleep(PRUNE_INTERVAL)
 
 
@@ -598,6 +611,7 @@ def main() -> None:
     except ConfigError as e:
         print(f"rebox-supervisor: {e}", file=sys.stderr)
         raise SystemExit(2) from None
+    sweep_tmp(tempfile.gettempdir())  # no session exists yet, so nothing in there is in use
     app = App(settings)
     os.environ["REBOX_INSTANCE"] = app.instance
     raise SystemExit(anyio.run(supervise, cfg, app))
