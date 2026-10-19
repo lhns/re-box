@@ -20,7 +20,7 @@ prune_empty = true
 
 [[child]]
 name = "ghidra"
-prefix = "gh_"
+prefix = "ghidra_"
 command = ["/opt/ghidra-mcp/venv/bin/bridge-mcp-ghidra", "--transport", "stdio"]
 # Hidden from tools/list and refused on call. The child's own names, without the prefix.
 deny = ["run_ghidra_script", "run_script_inline"]

@@ -84,16 +84,16 @@ def test_attach_shares_the_jvm_and_project(session):
                                                "comment": "set by REA"}))
     assert len(ghidra_mcp_jvm()) == 1 and not rea_jvms(), "REA started its own JVM"
     assert len(helpers()) == 1
-    found = jtext(ok(s.tool("gh_find_functions", {"program": "one_debug", "name_pattern": "AttachCompute"})))
+    found = jtext(ok(s.tool("ghidra_find_functions", {"program": "one_debug", "name_pattern": "AttachCompute"})))
     assert [f["name"] for f in found["functions"]] == ["AttachCompute"]
-    comments = jtext(ok(s.tool("gh_get_functions", {"program": "one_debug", "function": "AttachCompute",
-                                                     "fields": "comments"})))["comments"]
+    comments = jtext(ok(s.tool("ghidra_get_functions", {"program": "one_debug", "function": "AttachCompute",
+                                                         "fields": "comments"})))["comments"]
     assert any(c["text"] == "set by REA" for c in comments)
 
     ok(s.tool("rea_close_binary", {}))
     wait_for(lambda: not helpers(), 15, "the attach helper to exit")
     assert len(ghidra_mcp_jvm()) == 1
-    found = jtext(ok(s.tool("gh_find_functions", {"program": "one_debug", "name_pattern": "AttachCompute"})))
+    found = jtext(ok(s.tool("ghidra_find_functions", {"program": "one_debug", "name_pattern": "AttachCompute"})))
     assert found["functions"], "the REA rename is gone after close"
 
 
@@ -117,7 +117,7 @@ def test_same_name_other_bytes_gets_its_own_folder(session):
     for target in (first, second):
         ok(s.tool("rea_open_binary", {"path": target, "provider_id": "ghidra"}))
         ok(s.tool("rea_analyze_function", {"procedure": "compute"}))
-    opened = jtext(ok(s.tool("gh_open_program", {"path": f"/rea/{sha[:12]}/twin"})))
+    opened = jtext(ok(s.tool("ghidra_open_program", {"path": f"/rea/{sha[:12]}/twin"})))
     assert opened.get("success", True), opened
     ok(s.tool("rea_close_binary", {}))
 

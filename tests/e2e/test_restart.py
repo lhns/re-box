@@ -16,9 +16,9 @@ pytestmark = pytest.mark.skipif(PHASE != "restart", reason="runs after the resta
 
 def test_ghidra_rename_survived_restart(session):
     s = session()
-    opened = _json(s.tool("gh_open_program", {"path": "/hello_stripped"}))
+    opened = _json(s.tool("ghidra_open_program", {"path": "/hello_stripped"}))
     assert opened.get("success"), opened
-    found = _json(s.tool("gh_find_functions", {"program": "hello_stripped", "name_pattern": "ComputeFixtureValue"}))
+    found = _json(s.tool("ghidra_find_functions", {"program": "hello_stripped", "name_pattern": "ComputeFixtureValue"}))
     assert len(found["functions"]) == 1, found
 
 

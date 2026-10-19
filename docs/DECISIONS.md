@@ -41,7 +41,7 @@ v6.0.0 is the newest stable tag but cannot serve the spec's ghidra-mcp flow head
 
 v7 serves `import_file` headless (`ProjectProgramProvider.importFile`), puts the project
 operations behind `GHIDRA_MCP_FILE_ROOT`, makes lazy tool groups the default and reads
-`GHIDRA_MCP_LAZY`, and targets 12.1.4. The spec's own vocabulary (`gh_find_functions`,
+`GHIDRA_MCP_LAZY`, and targets 12.1.4. The spec's own vocabulary (`ghidra_find_functions`,
 `GHIDRA_MCP_LAZY`) is v7's. Cost: it is a release candidate. `versions.env` pins the tag (for
 Renovate) and the commit (checked at build, since tags move); Renovate proposes `v7.0.0` once
 it exists.
@@ -49,15 +49,15 @@ it exists.
 **Decided: ship rc.3 now.** v6.0.0 cannot do the one thing re-box needs from ghidra-mcp (headless
 import), so waiting means shipping nothing; the image is pinned by commit, so rc.3 cannot change
 under us. The Renovate PR to 7.0.0 is reviewed against the e2e suite when it lands (tool-name
-changes between rc and final are the likely breakage; the e2e names every `gh_` tool it uses).
+changes between rc and final are the likely breakage; the e2e names every `ghidra_` tool it uses).
 
 Tool names that changed in v7 (upstream wins over the spec's test list,
 `docs/project-management/MIGRATION_7.0.0_TOOL_CONSOLIDATION.md`):
 
 | spec | v7.0.0-rc.3 |
 | --- | --- |
-| `gh_decompile_function` | `gh_get_functions(fields="decompiled_code")` |
-| `gh_list_methods` | `gh_list_program_items(kind="methods")` or `gh_find_functions` |
+| `ghidra_decompile_function` | `ghidra_get_functions(fields="decompiled_code")` |
+| `ghidra_list_methods` | `ghidra_list_program_items(kind="methods")` or `ghidra_find_functions` |
 
 ## 5.2 Aggregator: custom
 
@@ -124,8 +124,8 @@ process group.
 | merged, REA compact/off + gh lazy | 282 | 323,079 |
 | merged, REA compact/off + gh no-lazy | 404 | 467,161 |
 
-REA also has 6 prompts and no resources; ghidra-mcp has neither. Longest prefixed name is 41
-characters; the two catalogs share 5 names (`set_bookmark`, `list_bookmarks`,
+REA also has 6 prompts and no resources; ghidra-mcp has neither. Longest prefixed name was 41
+characters with `gh_` (43 with `ghidra_`, see the prefix entry below); the two catalogs share 5 names (`set_bookmark`, `list_bookmarks`,
 `search_strings`, `set_comment`, `list_strings`), which the prefixes separate. The lazy default
 groups already contain every tool the e2e ghidra flow needs (`import_file`, `find_functions`,
 `get_functions`, `rename_function`, `save_program`, `open_program`, `close_program`,
@@ -133,14 +133,18 @@ groups already contain every tool the e2e ghidra flow needs (`import_file`, `fin
 
 **Decision (revised):** ghidra-mcp runs **not lazy** (`GHIDRA_MCP_LAZY=0`, 197 tools, +144 KB). The
 first decision kept it lazy and relied on `tools/list_changed`; but Claude Code 2.1.303 ignored
-`list_changed` in a `claude -p` test (tools added by `gh_load_tool_group` never appeared: "No such
+`list_changed` in a `claude -p` test (tools added by `ghidra_load_tool_group` never appeared: "No such
 tool available") and there are open reports of the same over Streamable HTTP and with tool search.
-With on-demand Ghidra a cold session would have no `gh_` tools at all, so the full catalog is in the
+With on-demand Ghidra a cold session would have no `ghidra_` tools at all, so the full catalog is in the
 first `tools/list` (Claude Code defers tool definitions via tool search, so the size costs little);
 lazy mode remains an opt-in (`GHIDRA_MCP_LAZY=1`; the e2e lazy test runs only then). The aggregator
 still relays `list_changed`. Keep REA's profiles at upstream `full`, exposed as
 `REA_MCP_INPUT_SCHEMA_PROFILE` / `REA_MCP_OUTPUT_SCHEMA_PROFILE`. REA's full catalog is 3 MB;
 docs/CLIENTS.md says when to switch to `compact`/`off`.
+
+**Prefix (2026-10-19):** `ghidra_` instead of the spec's `gh_`: `gh` reads as GitHub. Longest tool
+name: `ghidra_server_admin_terminate_all_checkouts` (43 chars); with Claude Code's `mcp__re-box__` it
+is 55 of the API's 64, so a server name in clients longer than 9 characters would push it over.
 
 ## Other departures from the spec
 
@@ -223,14 +227,14 @@ stops `REBOX_GHIDRA_IDLE_TIMEOUT` (300 s) after the last one closed; an idle con
   another. REA also kills its JVM's process group on cancel, which would take ghidra-mcp's unsaved
   edits with it. Superseded for most targets by "REA attaches to the ghidra-mcp JVM" below,
   which hosts REA's bridge on a thread instead.
-- **Start on the first session, not the first `gh_` call:** a bridge that boots without Ghidra
-  shows only static tools, so the client would never see a `gh_` tool to call. `initialize` is not
+- **Start on the first session, not the first `ghidra_` call:** a bridge that boots without Ghidra
+  shows only static tools, so the client would never see a `ghidra_` tool to call. `initialize` is not
   held when a catalog cache exists (39 s against client connect timeouts); the bridge starts at once,
   and when Ghidra is ready the aggregator calls the bridge's `connect_instance(project="rebox")`
   (`[child.on_ready]`), which discovers the server (verified in the image: matches project `rebox`,
   over TCP 8089). The bridge's own 15 s retry stays as fallback.
 - **Clients cannot be relied on to follow `tools/list_changed`** (Claude Code ignored it in a test),
-  so the full `gh_` catalog is in the first `tools/list` regardless: a per-child catalog cache
+  so the full `ghidra_` catalog is in the first `tools/list` regardless: a per-child catalog cache
   (`[child.catalog_cache]`, `$REBOX_STATE_DIR/cache/rebox-catalog/`, keyed by the ghidra-mcp
   ref+commit, `GHIDRA_MCP_LAZY` and `GHIDRA_MCP_ALLOW_SCRIPTS`) holds what a connected bridge lists.
   A session that opens while Ghidra is down advertises the cache; a `tools/call` for a cached tool
@@ -284,7 +288,7 @@ Rejected:
 
 **Consequences.**
 - One Ghidra JVM; REA's edits persist in the shared project (autosave, shutdown save) and are
-  visible to gh_ tools and to other sessions at once. REA's own texts ("ephemeral",
+  visible to ghidra_ tools and to other sessions at once. REA's own texts ("ephemeral",
   `project_ephemeral`, `persists_after_close: false`) are stale under re-box.
 - ghidra-mcp runs with scripts enabled; `run_ghidra_script`/`run_script_inline` are denied in
   the aggregator (8089 stays loopback-only, as before). The supervisor copies the host script into
@@ -300,12 +304,12 @@ Rejected:
 - Ghidra merges concurrent transactions into one, so an aborted edit discards the other side's
   work (measured; ghidra-mcp's `WriteTx` even joins an open transaction on purpose). The bridge
   runs its edits under ghidra-mcp's write lock (found by reflection), and only when no other
-  transaction is open (it releases the lock while it waits, at most 60 s). Still open: gh_
+  transaction is open (it releases the lock while it waits, at most 60 s). Still open: ghidra_
   comment and label writes take no lock in headless mode, so one that starts during a REA edit
   joins it and is lost if that edit aborts (duplicate or invalid name, cancel).
 - REA caches what it has read (inventories, analysis results) for the life of its process, on
   the assumption that the program does not change under it: renames, functions, labels or
-  strings that gh_ tools or other sessions make later reach REA only in a new MCP session
+  strings that ghidra_ tools or other sessions make later reach REA only in a new MCP session
   (measured: a rename by another session stayed "unknown procedure" in an open session, even
   after close and reopen of the binary; a new session found it).
 - Concurrent attaches in one JVM collide on Ghidra's script-bundle file lock (meant for separate
@@ -387,7 +391,7 @@ survival table: docs/PERSISTENCE.md.
 - **Evidence pruning:** an export whose `records` and `unknowns` are both empty is deleted at once
   (`prune_empty`; field names checked in REA's `evidenceBundle.js`); bundles older than
   `REBOX_EVIDENCE_RETENTION_DAYS` (30) are deleted at start and daily. Bundles feed only REA's
-  evidence views (no renames are re-applied), so age loses little; durable work lives in the `gh_`
+  evidence views (no renames are re-applied), so age loses little; durable work lives in the `ghidra_`
   project.
 
 ## Release pipeline

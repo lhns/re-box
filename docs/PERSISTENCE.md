@@ -54,13 +54,13 @@ mode 777); it needs a one-time chown to uid 1000. Docker Desktop was not tested.
 
 | path (under `REBOX_STATE_DIR`) | holds | why keep it | size |
 | --- | --- | --- | --- |
-| `ghidra-projects/rebox.gpr`, `rebox.rep/` | the shared Ghidra project: every program imported with `gh_import_file` or opened with `rea_open_binary` (by file name; a different file of the same name goes to `/rea/<sha256 prefix>/`), its auto-analysis, and all `gh_` and REA edits (renames, types, comments, bookmarks) | the long-running work. Re-importing a large binary costs its auto-analysis again (hours for big targets) and loses every annotation | several times each imported binary: MBs for small ELFs, GBs for large firmware |
+| `ghidra-projects/rebox.gpr`, `rebox.rep/` | the shared Ghidra project: every program imported with `ghidra_import_file` or opened with `rea_open_binary` (by file name; a different file of the same name goes to `/rea/<sha256 prefix>/`), its auto-analysis, and all `ghidra_` and REA edits (renames, types, comments, bookmarks) | the long-running work. Re-importing a large binary costs its auto-analysis again (hours for big targets) and loses every annotation | several times each imported binary: MBs for small ELFs, GBs for large firmware |
 | `home/` | `HOME` of every service and tool | | small |
 | `home/.config/ghidramcp/ghidramcp_12.1.4_PUBLIC/` | the headless server's Ghidra settings: preferences, tool state, `application.log` (Ghidra's own log, more detail than the container log); `home/.config/ghidra*`, `rebox-ghidra` are the first-start project creation's | diagnosing after a restart; preferences | < 10 MB |
 | `home/ghidra_scripts/` | `ReboxReaAttach.java`, which starts REA's bridge in the Ghidra JVM (copied from the image at every Ghidra start), and Ghidra's script bundle state | nothing to keep; rewritten at start. Clients cannot run scripts (the aggregator denies ghidra-mcp's script tools) | small |
 | `home/.config`, `home/.local`, `home/.cache` | other tools' user state when run directly: rizin, gdb/pwndbg history and config, adb keys (`.android/`), Chrome profile, NSS db | device pairings, histories | small |
 | `cache/` (`XDG_CACHE_HOME`) | Ghidra's cache (`rebox-ghidramcp/`: `fscache2`, `packed-db-cache`, `debuginfo-cache` with downloaded debug symbols), pwndbg, fontconfig, Chrome | faster opens, no repeated symbol downloads. **Safe to delete** while the container is stopped | 100s of MB, grows with symbol downloads |
-| `cache/rebox-catalog/ghidra-<key>.json` | the aggregator's catalog cache: the full tool list of the ghidra-mcp bridge, advertised to sessions while Ghidra starts | a cold session lists the `gh_` tools at once. **Safe to delete** (refilled at the next start, which then runs Ghidra once) | ~250 KB |
+| `cache/rebox-catalog/ghidra-<key>.json` | the aggregator's catalog cache: the full tool list of the ghidra-mcp bridge, advertised to sessions while Ghidra starts | a cold session lists the `ghidra_` tools at once. **Safe to delete** (refilled at the next start, which then runs Ghidra once) | ~250 KB |
 | `rea/evidence/<session>.json` | REA evidence bundles, one per MCP session: every Evidence record and unknown the session produced, written by the aggregator ("When things are saved") | REA's in-session state (its evidence, findings, caches) ends with the session; this is what is left of it. Renames and comments REA made are in the Ghidra project instead. Restore with `rea_import_evidence_bundle {"path": ...}` | KBs to tens of MB per session; pruned automatically (below) |
 | `.gitignore` | `*`, written once at start | the default state dir sits inside the work dir, which is often a git repo | bytes |
 
@@ -68,7 +68,7 @@ mode 777); it needs a one-time chown to uid 1000. Docker Desktop was not tested.
 (nothing to restore). Bundles not modified for `REBOX_EVIDENCE_RETENTION_DAYS` (default 30; `0`
 keeps everything) are deleted at start and daily. Bundles are only data for REA's evidence views
 (no renames are re-applied), so age-based pruning loses little; annotations that must last belong
-in the `gh_` project.
+in the `ghidra_` project.
 
 Suggested places for an agent's own REA exports (not created automatically): `rea/exports/` for
 `rea_export_evidence_bundle`, `rea/snapshots/` for `rea_close_binary {"snapshot_path": ...}`.
@@ -89,7 +89,7 @@ The work dir holds only the targets and what tools or agents write there explici
 
 **ghidra-mcp** keeps edits in memory until a program is saved. Saves happen on:
 
-- `gh_save_program`, `gh_save_all_programs`, `gh_close_program` with `save`, or a program being
+- `ghidra_save_program`, `ghidra_save_all_programs`, `ghidra_close_program` with `save`, or a program being
   evicted from ghidra-mcp's open-program cache;
 - every `REBOX_AUTOSAVE_INTERVAL` seconds (default 300; `0` disables): the supervisor saves every
   changed program (after waiting for running auto-analysis, as ghidra-mcp's save does);
@@ -123,7 +123,7 @@ Sessions without REA calls write nothing. `<session>` is the session tag the con
 | `docker stop` with enough grace (`stop_grace_period: 120s`, `--stop-timeout 120`) | **everything saved** | gone | **exported** for every session | kept |
 | `docker stop` with Docker's default 10 s | saved: the save starts at SIGTERM (measured: done 1.6 s after it, 145 ms for the save). Only a save that must first wait for long-running auto-analysis can be cut off (the shutdown waits at most 30 s for it before `exit_ghidra`); then edits since the last save are lost | gone | exported unless a session's export is still running at the SIGKILL | kept |
 | `docker kill`, host crash, power loss | edits since the last save (at most one `REBOX_AUTOSAVE_INTERVAL`) lost; imported programs survive (an import saves). The project opens at its last save; the stale lock is taken over on the next start (verified) | gone | changes since the last periodic export lost | kept |
-| OOM kill of the headless JVM (largest process at the defaults) | edits since the last save lost; the supervisor restarts the JVM with backoff and reopens the project; sessions stay up, `gh_` calls fail until it is back | an open REA binary's calls fail with "provider exited"; `rea_open_binary` again attaches to the restarted JVM | unaffected | kept |
+| OOM kill of the headless JVM (largest process at the defaults) | edits since the last save lost; the supervisor restarts the JVM with backoff and reopens the project; sessions stay up, `ghidra_` calls fail until it is back | an open REA binary's calls fail with "provider exited"; `rea_open_binary` again attaches to the restarted JVM | unaffected | kept |
 | OOM kill of a REA Ghidra JVM (targets in REA's own JVM only) | unaffected | that call fails; REA reports it and can start a new JVM | unaffected | kept |
 | OOM kill of a session's `rea mcp` process | unaffected | gone | changes since the last periodic export lost; the session's REA tools fail until the client opens a new session | kept |
 | `docker rm`, `compose down`, image upgrade | kept (it is in the mount) | gone | kept | kept |
@@ -133,7 +133,7 @@ project); export REA evidence or snapshots to the state dir before ending the se
 restart `rea_open_binary` the target (it reopens the same program, annotations included) and
 `rea_import_evidence_bundle` the export. Imported evidence is data for REA's evidence views. For
 targets in REA's own JVM (see "Not in it") annotations end with the session; keep those in a
-`gh_` import of the file.
+`ghidra_` import of the file.
 
 ## Backups
 
