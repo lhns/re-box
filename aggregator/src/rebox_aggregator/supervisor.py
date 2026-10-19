@@ -16,7 +16,7 @@ from anyio.streams.text import TextReceiveStream
 
 from .app import App, make_server
 from .children import kill_leftovers
-from .config import ConfigError, load_settings
+from .config import ConfigError, harden, load_settings, read_token
 from .log import log
 
 HEADLESS_PORT = 8089
@@ -36,8 +36,7 @@ class SupervisorConfig:
 
 def validate(env: Mapping[str, str]) -> SupervisorConfig:
     """Raise ConfigError (one clear line) when the container is misconfigured."""
-    if not env.get("REBOX_TOKEN"):
-        raise ConfigError("REBOX_TOKEN is required")
+    read_token(env)
     workdir_s = env.get("RE_WORKDIR", "")
     if not workdir_s or not os.path.isdir(workdir_s) or not os.access(workdir_s, os.W_OK):
         raise ConfigError(f"RE_WORKDIR {workdir_s!r} must be an existing writable directory")
@@ -125,7 +124,7 @@ class Headless:
             env["REBOX_INSTANCE"] = self.instance  # lets the shutdown sweep find a stuck JVM too
             self.cfg.projects_dir.mkdir(parents=True, exist_ok=True)
             started = time.monotonic()
-            self.reason = "headless server starting"
+            self.reason = "starting"
             self._proc = proc = await anyio.open_process(
                 headless_command(self.cfg), env=env, stdout=-1, stderr=-2, start_new_session=True
             )
@@ -135,7 +134,8 @@ class Headless:
                 await proc.wait()
                 tg.cancel_scope.cancel()
             self._healthy = False
-            self.reason = f"headless server exited with code {proc.returncode}"
+            self._kill_group(proc, signal.SIGKILL)  # stragglers of the old JVM's group
+            self.reason = "headless server down"
             if self._stopping:
                 return
             log("headless_exit", "error", exit_code=proc.returncode)
@@ -155,7 +155,7 @@ class Headless:
         try:
             await ensure_project(self._http, self.base, self.cfg.projects_dir)
         except (httpx2.HTTPError, ValueError) as e:
-            self.reason = f"project not open: {e}"
+            self.reason = "project not open"
             log("project_failed", "error", error=str(e)[:500])
             self._kill_group(proc, signal.SIGKILL)
             return
@@ -166,7 +166,7 @@ class Headless:
             ok = await self._check()
             self._healthy = ok
             if not ok:
-                self.reason = "headless server does not answer check_connection"
+                self.reason = "headless server down"
 
     @staticmethod
     def _kill_group(proc: anyio.abc.Process, sig: int) -> None:
@@ -252,6 +252,7 @@ def main() -> None:
         prog="rebox-supervisor",
         description="Run the ghidra-mcp headless server and the MCP aggregator; configured through env.",
     ).parse_args()
+    harden()
     try:
         cfg = validate(os.environ)
         settings = load_settings()

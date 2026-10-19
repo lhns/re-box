@@ -5,6 +5,7 @@ Messages stay plain dicts end to end; results are forwarded unchanged.
 
 import hashlib
 import itertools
+import math
 import os
 import time
 from collections.abc import Awaitable, Callable
@@ -26,7 +27,7 @@ from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, LATEST_HANDSHAKE_VERS
 
 from . import __version__
 from .catalog import Catalog, CatalogError, ChildCatalog
-from .children import Child, ChildError, kill_leftovers
+from .children import Child, ChildError, kill_leftovers, valid_id
 from .config import Settings
 from .log import log
 
@@ -35,6 +36,8 @@ LIST_CHANGED = {
     "notifications/prompts/list_changed": "prompts",
     "notifications/resources/list_changed": "resources",
 }
+MAX_INFLIGHT = 64
+MAX_QUEUED_NOTIFICATIONS = 1000
 LISTS = {
     "tools/list": "tools",
     "prompts/list": "prompts",
@@ -99,16 +102,21 @@ class Session:
         self._closed = anyio.Event()
         self._ws: Any = None
         self._tg: Any = None
+        self._out_send, self._out_recv = anyio.create_memory_object_stream[tuple[Any, Any]](math.inf)
+        self._queued = 0
+        self._warned_backpressure = False
 
     # -- lifecycle --------------------------------------------------------
 
     async def serve(self, *, task_status: TaskStatus[None] = anyio.TASK_STATUS_IGNORED) -> None:
+        reason = "disconnect"
         try:
             async with self.transport.connect() as (read, write):
                 self._ws = write
                 async with anyio.create_task_group() as tg:
                     self._tg = tg
                     task_status.started()
+                    tg.start_soon(self._write_downstream)
                     tg.start_soon(self._idle_watch)
                     try:
                         async for item in read:
@@ -120,8 +128,11 @@ class Session:
                     except (anyio.ClosedResourceError, anyio.BrokenResourceError):
                         pass
                     tg.cancel_scope.cancel()
+        except Exception as e:  # session-local: never take the app's task group down
+            log("internal_error", "error", session=self.tag, error=repr(e)[:500])
+            reason = "internal_error"
         finally:
-            await self.close("disconnect")
+            await self.close(reason)
 
     async def close(self, reason: str) -> None:
         if self._closing is not None:
@@ -151,7 +162,9 @@ class Session:
         timeout = self.settings.idle_timeout
         while True:
             await anyio.sleep(max(0.05, min(5.0, timeout / 5)))
-            if not self._inflight and time.monotonic() - self.last_activity > timeout:
+            idle = time.monotonic() - self.last_activity
+            # A long call may legitimately keep a session quiet; a client silent for 4x is gone.
+            if idle > timeout and (not self._inflight or idle > 4 * timeout):
                 await self.close("idle")
 
     async def on_exit(self, child: Child) -> None:
@@ -163,15 +176,32 @@ class Session:
     def touch(self) -> None:
         self.last_activity = time.monotonic()
 
-    async def _write(self, msg: Any, related: Any = None) -> None:
-        meta = ServerMessageMetadata(related_request_id=related) if related is not None else None
+    async def _write(self, msg: Any, related: Any = None, *, droppable: bool = False) -> None:
+        """Queue a downstream message. Notifications are dropped once too many are waiting."""
+        if droppable and self._queued > MAX_QUEUED_NOTIFICATIONS:
+            if not self._warned_backpressure:
+                self._warned_backpressure = True
+                log("downstream_backpressure", "warn", session=self.tag, queued=self._queued)
+            return
+        self._queued += 1
         try:
-            await self._ws.send(SessionMessage(msg, metadata=meta))
+            self._out_send.send_nowait((msg, related))
         except (anyio.ClosedResourceError, anyio.BrokenResourceError):
-            pass
+            self._queued -= 1
 
-    async def _notify_down(self, method: str, params: dict | None, related: Any = None) -> None:
-        await self._write(JSONRPCNotification(jsonrpc="2.0", method=method, params=params), related)
+    async def _write_downstream(self) -> None:
+        async for msg, related in self._out_recv:
+            meta = ServerMessageMetadata(related_request_id=related) if related is not None else None
+            try:
+                await self._ws.send(SessionMessage(msg, metadata=meta))
+            except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+                pass
+            self._queued -= 1
+
+    async def _notify_down(
+        self, method: str, params: dict | None, related: Any = None, *, droppable: bool = True
+    ) -> None:
+        await self._write(JSONRPCNotification(jsonrpc="2.0", method=method, params=params), related, droppable=droppable)
 
     def _related_for(self, child: Child) -> Any:
         return next((i for i, fl in self._inflight.items() if fl.child is child), None)
@@ -184,7 +214,13 @@ class Session:
 
     async def _on_downstream(self, msg: Any, metadata: Any) -> None:
         if isinstance(msg, JSONRPCRequest):
-            self._tg.start_soon(self._handle_request, msg, getattr(metadata, "on_request_unanswered", None))
+            if msg.id in self._inflight:
+                await self._write(_error(msg.id, -32600, "duplicate request id"))
+            elif len(self._inflight) >= MAX_INFLIGHT:
+                await self._write(_error(msg.id, -32000, "too many concurrent requests"))
+            else:
+                fl = self._inflight[msg.id] = Inflight(msg.id, unanswered=getattr(metadata, "on_request_unanswered", None))
+                self._tg.start_soon(self._handle_request, msg, fl)
         elif isinstance(msg, JSONRPCNotification):
             await self._handle_notification(msg)
         else:
@@ -196,7 +232,8 @@ class Session:
     async def _handle_notification(self, msg: JSONRPCNotification) -> None:
         params = msg.params or {}
         if msg.method == "notifications/cancelled":
-            fl = self._inflight.get(params.get("requestId"))
+            rid = params.get("requestId")
+            fl = self._inflight.get(rid) if valid_id(rid) else None
             if fl is None or fl.done:
                 return
             fl.scope.cancel()
@@ -216,8 +253,7 @@ class Session:
                     except ChildError:
                         pass
 
-    async def _handle_request(self, msg: JSONRPCRequest, unanswered: Any) -> None:
-        fl = self._inflight[msg.id] = Inflight(msg.id, unanswered=unanswered)
+    async def _handle_request(self, msg: JSONRPCRequest, fl: Inflight) -> None:
         start = time.monotonic()
         outcome, code = "ok", None
         try:
@@ -307,8 +343,9 @@ class Session:
             raise child.gone_error()
         meta = params.get("_meta")
         token = meta.get("progressToken") if isinstance(meta, dict) else None
-        key = (child.name, token) if isinstance(token, (str, int)) else None
-        if key:
+        key = (child.name, token) if valid_id(token) else None
+        owns = key is not None and key not in self._tokens
+        if owns:
             self._tokens[key] = fl.id
         fl.child = child
 
@@ -318,7 +355,7 @@ class Session:
         try:
             return await child.request(method, params, on_id=set_id)
         finally:
-            if key:
+            if owns:
                 self._tokens.pop(key, None)
 
     # -- initialize -------------------------------------------------------
@@ -347,20 +384,25 @@ class Session:
         base = {k: v for k, v in os.environ.items() if not k.startswith("REBOX_")}
 
         async def boot(spec: Any) -> None:
+            if self._closing:
+                return
             env = {**base, **spec.env, "REBOX_INSTANCE": self.instance, "REBOX_SESSION": self.tag}
             child = self.children[spec.name] = Child(spec, self.tag, env, self.settings.child_grace, self)
             try:
-                await child.start(self._tg)
-                child.capabilities = (await child.request("initialize", child_params)).get("capabilities") or {}
-                await child.notify("notifications/initialized")
-                self.parts[spec.name] = await self._fetch(child, ("tools", "prompts", "resources"))
-            except (ChildError, OSError) as e:
-                log("child_init_failed", "error", session=self.tag, child=spec.name, error=str(e)[:500])
+                with anyio.fail_after(self.settings.init_timeout):
+                    await child.start(self._tg)
+                    child.capabilities = (await child.request("initialize", child_params)).get("capabilities") or {}
+                    await child.notify("notifications/initialized")
+                    self.parts[spec.name] = await self._fetch(child, ("tools", "prompts", "resources"))
+            except (ChildError, OSError, TimeoutError) as e:
+                log("child_init_failed", "error", session=self.tag, child=spec.name, error=(str(e) or type(e).__name__)[:500])
                 self.parts.pop(spec.name, None)
-                if child.proc is None:
-                    child.dead = True
-                else:
+                if child.proc is not None:
                     await child.close()
+                    with anyio.move_on_after(2):
+                        await child.proc.wait()
+                    child.returncode = child.proc.returncode
+                child.dead = True
 
         async with anyio.create_task_group() as tg:
             for spec in self.settings.children:
@@ -432,6 +474,8 @@ class Session:
 
     async def _child_request(self, child: Child, msg: dict) -> None:
         orig = msg["id"]
+        if not valid_id(orig):
+            return
         if msg["method"] == "ping":
             await self._reply_child(child, orig, {})
             return
@@ -465,10 +509,12 @@ class Session:
     async def on_notification(self, child: Child, msg: dict) -> None:
         method, params = msg["method"], msg.get("params")
         if method == "notifications/progress" and isinstance(params, dict):
-            related = self._tokens.get((child.name, params.get("progressToken")))
+            token = params.get("progressToken")
+            related = self._tokens.get((child.name, token)) if valid_id(token) else None
             await self._notify_down(method, params, related)
         elif method == "notifications/cancelled" and isinstance(params, dict):
-            entry = self._up_by_child.get((child.name, params.get("requestId")))
+            rid = params.get("requestId")
+            entry = self._up_by_child.get((child.name, rid)) if valid_id(rid) else None
             if entry:
                 entry[1].cancel()
         elif method in LIST_CHANGED:
@@ -502,7 +548,9 @@ class Session:
                 self.parts[child.name] = part
                 self.catalog = candidate
                 for kind in sorted(kinds):
-                    await self._notify_down(f"notifications/{kind}/list_changed", None, self._related_for(child))
+                    await self._notify_down(
+                        f"notifications/{kind}/list_changed", None, self._related_for(child), droppable=False
+                    )
         finally:
             self._refreshing.pop(child.name, None)
             child.end_hold()

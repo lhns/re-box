@@ -16,12 +16,14 @@ Design: `aggregator/README.md`; why: `docs/DECISIONS.md`.
 
 | variable | default | meaning |
 | --- | --- | --- |
-| `REBOX_TOKEN` | required | Bearer token for `/mcp`. The supervisor exits 2 without it. Never passed to children. |
+| `REBOX_TOKEN_FILE` / `REBOX_TOKEN` | one required | Bearer token for `/mcp`, from a file (preferred: Kubernetes/compose secrets, keeps it out of `docker inspect` and the process environment) or the variable; the file wins. The supervisor exits 2 without one. Never passed to children. |
 | `REBOX_PORT` | `8443` | aggregator port |
 | `REBOX_BIND` | `0.0.0.0` | aggregator bind address |
 | `REBOX_TLS_CERT` / `REBOX_TLS_KEY` | unset | both set: serve HTTPS; else plain HTTP (expected behind a reverse proxy) |
 | `REBOX_MAX_SESSIONS` | `4` | concurrent MCP sessions; one more `initialize` gets HTTP 503 with a JSON-RPC error saying so |
-| `REBOX_SESSION_IDLE_TIMEOUT` | `1800` | seconds without a request before a session and its processes are closed |
+| `REBOX_SESSION_IDLE_TIMEOUT` | `1800` | seconds without a request before a session and its processes are closed; a session with a request still running is closed after 4× this without any client message |
+| `REBOX_INIT_TIMEOUT` | `120` | seconds a child may take to start and initialize at session open |
+| `REBOX_MAX_BODY_BYTES` | `16777216` | largest accepted POST body (413 above); a session also accepts at most 64 concurrent requests |
 | `REBOX_CHILD_GRACE` | `5` | seconds between SIGTERM and SIGKILL when closing a session |
 | `REBOX_HEADLESS_START_TIMEOUT` | `300` | seconds the headless server may take to answer |
 | `REBOX_CONFIG` | `/etc/rebox/aggregator.toml` | the children of each session |
@@ -128,7 +130,8 @@ them. Measured on the test fixtures: see docs/IMAGEBUILD.md.
   uid remap needs), `no-new-privileges`, headless server on loopback, scripts off, the file root
   guard on `RE_WORKDIR`, the token stripped from every child's environment.
 - Executed targets run as the same uid as the services, so they could reach the loopback headless
-  server; the network policy above is what contains them.
+  server or read a mounted token file; the network policy above is what contains them. The
+  supervisor marks itself non-dumpable so its own environment is not readable through `/proc`.
 
 ## Upgrades
 

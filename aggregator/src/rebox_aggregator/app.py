@@ -16,7 +16,7 @@ import uvicorn
 from mcp.server.streamable_http import StreamableHTTPServerTransport
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS
 
-from .config import ConfigError, Settings, load_settings
+from .config import ConfigError, Settings, harden, load_settings
 from .log import log
 from .session import Session
 
@@ -98,18 +98,17 @@ class App:
                 return await _json(send, 200, {})
             if method == "POST":
                 session.touch()
+                body = await self._read_body(headers, receive, send)
+                if body is None:
+                    return
+                receive = _replay(body, receive)
             return await session.transport.handle_request(scope, receive, send)
         if method != "POST":
             return await _rpc_error(send, 400, None, -32600, "Missing Mcp-Session-Id header")
 
-        body = b""
-        while True:
-            chunk = await receive()
-            if chunk["type"] == "http.disconnect":
-                return
-            body += chunk.get("body", b"")
-            if not chunk.get("more_body"):
-                break
+        body = await self._read_body(headers, receive, send)
+        if body is None:
+            return
         try:
             msg = json.loads(body)
         except ValueError:
@@ -140,26 +139,51 @@ class App:
         transport = StreamableHTTPServerTransport(mcp_session_id=uuid.uuid4().hex)
         session = Session(transport.mcp_session_id, transport, self.settings, self.instance, self._forget)  # type: ignore[arg-type]
         self.sessions[session.sid] = session
-        replayed = False
-
-        async def replay():
-            nonlocal replayed
-            if not replayed:
-                replayed = True
-                return {"type": "http.request", "body": body, "more_body": False}
-            return await receive()
-
         try:
             await self._tg.start(session.serve)
-            await transport.handle_request(scope, replay, send)
+            await transport.handle_request(scope, _replay(body, receive), send)
         except BaseException:
             await session.close("init_aborted")
             raise
         if not session.initialized:
             await session.close("init_failed")
 
+    async def _read_body(self, headers: dict[str, str], receive, send) -> bytes | None:
+        """Read a POST body up to REBOX_MAX_BODY_BYTES; answer 413 and return None beyond that."""
+        limit = self.settings.max_body
+        declared = headers.get("content-length", "")
+        chunks, size = [], 0
+        too_big = declared.isdigit() and int(declared) > limit
+        while not too_big:
+            event = await receive()
+            if event["type"] == "http.disconnect":
+                return None
+            chunks.append(event.get("body", b""))
+            size += len(chunks[-1])
+            too_big = size > limit
+            if not event.get("more_body"):
+                break
+        if too_big:
+            await _rpc_error(send, 413, None, -32600, f"Request body exceeds {limit} bytes")
+            return None
+        return b"".join(chunks)
+
     def _forget(self, session: Session) -> None:
         self.sessions.pop(session.sid, None)
+
+
+def _replay(body: bytes, receive):
+    """An ASGI receive that yields an already-read body once, then the real events."""
+    sent = False
+
+    async def replay():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return await receive()
+
+    return replay
 
 
 async def _json(send, status: int, body: dict, headers: dict[str, str] | None = None) -> None:
@@ -215,6 +239,7 @@ def main() -> None:
     argparse.ArgumentParser(
         prog="rebox-aggregator", description="Per-session MCP aggregator; configured through REBOX_* env."
     ).parse_args()
+    harden()
     try:
         settings = load_settings()
     except ConfigError as e:

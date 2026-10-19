@@ -2,6 +2,7 @@
 
 import itertools
 import json
+import math
 import os
 import signal
 from collections.abc import Callable
@@ -16,8 +17,13 @@ from .config import ChildSpec
 from .log import log
 
 # REA's tools/list is one ~3 MB line.
-MAX_LINE = 256 * 1024 * 1024
+MAX_LINE = 64 * 1024 * 1024
 STDIN_WAIT = 2.0
+
+
+def valid_id(x: Any) -> bool:
+    """JSON-RPC ids and progress tokens are str or int; anything else is unhashable or hostile."""
+    return isinstance(x, (str, int)) and not isinstance(x, bool)
 
 
 class ChildError(Exception):
@@ -56,32 +62,49 @@ class Child:
         self._bypass: set[int] = set()
         self._holding = False
         self._held: list[dict] = []
-        self._write_lock = anyio.Lock()
+        self.closing = False
+        self._out_send, self._out_recv = anyio.create_memory_object_stream[bytes](math.inf)
 
     def gone_error(self) -> ChildError:
         code = "unknown" if self.returncode is None else self.returncode
         return ChildError(-32603, f"backend '{self.name}' is not running in this session (exited with code {code})")
 
     async def start(self, tg: TaskGroup) -> None:
+        if self.closing:
+            raise ChildError(-32603, "session is closing")
         self.proc = await anyio.open_process(
             list(self.spec.command), stdin=-1, stdout=-1, stderr=-1, env=self.env, start_new_session=True
         )
         self.pid = self.proc.pid
+        if self.closing:  # close() ran while the process was being spawned
+            self._signal_group(signal.SIGKILL)
+            raise ChildError(-32603, "session is closing")
         tg.start_soon(self._read_stdout)
         tg.start_soon(self._read_stderr)
+        tg.start_soon(self._write_stdin)
 
     # -- outgoing ---------------------------------------------------------
 
     async def _send(self, msg: dict) -> None:
-        assert self.proc and self.proc.stdin
+        """Queue a line for the stdin writer task, so readers never wait on a child's pipe."""
+        if self.dead:
+            raise self.gone_error()
         data = json.dumps(msg, separators=(",", ":"), ensure_ascii=False).encode() + b"\n"
-        async with self._write_lock:
-            if self.dead:
-                raise self.gone_error()
-            try:
+        try:
+            self._out_send.send_nowait(data)
+        except (anyio.ClosedResourceError, anyio.BrokenResourceError):
+            raise self.gone_error() from None
+
+    async def _write_stdin(self) -> None:
+        assert self.proc and self.proc.stdin
+        try:
+            async for data in self._out_recv:
                 await self.proc.stdin.send(data)
-            except (anyio.BrokenResourceError, anyio.ClosedResourceError):
-                raise self.gone_error() from None
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            pass
+        finally:
+            with anyio.CancelScope(shield=True):
+                await self.proc.stdin.aclose()
 
     async def request(
         self,
@@ -143,7 +166,8 @@ class Child:
         self.settled.set()
 
     def _resolve(self, msg: dict) -> None:
-        pending = self._pending.get(msg.get("id"))
+        rid = msg.get("id")
+        pending = self._pending.get(rid) if valid_id(rid) else None
         if pending:
             pending.msg = msg
             pending.event.set()
@@ -165,11 +189,15 @@ class Child:
                     continue
                 if isinstance(msg, dict):
                     await self._dispatch(msg)
-        except (anyio.IncompleteRead, anyio.EndOfStream, anyio.BrokenResourceError, anyio.ClosedResourceError):
-            pass
-        except anyio.DelimiterNotFound:
-            log("child_line_too_long", "error", child=self.name, session=self.session)
-            self._signal_group(signal.SIGKILL)
+        except Exception as e:
+            if isinstance(e, (anyio.IncompleteRead, anyio.EndOfStream, anyio.BrokenResourceError, anyio.ClosedResourceError)):
+                pass
+            elif isinstance(e, anyio.DelimiterNotFound):
+                log("child_line_too_long", "error", child=self.name, session=self.session)
+                self._signal_group(signal.SIGKILL)
+            else:  # never let one child's bad message escape into the app
+                log("internal_error", "error", child=self.name, session=self.session, error=repr(e)[:500])
+                self._signal_group(signal.SIGKILL)
         finally:
             with anyio.CancelScope(shield=True):
                 await self._exited()
@@ -205,6 +233,7 @@ class Child:
         if self.dead:
             return
         self.dead = True
+        self._out_send.close()
         assert self.proc
         self.returncode = await self.proc.wait()
         self.end_hold()
@@ -238,13 +267,11 @@ class Child:
 
     async def close(self) -> None:
         """Close stdin, then SIGTERM, then SIGKILL the whole process group."""
+        self.closing = True
         if self.proc is None:
             return
         with anyio.CancelScope(shield=True):
-            try:
-                await self.proc.stdin.aclose()  # type: ignore[union-attr]
-            except Exception:
-                pass
+            self._out_send.close()  # the writer task drains the queue, then closes stdin
             if await self._wait_group_gone(STDIN_WAIT):
                 return
             self._signal_group(signal.SIGTERM)

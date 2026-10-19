@@ -5,6 +5,7 @@ import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from pathlib import Path
 
 NAME_RE = re.compile(r"^[a-z0-9-]+$")
 
@@ -32,6 +33,8 @@ class Settings:
     max_sessions: int = 4
     idle_timeout: float = 1800.0
     child_grace: float = 5.0
+    init_timeout: float = 120.0
+    max_body: int = 16 * 1024 * 1024
 
 
 def load_children(path: str) -> tuple[ChildSpec, ...]:
@@ -68,10 +71,33 @@ def _num(env: Mapping[str, str], key: str, default: float, cast=float):
         raise ConfigError(f"{key} must be a number, got {env[key]!r}") from None
 
 
-def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
-    token = env.get("REBOX_TOKEN", "")
+def read_token(env: Mapping[str, str]) -> str:
+    """REBOX_TOKEN_FILE (preferred: env is readable via /proc by same-uid processes) or REBOX_TOKEN."""
+    path = env.get("REBOX_TOKEN_FILE")
+    if path:
+        try:
+            token = Path(path).read_text().strip()
+        except OSError as e:
+            raise ConfigError(f"cannot read REBOX_TOKEN_FILE {path}: {e.strerror}") from None
+    else:
+        token = env.get("REBOX_TOKEN", "")
     if not token:
-        raise ConfigError("REBOX_TOKEN is required")
+        raise ConfigError("REBOX_TOKEN or REBOX_TOKEN_FILE is required (and must not be empty)")
+    return token
+
+
+def harden() -> None:
+    """Make /proc/self/environ unreadable to other same-uid processes (children reset this on exec)."""
+    try:
+        import ctypes
+
+        ctypes.CDLL(None, use_errno=True).prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE
+    except (OSError, AttributeError):
+        pass
+
+
+def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
+    token = read_token(env)
     cert, key = env.get("REBOX_TLS_CERT") or None, env.get("REBOX_TLS_KEY") or None
     if bool(cert) != bool(key):
         raise ConfigError("REBOX_TLS_CERT and REBOX_TLS_KEY must be set together")
@@ -88,4 +114,6 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
         max_sessions=max_sessions,
         idle_timeout=_num(env, "REBOX_SESSION_IDLE_TIMEOUT", 1800),
         child_grace=_num(env, "REBOX_CHILD_GRACE", 5),
+        init_timeout=_num(env, "REBOX_INIT_TIMEOUT", 120),
+        max_body=_num(env, "REBOX_MAX_BODY_BYTES", 16 * 1024 * 1024, int),
     )

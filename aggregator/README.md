@@ -23,7 +23,11 @@ headless server; used by unit tests and for development).
 
 ## Configuration
 
-Env (container): `REBOX_TOKEN` (required; refuse to start without it), `REBOX_PORT` (8443),
+Env (container): `REBOX_TOKEN_FILE` (path to a file holding the token, trailing whitespace stripped;
+preferred, because a process's environment is readable through `/proc/<pid>/environ` by other
+processes of the same uid) or `REBOX_TOKEN` (the file wins; refuse to start with neither or an empty
+token), `REBOX_INIT_TIMEOUT` (120 s, per child, covers spawn + `initialize` + listing; a child that
+exceeds it is killed and counts as failed), `REBOX_MAX_BODY_BYTES` (16 MiB; larger POSTs get HTTP 413), `REBOX_PORT` (8443),
 `REBOX_BIND` (0.0.0.0), `REBOX_TLS_CERT`/`REBOX_TLS_KEY` (both or neither), `REBOX_MAX_SESSIONS`
 (4), `REBOX_SESSION_IDLE_TIMEOUT` (1800 s), `REBOX_CHILD_GRACE` (5 s), `REBOX_CONFIG`
 (`/etc/rebox/aggregator.toml`).
@@ -39,8 +43,9 @@ command = ["/usr/local/bin/rea", "mcp"]   # absolute path required
 REA_LOG_LEVEL = "warn"
 ```
 
-A child's environment is the container env **minus every `REBOX_*` variable** (the token must
-never reach a child or a target REA executes), plus `[child.env]`, plus `REBOX_INSTANCE` (the
+A child's environment is the container env **minus every `REBOX_*` variable** (the token is not
+handed to children or the targets REA executes; a same-uid process could still read a token
+file, so the container, not the uid, is the boundary: docs/OPERATIONS.md, "Security"), plus `[child.env]`, plus `REBOX_INSTANCE` (the
 supervisor's random instance id) and `REBOX_SESSION` (the session tag, below).
 
 ## Session lifecycle
@@ -69,7 +74,14 @@ supervisor's random instance id) and `REBOX_SESSION` (the session tag, below).
   each child's stdin and wait up to 2 s; (2) SIGTERM its process group, wait `REBOX_CHILD_GRACE`;
   (3) SIGKILL the group; (4) SIGKILL any remaining process whose `/proc/<pid>/environ` holds
   this `REBOX_SESSION` and `REBOX_INSTANCE`. Then terminate the transport (later requests: 404).
-- **Idle:** no downstream message for `REBOX_SESSION_IDLE_TIMEOUT` seconds and nothing in flight.
+- **Idle:** no downstream message for `REBOX_SESSION_IDLE_TIMEOUT` seconds and nothing in flight, or
+  no downstream message for 4 x that while requests are in flight (a long call may keep a live client
+  quiet; a client silent for 4x is gone).
+- **Limits:** at most 64 in-flight requests per session (`-32000` "too many concurrent requests"),
+  a duplicate in-flight request id gets `-32600`, child output lines are capped at 64 MiB, and
+  notifications queued for a stalled client are dropped beyond 1000 (`downstream_backpressure`).
+  The supervisor and aggregator set `PR_SET_DUMPABLE=0` so their own environment is not readable
+  through `/proc` by same-uid processes; children are unaffected.
   An open GET stream does not keep a session alive: every REA session can hold a 2 GB JVM.
 
 ## Routing (per session)
@@ -128,7 +140,7 @@ results.**
 
 ## Supervisor
 
-1. Refuse to start (exit 2, one clear line) without `REBOX_TOKEN`, if `RE_WORKDIR` is missing or
+1. Refuse to start (exit 2, one clear line) without a token, if `RE_WORKDIR` is missing or
    not writable, if `GHIDRA_PROJECTS_DIR` (default `$RE_WORKDIR/ghidra-projects`) is outside
    `RE_WORKDIR` (`GHIDRA_MCP_FILE_ROOT` is `RE_WORKDIR`) or has a path element starting with `.`
    (Ghidra refuses those).
