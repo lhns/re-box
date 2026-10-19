@@ -6,7 +6,8 @@ ghidra-mcp's `gh_`. Any client that speaks streamable HTTP with a custom header 
 
 Paths in tool arguments are paths **inside the container**. Mount your work directory at the
 same absolute path (`RE_WORKDIR`, docs/OPERATIONS.md) and the paths your harness sees are valid
-as they are. Nothing is uploaded. The same goes for the state dir (`REBOX_STATE_DIR`,
+as they are (on Windows send the Git Bash form `/c/Users/you/re/x.exe`, not `C:\...`: the
+`initialize` instructions tell the agent so). Nothing is uploaded. The same goes for the state dir (`REBOX_STATE_DIR`,
 docs/PERSISTENCE.md): mounted at its own path, e.g. inside the agent's scratchpad, the agent reads
 REA exports and evidence autosaves there directly, and a path it passes to
 `rea_export_evidence_bundle` or `rea_close_binary {snapshot_path}` is valid on both sides.
@@ -29,7 +30,8 @@ token from the environment, so it never lands in a config file or shell history:
 }
 ```
 
-Then `export REBOX_TOKEN=...` before starting `claude`. If the variable is unset, Claude Code
+Then `export REBOX_TOKEN=...` before starting `claude` (PowerShell: `$env:REBOX_TOKEN = (Get-Content
+rebox_token)`). If the variable is unset, Claude Code
 sends the literal text `${REBOX_TOKEN}` and gets 401; `claude mcp list` warns about the missing
 variable.
 
@@ -49,11 +51,36 @@ https://code.claude.com/docs/en/mcp.md):
 | setting | default | set to |
 | --- | --- | --- |
 | per-server `"timeout"` in `.mcp.json`, or `MCP_TOOL_TIMEOUT` (ms) | HTTP requests time out after 60 s unless one of these is above 60000 | `900000` (at least `600000`) |
-| `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms) | 300000 for network servers: a call with no response **and no progress notification** for 5 min is aborted | `1800000` if you import large binaries with ghidra-mcp, which reports no progress while it analyses |
+| `CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT` (ms) | 300000 for network servers: a call with no response **and no progress notification** for 5 min is aborted | `1800000` as a belt-and-braces setting; re-box already sends a synthetic progress notification every 30 s (`REBOX_PROGRESS_KEEPALIVE_INTERVAL`) for calls that carry a progress token, which covers ghidra-mcp imports that report none |
 | `MCP_TIMEOUT` (ms, server connect) | 30000 | default is fine; a session start spawns two children and takes a few seconds |
 
 `MCP_TOOL_TIMEOUT` and the idle timeout can go in the shell or in `settings.json` under `env`.
 REA reports progress every 10 s while Ghidra starts, so REA calls do not hit the idle timeout.
+
+### Cold start
+
+Ghidra starts with the first session (about 40 s). No client support for `tools/list_changed` is
+needed: the full `gh_` catalog is in the first `tools/list` (from a cache in the state dir; the
+very first start of a new state dir fills it before answering `initialize`), and a `gh_` call made
+while Ghidra starts waits for it, then runs. The wait is bounded by
+`REBOX_HEADLESS_START_TIMEOUT` (300 s); on timeout or a failed start (for example the project is
+locked by another container) the call returns a tool error naming the reason. re-box sends progress
+notifications meanwhile for calls that carry a progress token.
+
+Timeouts: a 59 MB `gh_import_file` hit ghidra-mcp's bridge timeout of 300 s for `import_file`
+(a fixed table in the bridge's `config.py`, not an environment variable); the tool reports an error
+but the import continues in the Ghidra server. Check with `gh_list_open_programs` / `gh_analysis_status`
+before importing again.
+
+### Session lifetime
+
+A session whose client keeps the standalone GET notification stream open (the MCP SDKs, Claude
+Code interactive) is closed after `REBOX_SESSION_IDLE_TIMEOUT` (30 min) of silence; one without
+(a `claude -p` that exited without DELETE) after `REBOX_SESSION_ORPHAN_TIMEOUT` (5 min), so its REA
+JVM does not linger. At `REBOX_MAX_SESSIONS` a new session evicts the longest-idle one (idle at
+least 2 min) instead of being refused. An evicted or closed session answers 404 and a compliant
+client re-initializes; REA's in-session state is gone, its evidence is exported
+(docs/PERSISTENCE.md).
 
 ### Large catalogs and results
 
@@ -63,8 +90,9 @@ REA reports progress every 10 s while Ghidra starts, so REA calls do not hit the
   `REA_MCP_INPUT_SCHEMA_PROFILE=compact` and `REA_MCP_OUTPUT_SCHEMA_PROFILE=off` (220 KB).
 - Results above 25,000 tokens (`MAX_MCP_OUTPUT_TOKENS`) are cut; text over 50,000 characters is
   saved to a file. Raise `MAX_MCP_OUTPUT_TOKENS` if REA dossiers are truncated.
-- ghidra-mcp loads tool groups lazily and announces new ones with `tools/list_changed`, which
-  Claude Code follows (interactive and `-p`).
+- ghidra-mcp's whole catalog (197 tools, ~250 KB) is listed up front; lazy tool groups
+  (`GHIDRA_MCP_LAZY=1`) need a client that follows `tools/list_changed`, which Claude Code 2.1.303
+  did not in a `-p` test.
 
 ### REA's workflow skill
 
@@ -101,12 +129,12 @@ Anything that does streamable HTTP with a static header: point it at `/mcp` with
 - re-box speaks the session-based protocol versions (2024-11-05 to 2025-11-25). A client that
   first probes the sessionless 2026-07-28 protocol gets error `-32022` listing those versions and
   falls back to `initialize`, as the official SDKs and Claude Code do.
-- Clients that ignore `tools/list_changed` never see ghidra-mcp's lazily loaded groups: start
-  the container with `GHIDRA_MCP_LAZY=0` (all 197 ghidra tools up front).
+- Clients that ignore `tools/list_changed` need nothing special: the image lists all 197 ghidra
+  tools up front (`GHIDRA_MCP_LAZY=0`) and a cold session advertises them from the cache.
 - Clients with small message or schema limits: see the schema profiles above, and
   `REA_MCP_MAX_RESPONSE_BYTES` (docs/OPERATIONS.md).
-- A session ends after `REBOX_SESSION_IDLE_TIMEOUT` (30 min) without requests; the next request
-  gets 404 and a compliant client re-initializes. REA state (the open binary and its in-session
+- A session ends after `REBOX_SESSION_IDLE_TIMEOUT` (30 min) without requests (5 min without an
+  open GET stream); the next request gets 404 and a compliant client re-initializes. REA state (the open binary and its in-session
   Ghidra database) does not survive that, by design: each session's REA process holds it. Before
   closing, the aggregator exports the session's REA evidence to
   `$REBOX_STATE_DIR/rea/evidence/` (docs/PERSISTENCE.md). Work that must last belongs in

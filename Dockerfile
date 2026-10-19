@@ -79,6 +79,7 @@ tag_commit=$(git ls-remote origin "refs/tags/$GHIDRA_MCP_REF^{}" | cut -f1)
 [ "$tag_commit" = "$GHIDRA_MCP_COMMIT" ] || { echo "tag $GHIDRA_MCP_REF is $tag_commit, pinned $GHIDRA_MCP_COMMIT" >&2; exit 1; }
 git fetch -q --depth 1 origin "$GHIDRA_MCP_COMMIT"
 git checkout -q FETCH_HEAD
+echo "$GHIDRA_MCP_REF-$GHIDRA_MCP_COMMIT" > /src/ghidra-mcp.version  # keys the aggregator's catalog cache
 EOS
 
 FROM ghidra-mcp-src AS ghidra-mcp
@@ -94,6 +95,7 @@ cd /src/ghidra-mcp
 "$t/gradle-$GRADLE_VERSION/bin/gradle" --no-daemon -q jar -x test -PGHIDRA_INSTALL_DIR=/opt/ghidra
 mkdir -p /opt/ghidra-mcp
 cp build/libs/GhidraMCP-*.jar /opt/ghidra-mcp/GhidraMCP.jar
+cp /src/ghidra-mcp.version /opt/ghidra-mcp/VERSION
 rm -rf "$t" /root/.gradle
 EOS
 # The bridge's runtime deps come from upstream's uv.lock with hashes; the bridge itself from source.
@@ -170,16 +172,18 @@ COPY rootfs/etc/rebox/ /etc/rebox/
 RUN python3 /usr/local/lib/rebox/rewrite-skill.py /opt/rea/node_modules/rea-agents/skills /opt/rebox/skills rea_
 # Defaults; docs/OPERATIONS.md explains each. Memory: JAVA_OPTS heap (headless server) plus up
 # to REBOX_MAX_SESSIONS x GHIDRA_HEADLESS_MAXMEM (one REA Ghidra JVM per session) must fit the
-# container limit with overhead; these fit 16 GiB.
+# container limit with overhead; these fit 16 GiB. The G1 flags give heap back after a burst
+# (REA's own JVMs reject JVM option overrides, so they keep the defaults).
 ENV RE_WORKDIR=/work \
     REBOX_PORT=8443 \
     REBOX_MAX_SESSIONS=4 \
     REBOX_SESSION_IDLE_TIMEOUT=1800 \
+    REBOX_GHIDRA_IDLE_TIMEOUT=300 \
     REBOX_AUTOSAVE_INTERVAL=300 \
-    JAVA_OPTS="-Xmx4g -XX:+UseG1GC" \
+    JAVA_OPTS="-Xmx4g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30" \
     GHIDRA_HEADLESS_MAXMEM=1536m \
     GHIDRA_MCP_ALLOW_SCRIPTS=0 \
-    GHIDRA_MCP_LAZY=1 \
+    GHIDRA_MCP_LAZY=0 \
     GHIDRA_MCP_LOG_LEVEL=WARNING \
     REA_ANALYSIS_PROVIDER=ghidra \
     REA_MCP_INPUT_SCHEMA_PROFILE=full \
@@ -190,7 +194,7 @@ LABEL org.opencontainers.image.source="https://github.com/lhns/re-box" \
       org.opencontainers.image.title="re-box" \
       org.opencontainers.image.description="Ghidra, ghidra-mcp and REA behind one authenticated MCP endpoint"
 EXPOSE 8443
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5m --retries=3 CMD ["/usr/local/bin/re-box-healthcheck"]
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 CMD ["/usr/local/bin/re-box-healthcheck"]
 USER 1000:1000
 WORKDIR /home/rebox
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/re-box-entrypoint"]

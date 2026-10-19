@@ -16,6 +16,8 @@ export RE_WORKDIR=/tmp/rebox-e2e/work
 # Outside RE_WORKDIR on purpose: exercises the analyzeHeadless + --project path. The supervisor
 # (as PUID) creates it.
 export REBOX_STATE_DIR=/tmp/rebox-e2e/state
+# Short, so test_11 sees Ghidra stop; the other tests hold a session open (e2e/conftest.py keeper).
+export REBOX_GHIDRA_IDLE_TIMEOUT=5
 LOG=/tmp/rebox-e2e/services.log
 MEM=/tmp/rebox-e2e/rss.log
 

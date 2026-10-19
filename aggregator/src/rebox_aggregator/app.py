@@ -20,7 +20,7 @@ from .config import ConfigError, Settings, harden, load_settings
 from .log import log
 from .session import Session
 
-Health = Callable[[], tuple[bool, str]]
+Health = Callable[[], tuple[bool, str, str]]  # (ok, reason, backend state)
 
 
 def instance_id() -> str:
@@ -29,11 +29,24 @@ def instance_id() -> str:
     return given if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", given) else uuid.uuid4().hex
 
 
+class NoBackend:
+    """Stand-in for the supervisor's Ghidra lifecycle when the app runs on its own."""
+
+    def want(self, wanted: bool) -> None: ...
+
+    def ready(self) -> bool:
+        return True
+
+    def status(self) -> tuple[str, str]:
+        return "ready", ""
+
+
 class App:
     def __init__(self, settings: Settings, *, instance: str | None = None, health: Health | None = None):
         self.settings = settings
         self.instance = instance or instance_id()
-        self.health = health or (lambda: (True, ""))
+        self.health = health or (lambda: (True, "", ""))
+        self.backend = NoBackend()  # the supervisor swaps in the Ghidra lifecycle: want(bool), ready()
         self.sessions: dict[str, Session] = {}
         self.closing = False
         self._tg: anyio.abc.TaskGroup | None = None
@@ -55,8 +68,10 @@ class App:
             return
         path = scope["path"]
         if path == "/healthz":
-            ok, reason = self.health()
+            ok, reason, state = self.health()
             body = {"status": "ok"} if ok else {"status": "unavailable", "reason": reason}
+            if state:
+                body["ghidra"] = state
             return await _json(send, 200 if ok else 503, body)
         if path not in ("/mcp", "/mcp/"):
             return await _json(send, 404, {"error": "not found"})
@@ -102,6 +117,8 @@ class App:
                 if body is None:
                     return
                 receive = _replay(body, receive)
+            if method == "GET":
+                return await self._get_stream(session, scope, receive, send)
             return await session.transport.handle_request(scope, receive, send)
         if method != "POST":
             return await _rpc_error(send, 400, None, -32600, "Missing Mcp-Session-Id header")
@@ -122,6 +139,12 @@ class App:
                 "Unsupported protocol version; this server speaks the initialize handshake",
                 {"supported": list(HANDSHAKE_PROTOCOL_VERSIONS), "requested": requested},
             )
+        while not self.closing and len(self.sessions) >= self.settings.max_sessions:
+            victim = self._eviction_candidate()
+            if victim is None:
+                break
+            log("session_evicted", "info", session=victim.tag, idle_s=round(victim.idle_for()), reason="session limit")
+            await victim.close("evicted")  # saves its work first
         if self.closing or len(self.sessions) >= self.settings.max_sessions:
             n = len(self.sessions)
             reason = "shutting down" if self.closing else "session limit"
@@ -137,8 +160,12 @@ class App:
     async def _open(self, msg, body: bytes, scope, receive, send) -> None:
         assert self._tg is not None
         transport = StreamableHTTPServerTransport(mcp_session_id=uuid.uuid4().hex)
-        session = Session(transport.mcp_session_id, transport, self.settings, self.instance, self._forget)  # type: ignore[arg-type]
+        session = Session(
+            transport.mcp_session_id, transport, self.settings, self.instance, self._forget,  # type: ignore[arg-type]
+            lambda: self.backend.ready(), lambda: self.backend.status(),
+        )
         self.sessions[session.sid] = session
+        self.backend.want(True)
         try:
             await self._tg.start(session.serve)
             await transport.handle_request(scope, _replay(body, receive), send)
@@ -170,6 +197,28 @@ class App:
 
     def _forget(self, session: Session) -> None:
         self.sessions.pop(session.sid, None)
+        if not self.sessions:
+            self.backend.want(False)
+
+    def backend_became_ready(self) -> None:
+        for s in list(self.sessions.values()):
+            s.on_backend_ready()
+
+    def _eviction_candidate(self) -> Session | None:
+        """The longest-idle session with nothing in flight, if it has been idle long enough."""
+        idle = [s for s in self.sessions.values() if s.initialized and not s.busy and s.idle_for() >= self.settings.evict_min_idle]
+        return max(idle, key=lambda s: s.idle_for(), default=None)
+
+    async def _get_stream(self, session: Session, scope, receive, send) -> None:
+        """The client's standalone notification stream. Its presence tells an attended session from an orphan."""
+        session.get_streams += 1
+        log("get_stream_open", "debug", session=session.tag, open=session.get_streams)
+        try:
+            await session.transport.handle_request(scope, receive, send)
+        finally:
+            session.get_streams -= 1
+            session.touch()  # the stream's end is activity: the orphan clock starts from here
+            log("get_stream_closed", "debug", session=session.tag, open=session.get_streams)
 
 
 def _replay(body: bytes, receive):

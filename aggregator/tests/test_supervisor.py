@@ -78,6 +78,25 @@ def test_autosave_interval_validated(tmp_path):
             validate(env(tmp_path, REBOX_AUTOSAVE_INTERVAL=bad))
 
 
+def test_idle_and_retention_validated(tmp_path):
+    cfg = validate(env(tmp_path))
+    assert (cfg.idle_timeout, cfg.evidence_retention_days) == (300, 30)
+    cfg = validate(env(tmp_path, REBOX_GHIDRA_IDLE_TIMEOUT="0", REBOX_EVIDENCE_RETENTION_DAYS="0"))
+    assert (cfg.idle_timeout, cfg.evidence_retention_days) == (0, 0)
+    for key in ("REBOX_GHIDRA_IDLE_TIMEOUT", "REBOX_EVIDENCE_RETENTION_DAYS"):
+        for bad in ("-1", "x"):
+            with pytest.raises(ConfigError, match=key):
+                validate(env(tmp_path, **{key: bad}))
+
+
+def test_state_dir_gets_a_gitignore(tmp_path):
+    cfg = validate(env(tmp_path))
+    assert (cfg.state_dir / ".gitignore").read_text() == "*\n"
+    (cfg.state_dir / ".gitignore").write_text("mine\n")
+    validate(env(tmp_path))
+    assert (cfg.state_dir / ".gitignore").read_text() == "mine\n"  # never overwritten
+
+
 def test_missing_token(tmp_path):
     with pytest.raises(ConfigError, match="REBOX_TOKEN"):
         validate({"RE_WORKDIR": str(tmp_path)})
@@ -116,9 +135,10 @@ def test_headless_command(tmp_path):
 class FakeHeadless:
     """Tiny stand-in for the ghidra-mcp headless HTTP API; records POSTs."""
 
-    def __init__(self, has_project: bool):
+    def __init__(self, has_project: bool, reply: dict | None = None, opens: bool = True):
         outer = self
         self.has_project, self.posts = has_project, []
+        self.reply, self.opens = reply or {"success": True}, opens
 
         class H(BaseHTTPRequestHandler):
             def log_message(self, *a):
@@ -132,12 +152,13 @@ class FakeHeadless:
                 self.wfile.write(raw)
 
             def do_GET(self):
-                self._reply({"has_project": outer.has_project} if self.path == "/get_project_info" else {})
+                self._reply({"status": "ok", "has_project": outer.has_project})
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 outer.posts.append((self.path, body))
-                self._reply({"success": True})
+                outer.has_project = outer.has_project or (outer.opens and "error" not in outer.reply)
+                self._reply(outer.reply)
 
         self.server = HTTPServer(("127.0.0.1", 0), H)
         self.base = f"http://127.0.0.1:{self.server.server_port}"
@@ -147,8 +168,38 @@ class FakeHeadless:
         self.server.shutdown()
 
 
-async def run_ensure(has_project: bool, projects: Path):
-    fake = FakeHeadless(has_project)
+async def test_ensure_project_reports_a_lock_held_elsewhere(tmp_path):
+    from rebox_aggregator.supervisor import ProjectError
+
+    (tmp_path / "rebox.gpr").write_text("")
+    with pytest.raises(ProjectError, match="locked by another Ghidra instance") as e:
+        await run_ensure(False, tmp_path, reply={"error": "Project locked by another Ghidra instance: /x/rebox.lock"}, opens=False)
+    assert "/x/" not in str(e.value)  # fixed text: the reason goes to /healthz
+
+
+async def test_ensure_project_fails_when_it_is_still_not_open(tmp_path):
+    from rebox_aggregator.supervisor import ProjectError
+
+    with pytest.raises(ProjectError, match="project not open"):
+        await run_ensure(False, tmp_path, opens=False)
+
+
+async def test_lock_shows_as_failed_in_health(tmp_path):
+    fake = FakeHeadless(False, {"error": "Project locked by another Ghidra instance: x"}, opens=False)
+    try:
+        cfg = validate(env(tmp_path, REBOX_HEADLESS_START_TIMEOUT="5"))
+        (cfg.projects_dir / "rebox.gpr").write_text("")
+        h = Headless(cfg, "i", fake.base)
+        proc = await anyio.open_process(["sleep", "60"], start_new_session=True)
+        await h._monitor(proc, anyio.CancelScope())
+        await proc.wait()
+        assert h.health() == (False, "project locked by another Ghidra instance", "failed")
+    finally:
+        fake.close()
+
+
+async def run_ensure(has_project: bool, projects: Path, **kw):
+    fake = FakeHeadless(has_project, **kw)
     try:
         async with httpx2.AsyncClient() as http:
             await ensure_project(http, fake.base, projects)

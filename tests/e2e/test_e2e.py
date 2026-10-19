@@ -15,7 +15,7 @@ import httpx2 as httpx
 import pytest
 
 from conftest import (COMPUTE_MARKERS, COMPUTE_MULTIPLIER, INSTANCE, PROJECTS, STATE, TOKEN, URL,
-                      fixture_path, record)
+                      fixture_path, keeper, record, release_keeper)
 from mcpclient import McpError, Session
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
@@ -55,9 +55,18 @@ def tag_of(session_id: str) -> str:
 
 
 # --- 1. catalog
-def test_01_catalog(session):
-    s = session()
+def test_01_catalog():
+    """First session of the run: Ghidra is cold. The full gh_ catalog must be in the very first
+    tools/list (no waiting for tools/list_changed, which clients may ignore), and a gh_ call made
+    right away must wait for Ghidra and succeed without the client listing again. This session stays
+    open for the rest of the run (conftest.keeper) so Ghidra stays up."""
+    s = keeper()
     names = s.tool_names()
+    gh = [n for n in names if n.startswith("gh_")]
+    assert len(gh) > 150, f"only {len(gh)} gh_ tools in the first tools/list (GHIDRA_MCP_LAZY=0)"
+    first_call = s.tool("gh_list_open_programs", {})
+    record("01_catalog", "first gh_ call after initialize (waits for the cold Ghidra start)", first_call.seconds)
+    assert not first_call.result.get("isError"), first_call.text()[:500]
     for required in ("rea_open_binary", "rea_binary_overview", "gh_get_metadata", "gh_get_functions",
                      "gh_search_tools", "gh_import_file", "gh_find_functions", "gh_load_tool_group"):
         assert required in names, required
@@ -68,6 +77,9 @@ def test_01_catalog(session):
     assert prompts and all(p["name"].startswith("rea_") for p in prompts)
     caps = s.init_result["capabilities"]
     assert caps["tools"]["listChanged"] is True
+    instructions = s.init_result["instructions"]
+    assert s.session_id and tag_of(s.session_id) in instructions and str(STATE) in instructions
+    assert not {"gh_run_ghidra_script", "gh_run_script_inline"} & set(names)  # denied in aggregator.toml
 
 
 def test_01b_official_sdk_client_interop():
@@ -145,7 +157,9 @@ def test_03_ghidra_mcp_flow(session):
     assert (PROJECTS / "rebox.gpr").is_file() and (PROJECTS / "rebox.rep").is_dir()
 
 
-# --- 4. lazy tool groups and list_changed
+# --- 4. lazy tool groups and list_changed. Lazy mode is opt-in now (the image sets GHIDRA_MCP_LAZY=0:
+# clients cannot be relied on to follow list_changed); run with GHIDRA_MCP_LAZY=1 to exercise it.
+@pytest.mark.skipif(os.environ.get("GHIDRA_MCP_LAZY") != "1", reason="lazy tool groups are off by default")
 def test_04_lazy_groups(session):
     s = session(listen=True)
     before = set(s.tool_names())
@@ -276,3 +290,44 @@ def test_10_session_cleanup():
     assert not processes_in_groups(pgids)
     s.session_id = None
     s.close()
+
+
+# --- 11. Ghidra stops when the last session is gone (REBOX_GHIDRA_IDLE_TIMEOUT=5) and comes back
+def ghidra_server_pids() -> list[int]:
+    found = []
+    for proc in Path("/proc").iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            if b"GhidraMCPHeadlessServer" in (proc / "cmdline").read_bytes() and \
+                    f"REBOX_INSTANCE={INSTANCE}".encode() in (proc / "environ").read_bytes().split(b"\0"):
+                found.append(int(proc.name))
+        except OSError:
+            continue
+    return found
+
+
+def test_11_idle_stop_and_restart():
+    assert ghidra_server_pids(), "the keeper session should have kept Ghidra running"
+    release_keeper()  # every other session of the run is closed already
+    t0 = time.monotonic()
+    deadline = t0 + 90
+    while ghidra_server_pids() and time.monotonic() < deadline:
+        time.sleep(0.5)
+    record("11_idle_stop", "Ghidra gone after the last session closed (idle timeout 5 s)", time.monotonic() - t0)
+    assert not ghidra_server_pids()
+    with httpx.Client(timeout=30) as http:
+        health = http.get(URL.rsplit("/mcp", 1)[0] + "/healthz")
+    assert health.status_code == 200 and health.json()["ghidra"] == "stopped", health.text
+
+    # A cold session: the catalog comes from the cache at once, and a gh_ call waits for Ghidra.
+    s = Session(URL, TOKEN)
+    try:
+        s.initialize()
+        assert "gh_get_metadata" in s.tool_names()
+        opened = s.tool("gh_open_program", {"path": "/hello_stripped"})  # imported and saved by test_03
+        record("11_idle_stop", "first gh_ call of a cold session (restart included)", opened.seconds)
+        assert _json(opened).get("success"), opened.text()[:500]
+        assert ghidra_server_pids()
+    finally:
+        s.close()

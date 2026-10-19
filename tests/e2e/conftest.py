@@ -6,6 +6,7 @@ REBOX_INSTANCE, REBOX_E2E_PHASE (unset for the first run, `restart` for the run 
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -31,9 +32,35 @@ def record(test: str, what: str, seconds: float) -> None:
     _durations.append((test, what, seconds))
 
 
+def assert_gh_listed(s: Session) -> None:
+    """The gh_ tools are in the first tools/list even when Ghidra is cold (catalog cache or held initialize)."""
+    assert "gh_get_metadata" in s.tool_names(), "no gh_ tools in the first tools/list"
+
+
+_keeper: Session | None = None
+
+
+def keeper() -> Session:
+    """One session held open (with a GET stream, so it is not an orphan) for the whole run, so Ghidra
+    stays up between tests despite REBOX_GHIDRA_IDLE_TIMEOUT=5. test_11 releases it."""
+    global _keeper
+    if _keeper is None:
+        _keeper = Session(URL, TOKEN, timeout=None)
+        _keeper.initialize()
+        _keeper.listen()
+    return _keeper
+
+
+def release_keeper() -> None:
+    global _keeper
+    if _keeper is not None:
+        _keeper.close()
+        _keeper = None
+
+
 @pytest.fixture
 def session(request):
-    """An initialized MCP session, deleted afterwards."""
+    """An initialized MCP session with the gh_ tools available, deleted afterwards."""
     opened: list[Session] = []
 
     def make(listen: bool = False) -> Session:
@@ -42,6 +69,7 @@ def session(request):
         if listen:
             s.listen()
         opened.append(s)
+        assert_gh_listed(s)
         return s
 
     yield make

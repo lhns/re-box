@@ -145,7 +145,7 @@ async def test_delete_kills_process_group_including_grandchild(running):
 
 
 async def test_session_cap():
-    with run_app(max_sessions=2) as r:
+    with run_app(max_sessions=2, evict_min_idle=3600) as r:  # nothing is idle long enough to evict
         async with r.raw() as http:
             sid1, _ = await raw_init(http, r.url)
             await raw_init(http, r.url)
@@ -296,24 +296,27 @@ async def test_cancellation_relayed_with_child_request_id(running):
     assert [e["outcome"] for e in running.logged("tool_call")][-3] == "cancelled"
 
 
-async def test_child_crash_is_contained(running):
+async def test_child_crash_closes_only_that_session(running):
     async with running.raw() as http:
+        other, _ = await raw_init(http, running.url)
         sid, _ = await raw_init(http, running.url)
         msgs = await raw_call(http, running.url, sid, "tools/call", {"name": "a_crash", "arguments": {}})
         assert msgs[-1]["error"]["code"] == -32603 and "backend 'a' is not running" in msgs[-1]["error"]["message"]
-        msgs = await raw_call(http, running.url, sid, "tools/call", {"name": "a_echo", "arguments": {}}, 3)
-        assert msgs[-1]["error"]["code"] == -32603 and "exited with code 3" in msgs[-1]["error"]["message"]
-        assert await tool_text(http, running.url, sid, "b_echo", {"text": "ok"}, rid=4) == "ok"
+        assert await wait_until(lambda: sid not in running.app.sessions, 10)  # half-dead: the client re-initializes
+        r = await http.post(running.url, json={"jsonrpc": "2.0", "id": 9, "method": "ping"},
+                            headers={**RAW_HEADERS, "mcp-session-id": sid})
+        assert r.status_code == 404
+        assert await tool_text(http, running.url, other, "b_echo", {"text": "ok"}, rid=4) == "ok"
     assert running.logged("child_exit")[0]["exit_code"] == 3
+    assert [e["reason"] for e in running.logged("session_close")][0] == "child_exited"
 
 
-async def test_session_closes_when_all_children_die(running):
+async def test_session_closes_when_any_child_dies(running):
     async with running.raw() as http:
         sid, _ = await raw_init(http, running.url)
-        for i, n in enumerate(("a_crash", "b_crash")):
-            await raw_call(http, running.url, sid, "tools/call", {"name": n, "arguments": {}}, 2 + i)
+        await raw_call(http, running.url, sid, "tools/call", {"name": "b_crash", "arguments": {}})
         assert await wait_until(lambda: not running.app.sessions, 10)
-    assert running.logged("session_close")[0]["reason"] == "all_children_exited"
+    assert running.logged("session_close")[0]["reason"] == "child_exited"
 
 
 async def test_child_request_forwarded_to_client(running):

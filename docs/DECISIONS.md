@@ -44,7 +44,12 @@ operations behind `GHIDRA_MCP_FILE_ROOT`, makes lazy tool groups the default and
 `GHIDRA_MCP_LAZY`, and targets 12.1.4. The spec's own vocabulary (`gh_find_functions`,
 `GHIDRA_MCP_LAZY`) is v7's. Cost: it is a release candidate. `versions.env` pins the tag (for
 Renovate) and the commit (checked at build, since tags move); Renovate proposes `v7.0.0` once
-it exists. Open question for the owner: ship the RC or wait for 7.0.0.
+it exists.
+
+**Decided: ship rc.3 now.** v6.0.0 cannot do the one thing re-box needs from ghidra-mcp (headless
+import), so waiting means shipping nothing; the image is pinned by commit, so rc.3 cannot change
+under us. The Renovate PR to 7.0.0 is reviewed against the e2e suite when it lands (tool-name
+changes between rc and final are the likely breakage; the e2e names every `gh_` tool it uses).
 
 Tool names that changed in v7 (upstream wins over the spec's test list,
 `docs/project-management/MIGRATION_7.0.0_TOOL_CONSOLIDATION.md`):
@@ -126,8 +131,14 @@ groups already contain every tool the e2e ghidra flow needs (`import_file`, `fin
 `get_functions`, `rename_function`, `save_program`, `open_program`, `close_program`,
 `get_metadata`, `search_tools`, `load_tool_group`).
 
-**Decision:** keep ghidra-mcp lazy (`GHIDRA_MCP_LAZY=1`, upstream default in v7); the aggregator
-relays `list_changed`. Keep REA's profiles at upstream `full`, exposed as
+**Decision (revised):** ghidra-mcp runs **not lazy** (`GHIDRA_MCP_LAZY=0`, 197 tools, +144 KB). The
+first decision kept it lazy and relied on `tools/list_changed`; but Claude Code 2.1.303 ignored
+`list_changed` in a `claude -p` test (tools added by `gh_load_tool_group` never appeared: "No such
+tool available") and there are open reports of the same over Streamable HTTP and with tool search.
+With on-demand Ghidra a cold session would have no `gh_` tools at all, so the full catalog is in the
+first `tools/list` (Claude Code defers tool definitions via tool search, so the size costs little);
+lazy mode remains an opt-in (`GHIDRA_MCP_LAZY=1`; the e2e lazy test runs only then). The aggregator
+still relays `list_changed`. Keep REA's profiles at upstream `full`, exposed as
 `REA_MCP_INPUT_SCHEMA_PROFILE` / `REA_MCP_OUTPUT_SCHEMA_PROFILE`. REA's full catalog is 3 MB;
 docs/CLIENTS.md says when to switch to `compact`/`off`.
 
@@ -194,7 +205,66 @@ docs/CLIENTS.md says when to switch to `compact`/`off`.
   `REA_MCP_OUTPUT_SCHEMA_PROFILE=off`. The aggregator does not paginate `tools/list`: clients that
   do not follow `nextCursor` would silently lose tools. Claude Code 2.1.303 handles the full catalog.
 - **Claude Code `-p` exits without DELETE**, so its session (and REA's Ghidra JVM) lives until the
-  idle timeout and counts against `REBOX_MAX_SESSIONS` (docs/OPERATIONS.md).
+  orphan timeout and counts against `REBOX_MAX_SESSIONS` until then or until evicted
+  (docs/OPERATIONS.md; "Session timeouts" below).
+
+## Ghidra on demand: one install, separate JVMs
+
+**Decision:** one Ghidra install, but separate JVMs: the ghidra-mcp headless server (shared, one
+at most) and REA's per-session JVMs. The headless server starts when the first session opens and
+stops `REBOX_GHIDRA_IDLE_TIMEOUT` (300 s) after the last one closed; an idle container runs no Java
+(measured: the idle server is 128 MB RSS, ready 39 s after start).
+
+- **One JVM for both is not possible without forking REA.** REA launches
+  `ghidra.app.util.headless.AnalyzeHeadless` itself (`GhidraJavaLaunch.js`) and its JVM probe
+  rejects overrides, so a shim is ignored. Its bridge extends `HeadlessScript` and needs
+  `HeadlessAnalyzer`, a per-JVM singleton with its own project manager, while ghidra-mcp runs
+  another. REA also kills its JVM's process group on cancel, which would take ghidra-mcp's unsaved
+  edits with it. (Stage 2 revisits this by hosting REA's bridge inside the ghidra-mcp JVM.)
+- **Start on the first session, not the first `gh_` call:** a bridge that boots without Ghidra
+  shows only static tools, so the client would never see a `gh_` tool to call. `initialize` is not
+  held when a catalog cache exists (39 s against client connect timeouts); the bridge starts at once,
+  and when Ghidra is ready the aggregator calls the bridge's `connect_instance(project="rebox")`
+  (`[child.on_ready]`), which discovers the server (verified in the image: matches project `rebox`,
+  over TCP 8089). The bridge's own 15 s retry stays as fallback.
+- **Clients cannot be relied on to follow `tools/list_changed`** (Claude Code ignored it in a test),
+  so the full `gh_` catalog is in the first `tools/list` regardless: a per-child catalog cache
+  (`[child.catalog_cache]`, `$REBOX_STATE_DIR/cache/rebox-catalog/`, keyed by the ghidra-mcp
+  ref+commit, `GHIDRA_MCP_LAZY` and `GHIDRA_MCP_ALLOW_SCRIPTS`) holds what a connected bridge lists.
+  A session that opens while Ghidra is down advertises the cache; a `tools/call` for a cached tool
+  the bridge does not have yet is held (progress keepalive applies) until the live catalog replaces
+  the cache, bounded by `REBOX_HEADLESS_START_TIMEOUT`, and returns a tool error naming the Ghidra
+  state and reason on timeout or failure. The bridge's static tools stay callable immediately. If the
+  live catalog differs, the cache is rewritten and `list_changed` sent (best effort). With no cache
+  yet (new state dir, or a ghidra-mcp upgrade changed the key) the supervisor starts Ghidra at
+  container boot, lists the bridge once exactly as a session would, writes the cache, and lets the
+  idle stop take Ghidra down; a session opening before that holds its `initialize` reply until its
+  bridge is connected (bounded).
+- **Stop = save, then the shutdown escalation, but no instance-wide sweep** (it would kill a session
+  opening concurrently). A session opening during the stop waits for the old process to exit, then
+  starts a new one. A crash with sessions restarts with backoff; without sessions it stays stopped.
+- **`/healthz` is the aggregator, not the JVM:** 200 when Ghidra is stopped, starting or ready,
+  503 when failed or starting past `REBOX_HEADLESS_START_TIMEOUT`; the body names the state.
+- **G1 flags** (`G1PeriodicGCInterval=60000`, `MinHeapFreeRatio=10`, `MaxHeapFreeRatio=30`) hand heap
+  back after a burst. Not applied to REA's JVMs: REA rejects `JAVA_TOOL_OPTIONS` overrides.
+
+## Session timeouts
+
+REA JVMs must not linger after the client is gone, without punishing interactive users.
+
+- A session whose client keeps its standalone GET stream open (the MCP SDKs open one after
+  `notifications/initialized`) keeps `REBOX_SESSION_IDLE_TIMEOUT` (1800 s); a session with none (a
+  `claude -p` that exited, a dead client) is closed after `REBOX_SESSION_ORPHAN_TIMEOUT` (300 s).
+  The app counts GET streams per session (`get_stream_open`/`get_stream_closed` in the log). If a
+  client turns out to hold no GET stream while interactive, set the two timeouts equal
+  (`REBOX_SESSION_ORPHAN_TIMEOUT=0` uses the idle timeout for everyone).
+- At the session cap a new `initialize` evicts the longest-idle session with nothing in flight if
+  idle for at least `REBOX_SESSION_EVICT_MIN_IDLE` (120 s), after its autosave; 503 only when none
+  qualifies. A refused agent is worse off than an evicted idle one, which re-initializes on 404.
+- Requests with a `progressToken` that the child leaves silent for 30 s get a synthetic
+  `notifications/progress`, so Claude Code's 5-minute no-progress abort does not kill a long import.
+- A session is closed when any child dies (it used to be: all children). A session without `rea_`
+  or without the bridge looks alive and fails confusingly; the 404 makes the client start a whole one.
 
 ## State dir (persistence)
 
@@ -242,6 +312,11 @@ survival table: docs/PERSISTENCE.md.
   calls and none running, bounded by `REBOX_AUTOSAVE_TIMEOUT` (20 s, so a DELETE still clears
   the session's processes within the e2e test's 30 s). Snapshots are left to the agent: REA
   refuses them after metadata edits, and they only help reopen the same target.
+- **Evidence pruning:** an export whose `records` and `unknowns` are both empty is deleted at once
+  (`prune_empty`; field names checked in REA's `evidenceBundle.js`); bundles older than
+  `REBOX_EVIDENCE_RETENTION_DAYS` (30) are deleted at start and daily. Bundles feed only REA's
+  evidence views (no renames are re-applied), so age loses little; durable work lives in the `gh_`
+  project.
 
 ## Release pipeline
 
