@@ -2,11 +2,9 @@
 
 Raw binaries, DOS COM/MZ, language overrides, seeds, disabled analyzers and MIPS soft-float used to
 need REA's own JVM. Each test opens one such target, checks that the profile took effect, then
-checks the shared-JVM behaviour:
-
-  AFTER C's CHANGE (marked below; they fail on an image where these profiles still run in REA's own
-  JVM): the program is in the shared project under /rea/<sha256[:12]>-<profile digest[:8]>/<name>,
-  and no process of this instance is a Ghidra AnalyzeHeadless JVM.
+checks the shared-JVM behaviour: the program is in the shared project under
+/rea/<sha256[:12]>-<profile digest[:8]>/<name>, and no process of this instance is a Ghidra
+AnalyzeHeadless JVM.
 
 REA reads REA_GHIDRA_LANGUAGE_ID, _COMPILER_SPEC_ID, _DISABLED_ANALYZERS and _SEED_FILE at process
 start, so each test runs its own `rea mcp` (stdio, tool names without the aggregator's rea_ prefix)
@@ -62,7 +60,7 @@ def procedures(s) -> dict[str, str]:
 
 
 def assert_in_shared_jvm(gh, target: str) -> None:
-    """AFTER C's CHANGE: REA's program is in the shared project and REA has no JVM of its own."""
+    """REA's program is in the shared project and REA has no JVM of its own."""
     path = rea_program_path(gh, target)
     assert path, f"no /rea/{sha256_of(target)[:12]}-*/ program for {target} in the shared project"
     assert not rea_jvms(), "REA started its own Ghidra JVM (AnalyzeHeadless)"
@@ -125,7 +123,7 @@ def test_elf_language_override(session):
         assert set(find_values(analysis, "compiler_spec_id")) == {"gcc"}
         assert "0x539" in json.dumps(analysis) or "1337" in json.dumps(analysis)
         assert_in_shared_jvm(gh, target)
-        # AFTER C's CHANGE: the imported program carries the pinned language.
+        # The imported program carries the pinned language.
         path = rea_program_path(gh, target)
         ok(gh.tool("gh_open_program", {"path": path}))
         open_programs = json.loads(ok(gh.tool("gh_list_open_programs", {})).text())["programs"]
