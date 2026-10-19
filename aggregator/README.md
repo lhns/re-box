@@ -62,7 +62,7 @@ key = "{file:/opt/ghidra-mcp/VERSION}-lazy{GHIDRA_MCP_LAZY}"   # {NAME}: env var
 
 **Deny list:** `deny` names tools by the child's own (unprefixed) names. They are dropped from
 `tools/list` (again after every `list_changed` refresh), and a `tools/call` to one fails with
-`-32602` "Tool gh_x is disabled by this re-box's configuration" without reaching the child. The
+`-32602` "Tool ghidra_x is disabled by this re-box's configuration" without reaching the child. The
 shipped config denies ghidra-mcp's `run_ghidra_script` and `run_script_inline`.
 
 **on_ready:** the Ghidra server starts with the first session, so a bridge usually boots before it
@@ -116,7 +116,7 @@ supervisor's random instance id) and `REBOX_SESSION` (the session tag, below).
   `protocolVersion`), send each `notifications/initialized`, fetch `tools/list` (all pages),
   `prompts/list` / `resources/list` / `resources/templates/list` where advertised, build the
   catalog, reply (the result carries `instructions`: state dir, this session's tag and evidence
-  file, gh_ vs rea_ persistence, the path rule, the cold-start note). It does not wait for Ghidra.
+  file, ghidra_ vs rea_ persistence, the path rule, the cold-start note). It does not wait for Ghidra.
   A child that fails to start or initialize is logged and marked dead; the
   session still opens if at least one child is up. All down, or an invalid catalog (below): the
   `initialize` gets a JSON-RPC error and the session is discarded.

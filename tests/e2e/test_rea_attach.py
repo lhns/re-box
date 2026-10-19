@@ -84,16 +84,16 @@ def test_attach_shares_the_jvm_and_project(session):
                                                "comment": "set by REA"}))
     assert len(ghidra_mcp_jvm()) == 1 and not rea_jvms(), "REA started its own JVM"
     assert len(helpers()) == 1
-    found = jtext(ok(s.tool("gh_find_functions", {"program": "one_debug", "name_pattern": "AttachCompute"})))
+    found = jtext(ok(s.tool("ghidra_find_functions", {"program": "one_debug", "name_pattern": "AttachCompute"})))
     assert [f["name"] for f in found["functions"]] == ["AttachCompute"]
-    comments = jtext(ok(s.tool("gh_get_functions", {"program": "one_debug", "function": "AttachCompute",
-                                                     "fields": "comments"})))["comments"]
+    comments = jtext(ok(s.tool("ghidra_get_functions", {"program": "one_debug", "function": "AttachCompute",
+                                                         "fields": "comments"})))["comments"]
     assert any(c["text"] == "set by REA" for c in comments)
 
     ok(s.tool("rea_close_binary", {}))
     wait_for(lambda: not helpers(), 15, "the attach helper to exit")
     assert len(ghidra_mcp_jvm()) == 1
-    found = jtext(ok(s.tool("gh_find_functions", {"program": "one_debug", "name_pattern": "AttachCompute"})))
+    found = jtext(ok(s.tool("ghidra_find_functions", {"program": "one_debug", "name_pattern": "AttachCompute"})))
     assert found["functions"], "the REA rename is gone after close"
 
 
@@ -117,7 +117,7 @@ def test_same_name_other_bytes_gets_its_own_folder(session):
     for target in (first, second):
         ok(s.tool("rea_open_binary", {"path": target, "provider_id": "ghidra"}))
         ok(s.tool("rea_analyze_function", {"procedure": "compute"}))
-    opened = jtext(ok(s.tool("gh_open_program", {"path": f"/rea/{sha[:12]}/twin"})))
+    opened = jtext(ok(s.tool("ghidra_open_program", {"path": f"/rea/{sha[:12]}/twin"})))
     assert opened.get("success", True), opened
     ok(s.tool("rea_close_binary", {}))
 
@@ -161,7 +161,7 @@ def test_concurrent_rea_sessions_share_one_program(session):
     assert not errors, errors
     assert len(helpers()) == 2 and len(ghidra_mcp_jvm()) == 1 and not rea_jvms()
     # Both opened the same new file at once: one program, not a "shared_debug.0" copy as well.
-    programs = jtext(ok(a.tool("gh_list_open_programs", {})))["programs"]
+    programs = jtext(ok(a.tool("ghidra_list_open_programs", {})))["programs"]
     assert [p["path"] for p in programs if p["name"].startswith("shared_debug")] == ["/shared_debug"], programs
     ok(a.tool("rea_annotate_native_function", {"procedure": "compute", "name": "SharedCompute"}))
     # One program: b, still open since before, sees a's rename at once.
@@ -177,7 +177,7 @@ def test_rea_sees_a_gh_rename_without_reopening(session):
     ok(s.tool("rea_analyze_function", {"procedure": "compute"}))
     before = ok(s.tool("rea_list_procedures", {})).text()
     assert "compute" in before and "GhRenamedCompute" not in before
-    ok(s.tool("gh_rename_function", {"program": "live_debug", "old_name": "compute",
+    ok(s.tool("ghidra_rename_function", {"program": "live_debug", "old_name": "compute",
                                      "new_name": "GhRenamedCompute", "strict_mode": "off"}))
     assert "GhRenamedCompute" in ok(s.tool("rea_list_procedures", {})).text()
     ok(s.tool("rea_analyze_function", {"procedure": "GhRenamedCompute"}))

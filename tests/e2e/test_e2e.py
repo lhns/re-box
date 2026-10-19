@@ -56,21 +56,21 @@ def tag_of(session_id: str) -> str:
 
 # --- 1. catalog
 def test_01_catalog():
-    """First session of the run: Ghidra is cold. The full gh_ catalog must be in the very first
-    tools/list (no waiting for tools/list_changed, which clients may ignore), and a gh_ call made
+    """First session of the run: Ghidra is cold. The full ghidra_ catalog must be in the very first
+    tools/list (no waiting for tools/list_changed, which clients may ignore), and a ghidra_ call made
     right away must wait for Ghidra and succeed without the client listing again. This session stays
     open for the rest of the run (conftest.keeper) so Ghidra stays up."""
     s = keeper()
     names = s.tool_names()
-    gh = [n for n in names if n.startswith("gh_")]
-    assert len(gh) > 150, f"only {len(gh)} gh_ tools in the first tools/list (GHIDRA_MCP_LAZY=0)"
-    first_call = s.tool("gh_list_open_programs", {})
-    record("01_catalog", "first gh_ call after initialize (waits for the cold Ghidra start)", first_call.seconds)
+    gh = [n for n in names if n.startswith("ghidra_")]
+    assert len(gh) > 150, f"only {len(gh)} ghidra_ tools in the first tools/list (GHIDRA_MCP_LAZY=0)"
+    first_call = s.tool("ghidra_list_open_programs", {})
+    record("01_catalog", "first ghidra_ call after initialize (waits for the cold Ghidra start)", first_call.seconds)
     assert not first_call.result.get("isError"), first_call.text()[:500]
-    for required in ("rea_open_binary", "rea_binary_overview", "gh_get_metadata", "gh_get_functions",
-                     "gh_search_tools", "gh_import_file", "gh_find_functions", "gh_load_tool_group"):
+    for required in ("rea_open_binary", "rea_binary_overview", "ghidra_get_metadata", "ghidra_get_functions",
+                     "ghidra_search_tools", "ghidra_import_file", "ghidra_find_functions", "ghidra_load_tool_group"):
         assert required in names, required
-    assert all(n.startswith(("rea_", "gh_")) for n in names), [n for n in names if not n.startswith(("rea_", "gh_"))]
+    assert all(n.startswith(("rea_", "ghidra_")) for n in names), [n for n in names if not n.startswith(("rea_", "ghidra_"))]
     assert all(NAME_RE.match(n) for n in names)
     assert len(names) == len(set(names))
     prompts = s.request("prompts/list", {}).result["prompts"]
@@ -79,7 +79,7 @@ def test_01_catalog():
     assert caps["tools"]["listChanged"] is True
     instructions = s.init_result["instructions"]
     assert s.session_id and tag_of(s.session_id) in instructions and str(STATE) in instructions
-    assert not {"gh_run_ghidra_script", "gh_run_script_inline"} & set(names)  # denied in aggregator.toml
+    assert not {"ghidra_run_ghidra_script", "ghidra_run_script_inline"} & set(names)  # denied in aggregator.toml
 
 
 def test_01b_official_sdk_client_interop():
@@ -97,11 +97,11 @@ def test_01b_official_sdk_client_interop():
                 async with ClientSession(read, write) as cs:
                     await cs.initialize()
                     tools = (await cs.list_tools()).tools
-                    result = await cs.call_tool("gh_list_open_programs", {})
+                    result = await cs.call_tool("ghidra_list_open_programs", {})
                     return [t.name for t in tools], result
 
     names, result = anyio.run(run)
-    assert "rea_open_binary" in names and "gh_get_metadata" in names
+    assert "rea_open_binary" in names and "ghidra_get_metadata" in names
     assert not result.is_error
 
 
@@ -126,33 +126,33 @@ def _json(call):
 
 def test_03_ghidra_mcp_flow(session):
     s = session()
-    imported = s.tool("gh_import_file", {"file_path": fixture_path("hello_stripped")})
-    record("03_ghidra_mcp_flow", "gh_import_file + auto-analysis", imported.seconds)
+    imported = s.tool("ghidra_import_file", {"file_path": fixture_path("hello_stripped")})
+    record("03_ghidra_mcp_flow", "ghidra_import_file + auto-analysis", imported.seconds)
     info = _json(imported)
     assert info.get("success"), info
     program = info["name"]
 
-    functions = _json(s.tool("gh_find_functions", {"program": program, "name_pattern": "FUN_", "limit": 200}))["functions"]
+    functions = _json(s.tool("ghidra_find_functions", {"program": program, "name_pattern": "FUN_", "limit": 200}))["functions"]
     assert functions
     compute = None
     for fn in functions:
-        code = _json(s.tool("gh_get_functions", {"program": program, "function": fn["address"],
-                                                  "fields": "decompiled_code"})).get("decompiled_code", "")
+        code = _json(s.tool("ghidra_get_functions", {"program": program, "function": fn["address"],
+                                                      "fields": "decompiled_code"})).get("decompiled_code", "")
         if any(m in code for m in COMPUTE_MARKERS):
             compute = fn
             break
     assert compute, "no stripped function decompiles to compute()"
 
-    renamed = _json(s.tool("gh_rename_function", {"program": program, "old_name": compute["address"],
-                                                   "new_name": "ComputeFixtureValue", "strict_mode": "off"}))
+    renamed = _json(s.tool("ghidra_rename_function", {"program": program, "old_name": compute["address"],
+                                                       "new_name": "ComputeFixtureValue", "strict_mode": "off"}))
     assert renamed.get("status") == "success" or renamed.get("success"), renamed
-    assert _json(s.tool("gh_save_program", {"program": program})).get("success")
-    assert _json(s.tool("gh_close_program", {"name": program, "save": True})).get("success", True)
+    assert _json(s.tool("ghidra_save_program", {"program": program})).get("success")
+    assert _json(s.tool("ghidra_close_program", {"name": program, "save": True})).get("success", True)
 
     # Reopen from the project database on disk.
-    reopened = _json(s.tool("gh_open_program", {"path": info["path"]}))
+    reopened = _json(s.tool("ghidra_open_program", {"path": info["path"]}))
     assert reopened.get("success"), reopened
-    found = _json(s.tool("gh_find_functions", {"program": program, "name_pattern": "ComputeFixtureValue"}))
+    found = _json(s.tool("ghidra_find_functions", {"program": program, "name_pattern": "ComputeFixtureValue"}))
     assert [f["address"] for f in found["functions"]] == [compute["address"]]
     assert (PROJECTS / "rebox.gpr").is_file() and (PROJECTS / "rebox.rep").is_dir()
 
@@ -163,8 +163,8 @@ def test_03_ghidra_mcp_flow(session):
 def test_04_lazy_groups(session):
     s = session(listen=True)
     before = set(s.tool_names())
-    assert "gh_get_comment" not in before, "comment group already loaded; lazy mode off?"
-    load = s.tool("gh_load_tool_group", {"group": "comment"})
+    assert "ghidra_get_comment" not in before, "comment group already loaded; lazy mode off?"
+    load = s.tool("ghidra_load_tool_group", {"group": "comment"})
     changed = [m for m in load.notifications if m.get("method") == "notifications/tools/list_changed"]
     deadline = time.monotonic() + 10
     while not changed and time.monotonic() < deadline:
@@ -174,11 +174,11 @@ def test_04_lazy_groups(session):
                 changed.append(m)
         except Exception:
             pass
-    assert changed, "no notifications/tools/list_changed after gh_load_tool_group"
+    assert changed, "no notifications/tools/list_changed after ghidra_load_tool_group"
     after = set(s.tool_names())
-    assert {"gh_get_comment", "gh_set_comment"} <= after - before
+    assert {"ghidra_get_comment", "ghidra_set_comment"} <= after - before
     # Routed to the bridge (a tool-level error about the missing program is fine; unknown tool is not).
-    call = s.request("tools/call", {"name": "gh_get_comment", "arguments": {"program": "nonexistent", "address": "0x0"}})
+    call = s.request("tools/call", {"name": "ghidra_get_comment", "arguments": {"program": "nonexistent", "address": "0x0"}})
     assert call.error is None, call.error
 
 
@@ -243,7 +243,7 @@ def test_07_cancellation(session):
     assert call is None or call.result is None, "cancelled request still produced a result"
     # The session survives: both children still answer.
     assert json.dumps(fixture_path("hello_debug")) in s.tool("rea_binary_session", {}).text()
-    assert not s.tool("gh_list_open_programs", {}).result.get("isError")
+    assert not s.tool("ghidra_list_open_programs", {}).result.get("isError")
 
 
 # --- 8. auth
@@ -326,13 +326,13 @@ def test_11_idle_stop_and_restart():
             time.sleep(0.25)
     assert health.status_code == 200 and health.json()["ghidra"] == "stopped", health.text
 
-    # A cold session: the catalog comes from the cache at once, and a gh_ call waits for Ghidra.
+    # A cold session: the catalog comes from the cache at once, and a ghidra_ call waits for Ghidra.
     s = Session(URL, TOKEN)
     try:
         s.initialize()
-        assert "gh_get_metadata" in s.tool_names()
-        opened = s.tool("gh_open_program", {"path": "/hello_stripped"})  # imported and saved by test_03
-        record("11_idle_stop", "first gh_ call of a cold session (restart included)", opened.seconds)
+        assert "ghidra_get_metadata" in s.tool_names()
+        opened = s.tool("ghidra_open_program", {"path": "/hello_stripped"})  # imported and saved by test_03
+        record("11_idle_stop", "first ghidra_ call of a cold session (restart included)", opened.seconds)
         assert _json(opened).get("success"), opened.text()[:500]
         assert ghidra_server_pids()
     finally:

@@ -5,7 +5,7 @@ One container for agent-driven reverse engineering: [Ghidra](https://github.com/
 [ghidra-mcp](https://github.com/bethington/ghidra-mcp), plus the Linux tools REA drives (rizin,
 gdb/pwndbg, pwntools, JADX, apktool, binwalk, unblob, tshark, sigrok, WABT, mitmproxy, Chrome for
 Testing), behind **one authenticated MCP endpoint** on port 8443. REA's tools and prompts are
-prefixed `rea_`, ghidra-mcp's `gh_`. Every MCP session gets its own REA and bridge processes; the
+prefixed `rea_`, ghidra-mcp's `ghidra_`. Every MCP session gets its own REA and bridge processes; the
 ghidra-mcp Ghidra project is shared and persistent.
 
 Image: `ghcr.io/lhns/re-box` (`latest` = `main`, `sha-<commit>`, `X.Y.Z` for release tags), linux/amd64, ~3.7 GB.
@@ -35,7 +35,7 @@ Mount the work dir at the **same absolute path** inside and out: tool arguments 
 paths, so the paths your agent already uses stay valid, and so do the paths re-box writes back.
 Pulling needs `docker login ghcr.io` while the package is private.
 
-Ghidra runs only while a session is open: the first session starts it (about 40 s; the `gh_` tools
+Ghidra runs only while a session is open: the first session starts it (about 40 s; the `ghidra_` tools
 call waits for it) and it stops 5 minutes after the last session closed
 (`REBOX_GHIDRA_IDLE_TIMEOUT`), so an idle container runs no Java.
 

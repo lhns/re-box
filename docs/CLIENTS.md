@@ -2,7 +2,7 @@
 
 re-box serves one MCP endpoint over streamable HTTP: `http(s)://<host>:8443/mcp`, with a static
 `Authorization: Bearer <REBOX_TOKEN>` header. REA's tools and prompts are prefixed `rea_`,
-ghidra-mcp's `gh_`. Any client that speaks streamable HTTP with a custom header works.
+ghidra-mcp's `ghidra_`. Any client that speaks streamable HTTP with a custom header works.
 
 Paths in tool arguments are paths **inside the container**. Mount your work directory at the
 same absolute path (`RE_WORKDIR`, docs/OPERATIONS.md) and the paths your harness sees are valid
@@ -60,16 +60,16 @@ REA reports progress every 10 s while Ghidra starts, so REA calls do not hit the
 ### Cold start
 
 Ghidra starts with the first session (about 40 s). No client support for `tools/list_changed` is
-needed: the full `gh_` catalog is in the first `tools/list` (from a cache in the state dir; the
-very first start of a new state dir fills it before answering `initialize`), and a `gh_` call made
+needed: the full `ghidra_` catalog is in the first `tools/list` (from a cache in the state dir; the
+very first start of a new state dir fills it before answering `initialize`), and a `ghidra_` call made
 while Ghidra starts waits for it, then runs. The wait is bounded by
 `REBOX_HEADLESS_START_TIMEOUT` (300 s); on timeout or a failed start (for example the project is
 locked by another container) the call returns a tool error naming the reason. re-box sends progress
 notifications meanwhile for calls that carry a progress token.
 
-Timeouts: a 59 MB `gh_import_file` hit ghidra-mcp's bridge timeout of 300 s for `import_file`
+Timeouts: a 59 MB `ghidra_import_file` hit ghidra-mcp's bridge timeout of 300 s for `import_file`
 (a fixed table in the bridge's `config.py`, not an environment variable); the tool reports an error
-but the import continues in the Ghidra server. Check with `gh_list_open_programs` / `gh_analysis_status`
+but the import continues in the Ghidra server. Check with `ghidra_list_open_programs` / `ghidra_analysis_status`
 before importing again.
 
 ### Session lifetime
@@ -138,4 +138,4 @@ Anything that does streamable HTTP with a static header: point it at `/mcp` with
   Ghidra database) does not survive that, by design: each session's REA process holds it. Before
   closing, the aggregator exports the session's REA evidence to
   `$REBOX_STATE_DIR/rea/evidence/` (docs/PERSISTENCE.md). Work that must last belongs in
-  ghidra-mcp's project (`gh_` tools), which is saved.
+  ghidra-mcp's project (`ghidra_` tools), which is saved.

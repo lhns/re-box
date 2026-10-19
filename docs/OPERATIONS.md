@@ -150,7 +150,7 @@ them. Measured on the test fixtures: see docs/BUILDING.md.
   exports its REA evidence and is closed, then the headless server saves again and exits. Give it
   time: `stop_grace_period: 120s` / `docker run --stop-timeout 120`; Docker's default is 10 s
   (docs/PERSISTENCE.md). A crashed headless server is restarted with
-  backoff while sessions exist; they survive, `gh_` calls fail until it is back.
+  backoff while sessions exist; they survive, `ghidra_` calls fail until it is back.
 - Clients that exit without ending their session (Claude Code `-p` does not send DELETE) keep it,
   and its REA Ghidra JVM, until `REBOX_SESSION_ORPHAN_TIMEOUT` (300 s; sessions with an open GET
   stream get the full `REBOX_SESSION_IDLE_TIMEOUT`); they count against `REBOX_MAX_SESSIONS` until

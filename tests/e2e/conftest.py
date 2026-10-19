@@ -33,8 +33,8 @@ def record(test: str, what: str, seconds: float) -> None:
 
 
 def assert_gh_listed(s: Session) -> None:
-    """The gh_ tools are in the first tools/list even when Ghidra is cold (catalog cache or held initialize)."""
-    assert "gh_get_metadata" in s.tool_names(), "no gh_ tools in the first tools/list"
+    """The ghidra_ tools are in the first tools/list even when Ghidra is cold (catalog cache or held initialize)."""
+    assert "ghidra_get_metadata" in s.tool_names(), "no ghidra_ tools in the first tools/list"
 
 
 _keeper: Session | None = None
@@ -60,7 +60,7 @@ def release_keeper() -> None:
 
 @pytest.fixture
 def session(request):
-    """An initialized MCP session with the gh_ tools available, deleted afterwards."""
+    """An initialized MCP session with the ghidra_ tools available, deleted afterwards."""
     opened: list[Session] = []
 
     def make(listen: bool = False) -> Session:
