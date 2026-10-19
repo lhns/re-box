@@ -3,7 +3,7 @@ re-box patch 0001: every program write takes the headless write lock.
 Upstream bethington/ghidra-mcp commit c30b7a7460ee0b62441665a3ab159ae60f08dd6b (on dev, not on
 release/7.0), unchanged: 21 tools opened their own transaction inside runOnUi or executeRead,
 skipping DirectThreadingStrategy's lock. With REA's bridge in the same JVM holding that lock
-around its edits, this closes the window where a gh_ comment or label write joined a REA
+around its edits, this closes the window where a ghidra_ comment or label write joined a REA
 transaction and was lost when it aborted. Drop when the pinned ghidra-mcp contains it.
 
 diff --git a/CHANGELOG.md b/CHANGELOG.md
