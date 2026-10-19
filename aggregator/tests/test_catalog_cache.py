@@ -63,6 +63,19 @@ def test_save_is_atomic_skips_equal_keeps_bigger_and_drops_other_keys(tmp_path):
     assert not list(cache_file(tmp_path, s2).parent.glob("*.tmp"))
 
 
+def test_concurrent_saves_leave_a_valid_file(tmp_path):
+    import threading
+    s = spec()
+    parts = [ChildCatalog(tools=[tool(f"t{i}_{j}") for j in range(10 + i)]) for i in range(8)]
+    threads = [threading.Thread(target=catalogcache.save, args=(str(tmp_path), s, p)) for p in parts]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert len(json.loads(cache_file(tmp_path).read_text())["tools"]) == 17  # the biggest one won
+    assert not list(cache_file(tmp_path).parent.glob("*.tmp"))
+
+
 def test_load_rejects_garbage(tmp_path):
     p = cache_file(tmp_path)
     p.parent.mkdir(parents=True)

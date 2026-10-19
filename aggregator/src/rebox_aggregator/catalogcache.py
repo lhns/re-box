@@ -7,6 +7,8 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,7 @@ from .config import ChildSpec
 from .log import log
 
 MAX_LINE = 64 * 1024 * 1024
+_save_lock = threading.Lock()  # sessions save from worker threads; compare-and-write must not interleave
 
 
 def resolve_key(spec: ChildSpec, environ: dict[str, str] | None = None) -> str:
@@ -60,6 +63,11 @@ def save(state_dir: str, spec: ChildSpec, part: ChildCatalog) -> bool:
         return False
     target = path_for(state_dir, spec)
     body = json.dumps(vars(part), separators=(",", ":"), ensure_ascii=False)
+    with _save_lock:
+        return _save(target, spec, part, body)
+
+
+def _save(target: Path, spec: ChildSpec, part: ChildCatalog, body: str) -> bool:
     try:
         if target.exists():
             old = target.read_text()
@@ -71,9 +79,14 @@ def save(state_dir: str, spec: ChildSpec, part: ChildCatalog) -> bool:
                 log("catalog_cache_kept", "warn", child=spec.name, tools=len(part.tools))
                 return False
         target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-        tmp.write_text(body)
-        os.replace(tmp, target)
+        fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(body)
+            os.replace(tmp, target)
+        except BaseException:
+            os.unlink(tmp)
+            raise
         for old in target.parent.glob(f"{spec.name}-*.json"):  # other keys: an older ghidra-mcp or setting
             if old != target:
                 old.unlink(missing_ok=True)
