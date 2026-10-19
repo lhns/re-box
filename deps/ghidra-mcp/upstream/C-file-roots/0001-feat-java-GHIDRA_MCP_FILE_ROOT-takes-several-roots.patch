@@ -1,0 +1,305 @@
+From 147d875c3468e34904e7d83d26b753a3df61145b Mon Sep 17 00:00:00 2001
+From: Pierre Kisters <pierrekisters@gmail.com>
+Date: Mon, 19 Oct 2026 18:06:39 +0000
+Subject: [PATCH] feat(java): GHIDRA_MCP_FILE_ROOT takes several roots
+
+The variable took one directory, so a server that must read from two
+places (an upload directory and a scratch directory that another tool
+writes into) had to widen the root to a common parent or drop it.
+
+It now takes a list separated by the platform path separator (":" on
+Linux and macOS, ";" on Windows). A path must fall under one entry,
+compared as whole path components after canonicalization, so /workshop
+is not under /work. One directory behaves as before; blank entries are
+ignored.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .env.template                                 |  1 +
+ CHANGELOG.md                                  |  9 +++
+ README.md                                     |  2 +-
+ docker/README.md                              |  2 +-
+ docs/prompts/TOOL_USAGE_GUIDE.md              |  2 +-
+ .../java/com/xebyte/core/SecurityConfig.java  | 67 +++++++++++-------
+ .../offline/SecurityConfigFileRootsTest.java  | 69 +++++++++++++++++++
+ 7 files changed, 125 insertions(+), 27 deletions(-)
+ mode change 100644 => 100755 .env.template
+ mode change 100644 => 100755 CHANGELOG.md
+ mode change 100644 => 100755 README.md
+ mode change 100644 => 100755 docker/README.md
+ mode change 100644 => 100755 docs/prompts/TOOL_USAGE_GUIDE.md
+ mode change 100644 => 100755 src/main/java/com/xebyte/core/SecurityConfig.java
+ create mode 100755 src/test/java/com/xebyte/offline/SecurityConfigFileRootsTest.java
+
+diff --git a/.env.template b/.env.template
+old mode 100644
+new mode 100755
+index 937cc70..3d87fe6
+--- a/.env.template
++++ b/.env.template
+@@ -70,6 +70,7 @@ GHIDRA_MCP_ALLOW_SCRIPTS=
+ # Confine filesystem-path endpoints (import_file, import_program, export_program,
+ # archive_project, restore_project) to a directory.
+ # Paths are canonicalized and must resolve under this root. Unset = accept any.
++# Several roots: separate them with the platform path separator (":" on Linux/macOS, ";" on Windows).
+ GHIDRA_MCP_FILE_ROOT=
+ # Confine project-domain endpoints (open/delete/create) to a project folder
+ # prefix, e.g. /MyFolder/Subfolder. Unset = whole project in scope.
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+old mode 100644
+new mode 100755
+index 841a9fb..01f3e89
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,15 @@ Complete version history for the Ghidra MCP Server project.
+ 
+ Changes on `dev` after 7.0.0.
+ 
++### Changed — `GHIDRA_MCP_FILE_ROOT` accepts several roots
++
++The variable took one directory, so a server that must read from two places (an upload
++directory and a scratch directory a tool writes into) had to widen the root to a common parent
++or drop it. It now takes a list separated by the platform path separator (`:` on Linux and
++macOS, `;` on Windows); a path must fall under one entry, compared as whole path components
++after canonicalization (`/workshop` is not under `/work`). A single directory behaves as
++before, and blank entries are ignored.
++
+ ### Performance — `get_functions` opens one decompiler per call (#575)
+ 
+ Every decompile in a `get_functions` call -- each target and each caller decompiled for
+diff --git a/README.md b/README.md
+old mode 100644
+new mode 100755
+index 5b9b150..eca873e
+--- a/README.md
++++ b/README.md
+@@ -719,7 +719,7 @@ GhidraMCP is designed for **localhost-only development**. The default configurat
+ | --- | --- |
+ | `GHIDRA_MCP_AUTH_TOKEN` | When set, every HTTP request must carry `Authorization: Bearer <token>`. Timing-safe comparison. `/mcp/health` and `/check_connection` are exempt. |
+ | `GHIDRA_MCP_ALLOW_SCRIPTS` | Set to `1`, `true`, or `yes` to enable `/run_script_inline` and `/run_ghidra_script`. **Off by default as of v5.4.1** — these endpoints execute arbitrary Java against the Ghidra process. In headless mode this also triggers OSGi `BundleHost` initialization at server startup (Felix framework, ~hundreds of ms); leave it off if you don't need script execution. |
+-| `GHIDRA_MCP_FILE_ROOT` | When set to a directory path, filesystem-path endpoints (`/import_file`, `/open_project`, `/delete_file`, etc.) canonicalize the input and require it to fall under this root. Prevents path-traversal. |
++| `GHIDRA_MCP_FILE_ROOT` | When set to a directory path, filesystem-path endpoints (`/import_file`, `/open_project`, `/delete_file`, etc.) canonicalize the input and require it to fall under this root. Several roots may be given, separated by the platform path separator (`:` on Linux and macOS, `;` on Windows). Prevents path-traversal. |
+ 
+ Name-quality enforcement is separate from security. By default,
+ `rename_function` and global write endpoints reject names that fail
+diff --git a/docker/README.md b/docker/README.md
+old mode 100644
+new mode 100755
+index 5044915..6000073
+--- a/docker/README.md
++++ b/docker/README.md
+@@ -126,7 +126,7 @@ mvn clean package -P docker -DskipTests
+ | `GHIDRA_MCP_PORT` | `8089` | HTTP server port |
+ | `GHIDRA_MCP_BIND_ADDRESS` | `0.0.0.0` | Bind address |
+ | `GHIDRA_MCP_ALLOW_SCRIPTS` | unset | `1` enables `/run_script_inline` and `/run_ghidra_script` (arbitrary code) |
+-| `GHIDRA_MCP_FILE_ROOT` | unset | Confine filesystem-path endpoints such as `/import_file` to this directory |
++| `GHIDRA_MCP_FILE_ROOT` | unset | Confine filesystem-path endpoints such as `/import_file` to this directory; several roots separated by `:` |
+ | `JAVA_OPTS` | `-Xmx4g -XX:+UseG1GC` | JVM options |
+ | `PROGRAM_FILE` | - | Path to binary file to load on startup |
+ | `PROJECT_PATH` | - | Path to Ghidra project directory |
+diff --git a/docs/prompts/TOOL_USAGE_GUIDE.md b/docs/prompts/TOOL_USAGE_GUIDE.md
+old mode 100644
+new mode 100755
+index a3be113..e77f775
+--- a/docs/prompts/TOOL_USAGE_GUIDE.md
++++ b/docs/prompts/TOOL_USAGE_GUIDE.md
+@@ -646,7 +646,7 @@ GhidraMCP defaults to localhost-unauthenticated — safe on a single-user dev bo
+ | --- | --- |
+ | `GHIDRA_MCP_AUTH_TOKEN` | When set, every HTTP request must carry `Authorization: Bearer <token>`. Timing-safe comparison. `/mcp/health` and `/check_connection` are always exempt. |
+ | `GHIDRA_MCP_ALLOW_SCRIPTS` | Set to `1`, `true`, or `yes` to enable `/run_script_inline` and `/run_ghidra_script`. **Off by default as of v5.4.1** (breaking change — these endpoints execute arbitrary Java against the Ghidra process). |
+-| `GHIDRA_MCP_FILE_ROOT` | When set, filesystem-path endpoints (`/import_file`, `/open_project`, `/delete_file`, etc.) canonicalize the input and require it to fall under this root. |
++| `GHIDRA_MCP_FILE_ROOT` | When set, filesystem-path endpoints (`/import_file`, `/open_project`, `/delete_file`, etc.) canonicalize the input and require it to fall under this root (or one of several, separated by `:` on Linux/macOS, `;` on Windows). |
+ 
+ The headless server refuses to start on a non-loopback bind address (`0.0.0.0`, explicit external IP) unless `GHIDRA_MCP_AUTH_TOKEN` is set.
+ 
+diff --git a/src/main/java/com/xebyte/core/SecurityConfig.java b/src/main/java/com/xebyte/core/SecurityConfig.java
+old mode 100644
+new mode 100755
+index ca2799e..2782d06
+--- a/src/main/java/com/xebyte/core/SecurityConfig.java
++++ b/src/main/java/com/xebyte/core/SecurityConfig.java
+@@ -5,6 +5,8 @@ import java.io.IOException;
+ import java.nio.charset.StandardCharsets;
+ import java.nio.file.Path;
+ import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.List;
+ 
+ /**
+  * Read-once, thread-safe snapshot of security-relevant environment variables.
+@@ -31,7 +33,8 @@ import java.nio.file.Paths;
+  *       {@link #resolveWithinFileRoot(String)}) and require that the resolved path fall
+  *       under this root, preventing path traversal. This applies to {@code /import_file}
+  *       (and the headless import path). When unset, paths are accepted as-is (pre-v5.4.1
+- *       behavior).
++ *       behavior). Several roots may be given, separated by the platform path separator
++ *       ({@code :} on Linux and macOS, {@code ;} on Windows); a path must fall under one of them.
+  *       <p>{@code /open_project} takes a filesystem path too (a {@code .gpr} or project
+  *       directory), so it is contained the same way on both servers; a {@code ghidra://}
+  *       URL names a server repository and is not a path. {@code /delete_file} operates
+@@ -79,7 +82,7 @@ public final class SecurityConfig {
+     private final byte[] tokenBytes;     // null if auth disabled
+     private final boolean scriptsAllowed;
+     private final String fileRoot;       // null if disabled
+-    private final Path fileRootCanonical;
++    private final List<Path> fileRootsCanonical; // empty if disabled
+     private volatile String projectFolderScope; // null = no enforcement (default)
+ 
+     private SecurityConfig() {
+@@ -95,19 +98,8 @@ public final class SecurityConfig {
+                     || rawScripts.equalsIgnoreCase("yes"));
+ 
+         String rawRoot = System.getenv("GHIDRA_MCP_FILE_ROOT");
+-        if (rawRoot != null && !rawRoot.isEmpty()) {
+-            this.fileRoot = rawRoot;
+-            Path p;
+-            try {
+-                p = new File(rawRoot).getCanonicalFile().toPath();
+-            } catch (IOException e) {
+-                p = Paths.get(rawRoot).toAbsolutePath().normalize();
+-            }
+-            this.fileRootCanonical = p;
+-        } else {
+-            this.fileRoot = null;
+-            this.fileRootCanonical = null;
+-        }
++        this.fileRootsCanonical = canonicalRoots(rawRoot);
++        this.fileRoot = fileRootsCanonical.isEmpty() ? null : rawRoot;
+ 
+         // Project-folder scope guard. When set, FrontEndProgramProvider
+         // refuses to return Programs whose DomainFile path falls outside
+@@ -231,23 +223,50 @@ public final class SecurityConfig {
+     }
+ 
+     /**
+-     * Canonicalize {@code userPath} and verify it falls under
++     * Canonicalize {@code userPath} and verify it falls under one of the roots in
+      * {@link #getFileRoot()}. When no file root is configured this returns the
+      * path as-is (pre-v5.4.1 behavior). Returns {@code null} when a root is
+-     * configured and the path escapes it.
++     * configured and the path escapes all of them.
+      */
+     public Path resolveWithinFileRoot(String userPath) {
+         if (userPath == null) return null;
+-        Path requested;
++        Path requested = canonical(userPath);
++        if (fileRootsCanonical.isEmpty()) {
++            return requested;  // no allow-list configured
++        }
++        return underAny(requested, fileRootsCanonical) ? requested : null;
++    }
++
++    /**
++     * Canonical forms of a list separated by {@link File#pathSeparator}; blank entries are
++     * skipped, so an unset or empty value yields an empty list.
++     */
++    public static List<Path> canonicalRoots(String raw) {
++        List<Path> roots = new ArrayList<>();
++        if (raw != null) {
++            for (String part : raw.split(java.util.regex.Pattern.quote(File.pathSeparator))) {
++                if (!part.isBlank()) {
++                    roots.add(canonical(part.trim()));
++                }
++            }
++        }
++        return List.copyOf(roots);
++    }
++
++    /** Whether {@code path} lies under one of {@code roots} (whole path components, so /workshop is not under /work). */
++    public static boolean underAny(Path path, List<Path> roots) {
++        for (Path root : roots) {
++            if (path.startsWith(root)) return true;
++        }
++        return false;
++    }
++
++    private static Path canonical(String path) {
+         try {
+-            requested = new File(userPath).getCanonicalFile().toPath();
++            return new File(path).getCanonicalFile().toPath();
+         } catch (IOException e) {
+-            requested = Paths.get(userPath).toAbsolutePath().normalize();
+-        }
+-        if (fileRootCanonical == null) {
+-            return requested;  // no allow-list configured
++            return Paths.get(path).toAbsolutePath().normalize();
+         }
+-        return requested.startsWith(fileRootCanonical) ? requested : null;
+     }
+ 
+     /**
+diff --git a/src/test/java/com/xebyte/offline/SecurityConfigFileRootsTest.java b/src/test/java/com/xebyte/offline/SecurityConfigFileRootsTest.java
+new file mode 100755
+index 0000000..c25fcfa
+--- /dev/null
++++ b/src/test/java/com/xebyte/offline/SecurityConfigFileRootsTest.java
+@@ -0,0 +1,69 @@
++package com.xebyte.offline;
++
++import com.xebyte.core.SecurityConfig;
++import org.junit.Test;
++
++import java.io.File;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.util.List;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
++
++/**
++ * {@code GHIDRA_MCP_FILE_ROOT} takes several roots, separated by the platform path
++ * separator. The singleton reads the environment once, so the parsing and the containment
++ * rule are tested through their static helpers, which {@code resolveWithinFileRoot} calls.
++ */
++public class SecurityConfigFileRootsTest {
++
++    @Test
++    public void rootsAreSplitOnThePathSeparatorAndBlanksAreSkipped() throws Exception {
++        Path a = Files.createTempDirectory("root-a");
++        Path b = Files.createTempDirectory("root-b");
++        String raw = a + File.pathSeparator + " " + File.pathSeparator + b + File.pathSeparator;
++
++        List<Path> roots = SecurityConfig.canonicalRoots(raw);
++
++        assertEquals(List.of(a.toRealPath(), b.toRealPath()), roots);
++        assertTrue(SecurityConfig.canonicalRoots(null).isEmpty());
++        assertTrue(SecurityConfig.canonicalRoots("").isEmpty());
++        assertTrue(SecurityConfig.canonicalRoots(File.pathSeparator).isEmpty());
++    }
++
++    @Test
++    public void aPathMustLieUnderOneOfTheRoots() throws Exception {
++        Path a = Files.createTempDirectory("root-a").toRealPath();
++        Path b = Files.createTempDirectory("root-b").toRealPath();
++        List<Path> roots = SecurityConfig.canonicalRoots(a + File.pathSeparator + b);
++
++        assertTrue(SecurityConfig.underAny(a.resolve("x/fw.bin"), roots));
++        assertTrue(SecurityConfig.underAny(b.resolve("target.bin"), roots));
++        assertTrue("a root itself is allowed", SecurityConfig.underAny(a, roots));
++        assertFalse(SecurityConfig.underAny(a.getParent().resolve("elsewhere"), roots));
++        assertFalse("no roots, nothing matches", SecurityConfig.underAny(a, List.of()));
++    }
++
++    @Test
++    public void aSiblingWithTheSamePrefixIsNotUnderTheRoot() throws Exception {
++        Path parent = Files.createTempDirectory("roots");
++        Path work = Files.createDirectory(parent.resolve("work")).toRealPath();
++        Path workshop = Files.createDirectory(parent.resolve("workshop")).toRealPath();
++        List<Path> roots = SecurityConfig.canonicalRoots(work.toString());
++
++        assertFalse(SecurityConfig.underAny(workshop.resolve("a"), roots));
++    }
++
++    @Test
++    public void aRootWrittenWithDotDotIsTheRealDirectory() throws Exception {
++        Path parent = Files.createTempDirectory("roots");
++        Path work = Files.createDirectory(parent.resolve("work")).toRealPath();
++        Files.createDirectory(parent.resolve("secret"));
++        // canonicalRoots canonicalizes its entries, so a root written with ".." is the real directory
++        List<Path> roots = SecurityConfig.canonicalRoots(work + "/../work");
++
++        assertEquals(List.of(work), roots);
++    }
++}

@@ -1,0 +1,136 @@
+From 4589c9f272c4980064ea9d5161a2ddd074c6fa21 Mon Sep 17 00:00:00 2001
+From: Pierre Kisters <pierrekisters@gmail.com>
+Date: Mon, 19 Oct 2026 18:07:44 +0000
+Subject: [PATCH] feat(java): DirectThreadingStrategy.writeLock(), one write
+ lock per JVM
+
+c30b7a74 made every program write hold the strategy's lock for its
+transaction. The lock was a field of each instance, so code that edits a
+served program from outside the request path (a script running a
+long-lived service, an embedded tool) had no lock to take. Ghidra merges
+concurrent transactions into one, so an edit that aborts discards the
+other side's work.
+
+The lock is now one per JVM and writeLock() returns it. The server's own
+reads and writes behave as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CHANGELOG.md                                  | 10 +++++
+ .../headless/DirectThreadingStrategy.java     | 16 +++++++-
+ .../offline/DirectThreadingStrategyTest.java  | 41 +++++++++++++++++++
+ 3 files changed, 66 insertions(+), 1 deletion(-)
+ mode change 100644 => 100755 src/main/java/com/xebyte/headless/DirectThreadingStrategy.java
+ mode change 100644 => 100755 src/test/java/com/xebyte/offline/DirectThreadingStrategyTest.java
+
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 841a9fb..b92bed5 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -8,6 +8,16 @@ Complete version history for the Ghidra MCP Server project.
+ 
+ Changes on `dev` after 7.0.0.
+ 
++### Added — `DirectThreadingStrategy.writeLock()`: one write lock per JVM
++
++Since c30b7a74 every program write on the headless server holds the strategy's lock for its
++whole transaction. The lock was a field of each `DirectThreadingStrategy`, so code that edits a
++served program from outside the request path (a script running a long-lived service, an
++embedded tool) had no lock to take: Ghidra merges concurrent transactions into one, and an edit
++that aborts discards the other side's work. The lock is now one per JVM and
++`DirectThreadingStrategy.writeLock()` returns it. Behaviour of the server's own writes and
++reads is unchanged.
++
+ ### Performance — `get_functions` opens one decompiler per call (#575)
+ 
+ Every decompile in a `get_functions` call -- each target and each caller decompiled for
+diff --git a/src/main/java/com/xebyte/headless/DirectThreadingStrategy.java b/src/main/java/com/xebyte/headless/DirectThreadingStrategy.java
+old mode 100644
+new mode 100755
+index d30c69f..367c2b5
+--- a/src/main/java/com/xebyte/headless/DirectThreadingStrategy.java
++++ b/src/main/java/com/xebyte/headless/DirectThreadingStrategy.java
+@@ -32,7 +32,21 @@ import java.util.concurrent.locks.ReentrantLock;
+  */
+ public class DirectThreadingStrategy implements ThreadingStrategy {
+ 
+-    private final ReentrantLock globalLock = new ReentrantLock();
++    // One per JVM, not per instance: code outside the request path that edits a program the
++    // server serves (a script running a long-lived service, an embedded tool) must serialize
++    // with the server's writes, and only a JVM-wide lock is reachable from there.
++    private static final ReentrantLock GLOBAL_LOCK = new ReentrantLock();
++    private final ReentrantLock globalLock = GLOBAL_LOCK;
++
++    /**
++     * The lock every {@link #executeWrite} holds for its whole transaction (and
++     * {@link #executeRead} for its call). Hold it around a transaction of your own on a
++     * program this server serves: Ghidra merges concurrent transactions into one, so an
++     * aborted edit would otherwise discard a concurrent request's work.
++     */
++    public static ReentrantLock writeLock() {
++        return GLOBAL_LOCK;
++    }
+ 
+     @Override
+     public <T> T executeRead(Callable<T> action) throws Exception {
+diff --git a/src/test/java/com/xebyte/offline/DirectThreadingStrategyTest.java b/src/test/java/com/xebyte/offline/DirectThreadingStrategyTest.java
+old mode 100644
+new mode 100755
+index 21874f5..90f2ab8
+--- a/src/test/java/com/xebyte/offline/DirectThreadingStrategyTest.java
++++ b/src/test/java/com/xebyte/offline/DirectThreadingStrategyTest.java
+@@ -6,8 +6,11 @@ import org.junit.Test;
+ 
+ import java.util.concurrent.CompletableFuture;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.TimeoutException;
+ 
+ import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertFalse;
++import static org.junit.Assert.assertTrue;
+ import static org.junit.Assert.fail;
+ import static org.mockito.ArgumentMatchers.anyBoolean;
+ import static org.mockito.ArgumentMatchers.anyInt;
+@@ -51,4 +54,42 @@ public class DirectThreadingStrategyTest {
+         });
+         assertEquals("written", second.get(5, TimeUnit.SECONDS));
+     }
++
++    /**
++     * Code that edits a served program outside the request path (a script, an embedded
++     * tool) can only reach a lock that is the same for every strategy instance in the JVM.
++     */
++    @Test
++    public void everyStrategyInstanceWritesUnderTheOneJvmWideLock() throws Exception {
++        DirectThreadingStrategy first = new DirectThreadingStrategy();
++        DirectThreadingStrategy second = new DirectThreadingStrategy();
++        Program one = mock(Program.class);
++        when(one.startTransaction(anyString())).thenReturn(1);
++        Program two = mock(Program.class);
++        when(two.startTransaction(anyString())).thenReturn(2);
++
++        CompletableFuture<String> other = new CompletableFuture<>();
++        first.executeWrite(one, "first", () -> {
++            assertTrue(DirectThreadingStrategy.writeLock().isHeldByCurrentThread());
++            CompletableFuture.supplyAsync(() -> {
++                try {
++                    return second.executeWrite(two, "second", () -> "written");
++                } catch (Exception e) {
++                    throw new RuntimeException(e);
++                }
++            }).whenComplete((v, e) -> {
++                if (e != null) other.completeExceptionally(e); else other.complete(v);
++            });
++            try {
++                other.get(300, TimeUnit.MILLISECONDS);
++                fail("a write on another instance must wait for the first one's transaction");
++            } catch (TimeoutException expected) {
++                // still blocked, as it must be
++            }
++            return null;
++        });
++
++        assertEquals("written", other.get(5, TimeUnit.SECONDS));
++        assertFalse(DirectThreadingStrategy.writeLock().isLocked());
++    }
+ }
