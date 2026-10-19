@@ -303,6 +303,11 @@ Rejected:
   transaction is open (it releases the lock while it waits, at most 60 s). Still open: gh_
   comment and label writes take no lock in headless mode, so one that starts during a REA edit
   joins it and is lost if that edit aborts (duplicate or invalid name, cancel).
+- A REA session caches its program's function, name and string inventories when it first needs
+  them; names it reads live (a gh_ rename shows at once), but functions, labels or strings that
+  other sessions create later appear in an open REA session only after it reopens the binary.
+- Concurrent attaches in one JVM collide on Ghidra's script-bundle file lock (meant for separate
+  JVMs: `OverlappingFileLockException`); the helper retries until the other's build is done.
 - Memory: REA's programs live in the shared heap (`JAVA_OPTS`, now `-Xmx8g`); a session costs
   about 0.5 GiB outside it (rea node, helper, bridge). `GHIDRA_HEADLESS_MAXMEM` applies only to
   targets in REA's own JVM.

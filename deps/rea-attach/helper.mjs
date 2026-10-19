@@ -75,7 +75,12 @@ for (;;) {
 // script refuses it when its bytes differ from REA's target, and the target then goes to a
 // folder of its own. The only place that knows how ghidra-mcp imports.
 const importTarget = async (folder) => {
-	const imported = await call("/import_file", { file_path: target, project_folder: folder, auto_analyze: true });
+	const body = { file_path: target, project_folder: folder, auto_analyze: true };
+	// Two sessions importing the same new file at once: one wins, the other then reuses it.
+	const imported = await call("/import_file", body).catch(async () => {
+		await sleep(2000);
+		return call("/import_file", body);
+	});
 	const program = imported.path;
 	if (imported.reused_existing) {
 		const status = await call(`/analysis_status?program=${encodeURIComponent(program)}`);
@@ -87,13 +92,23 @@ const importTarget = async (folder) => {
 
 const attach = async (folder) => {
 	const program = await importTarget(folder);
-	await call("/run_ghidra_script", {
+	const body = {
 		script_name: hostScript,
 		args: [descriptorPath, bridgeDir, process.pid, scriptLog, descriptor.run_id, descriptor.target_sha256].join(" "),
 		program,
 		timeout_seconds: 1800,
-	});
-	return program;
+	};
+	// Ghidra guards script bundle builds with a file lock meant for separate JVMs: two sessions
+	// attaching at once in this one JVM get OverlappingFileLockException. Take turns.
+	for (let attempt = 1; ; attempt++) {
+		try {
+			await call("/run_ghidra_script", body);
+			return program;
+		} catch (e) {
+			if (!e.message.includes("OverlappingFileLockException") || attempt >= 30) throw e;
+			await sleep(500 + Math.random() * 1000);
+		}
+	}
 };
 
 let program;

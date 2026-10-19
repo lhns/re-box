@@ -377,16 +377,16 @@ class Headless:
                 tg.cancel_scope.cancel()
             self._healthy = False
             self._kill_group(proc, signal.SIGKILL)  # stragglers of the old JVM's group
-            # REA bridges served from that JVM are gone; their helpers would notice within seconds,
-            # killing them now makes REA report it at once (reopen the binary to attach again).
-            await anyio.to_thread.run_sync(kill_by_command, self.instance, ATTACH_HELPER)
             if self._stopping:
                 return
-            if self._idle_stopped:
+            if self._idle_stopped:  # no sessions, so no REA helpers either
                 self._idle_stopped = False
                 self._set("stopped")
                 backoff = 5.0
                 continue
+            # A crash: the REA bridges it served are gone. Their helpers would notice within seconds;
+            # killing them now makes REA report it at once (reopen the binary to attach again).
+            await anyio.to_thread.run_sync(kill_by_command, self.instance, ATTACH_HELPER)
             log("headless_exit", "error", exit_code=proc.returncode)
             if time.monotonic() - started > 60:
                 backoff = 5.0
