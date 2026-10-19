@@ -164,10 +164,21 @@ def test_concurrent_rea_sessions_share_one_program(session):
     programs = jtext(ok(a.tool("gh_list_open_programs", {})))["programs"]
     assert [p["path"] for p in programs if p["name"].startswith("shared_debug")] == ["/shared_debug"], programs
     ok(a.tool("rea_annotate_native_function", {"procedure": "compute", "name": "SharedCompute"}))
-    # Same program for all: a new session sees a's rename. (b does not, even after reopening: REA
-    # caches what it read for the life of its process; DECISIONS.md.)
-    c = session()
-    ok(c.tool("rea_open_binary", {"path": target, "provider_id": "ghidra"}))
-    ok(c.tool("rea_analyze_function", {"procedure": "SharedCompute"}))
-    for s in (a, b, c):
+    # One program: b, still open since before, sees a's rename at once.
+    ok(b.tool("rea_analyze_function", {"procedure": "SharedCompute"}))
+    for s in (a, b):
         ok(s.tool("rea_close_binary", {}))
+
+
+def test_rea_sees_a_gh_rename_without_reopening(session):
+    target = copy_fixture("hello_debug", "attach/live_debug")
+    s = session()
+    ok(s.tool("rea_open_binary", {"path": target, "provider_id": "ghidra"}))
+    ok(s.tool("rea_analyze_function", {"procedure": "compute"}))
+    before = ok(s.tool("rea_list_procedures", {})).text()
+    assert "compute" in before and "GhRenamedCompute" not in before
+    ok(s.tool("gh_rename_function", {"program": "live_debug", "old_name": "compute",
+                                     "new_name": "GhRenamedCompute", "strict_mode": "off"}))
+    assert "GhRenamedCompute" in ok(s.tool("rea_list_procedures", {})).text()
+    ok(s.tool("rea_analyze_function", {"procedure": "GhRenamedCompute"}))
+    ok(s.tool("rea_close_binary", {}))

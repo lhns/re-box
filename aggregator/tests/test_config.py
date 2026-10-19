@@ -59,6 +59,8 @@ def test_autosave_parsed(tmp_path):
     '[child.autosave]\ntool = ""\n',
     '[child.autosave]\narguments = {}\n',
     '[child.autosave]\ntool = "x"\narguments = "no"\n',
+    '[child.autosave]\ntool = "x"\nbefore_tools = "close"\n',
+    '[child.autosave]\ntool = "x"\nbefore_tools = [""]\n',
 ])
 def test_bad_autosave(tmp_path, bad):
     with pytest.raises(ConfigError, match="autosave"):
@@ -71,6 +73,7 @@ def test_shipped_config_has_rea_autosave():
     repo = Path(__file__).parents[2] / "rootfs/etc/rebox/aggregator.toml"  # in the image: the installed copy
     specs = {s.name: s for s in load_children(str(repo if repo.exists() else "/etc/rebox/aggregator.toml"))}
     assert specs["rea"].autosave.tool == "export_evidence_bundle" and specs["ghidra"].autosave is None
+    assert specs["rea"].autosave.before_tools == ("close_binary",)  # it clears REA's evidence
 
 
 def test_autosave_settings(tmp_path):

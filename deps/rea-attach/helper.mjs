@@ -37,12 +37,14 @@ const descriptor = JSON.parse(readFileSync(descriptorPath, "utf8"));
 if (!scriptLog || /\s/u.test(descriptorPath + scriptLog + bridgeDir))
 	die("the descriptor, script log and bridge paths must be set and contain no whitespace");
 
-// A per-target lock shared by every helper of this container (same uid). TMPDIR is REA's private
-// per-session directory here, so the lock lives at a fixed path. A lock whose holder died is taken over.
+// A lock per program name, shared by every helper of this container (same uid): the project
+// folder is shared by name, so two files of the same name collide too. TMPDIR is REA's private
+// per-session directory here, so the locks live at a fixed path. A lock whose holder died is
+// taken over.
 const LOCKS = "/tmp/rebox-attach-locks";
-const lockTarget = async (sha256) => {
+const lockName = async (name) => {
 	mkdirSync(LOCKS, { recursive: true, mode: 0o700 });
-	const path = join(LOCKS, `${sha256}.lock`);
+	const path = join(LOCKS, `${encodeURIComponent(name)}.lock`);
 	for (;;) {
 		try {
 			writeFileSync(path, String(process.pid), { flag: "wx" });
@@ -102,8 +104,8 @@ const importTarget = async (folder) => {
 	const body = { file_path: target, project_folder: folder, auto_analyze: true };
 	// import_file checks for an existing program, then imports: two sessions opening the same new
 	// file at once both import it, and Ghidra saves the second as "<name>.0", a separate program
-	// (seen in CI: one session's rename landed in the copy). Take turns per target.
-	const release = await lockTarget(descriptor.target_sha256);
+	// (seen in CI: one session's rename landed in the copy). Take turns per name.
+	const release = await lockName(basename(target));
 	let imported;
 	try {
 		imported = await call("/import_file", body);

@@ -43,6 +43,7 @@ class Autosave:
     tool: str  # the child's own (unprefixed) tool name
     arguments: Mapping[str, Any] = field(default_factory=dict)  # {state_dir} and {session} are substituted
     prune_empty: bool = False  # after a save, delete arguments.path when it is an evidence bundle with no content
+    before_tools: tuple[str, ...] = ()  # the child's tools that drop its work: save first (e.g. REA's close_binary)
 
 
 @dataclass(frozen=True)
@@ -82,7 +83,10 @@ def _autosave(name: str, raw: Any) -> Autosave | None:
     args = raw.get("arguments", {}) if isinstance(raw, dict) else None
     if not (isinstance(tool, str) and tool) or not isinstance(args, dict):
         raise ConfigError(f"child {name}: autosave needs a non-empty tool name and an arguments table")
-    return Autosave(tool, dict(args), bool(raw.get("prune_empty", False)))
+    before = raw.get("before_tools", [])
+    if not (isinstance(before, list) and all(isinstance(t, str) and t for t in before)):
+        raise ConfigError(f"child {name}: autosave.before_tools must be a list of tool names")
+    return Autosave(tool, dict(args), bool(raw.get("prune_empty", False)), tuple(before))
 
 
 def _catalog_cache(name: str, raw: Any) -> CatalogCacheSpec | None:
