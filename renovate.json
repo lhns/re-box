@@ -58,6 +58,18 @@
         "rea-agents"
       ],
       "automerge": false
+    },
+    {
+      "description": "REA admits exactly these versions (third_party/*/README.md, src/android/JadxRelease.ts in rea-agents); bump them only when a new REA release names new ones.",
+      "matchDepNames": [
+        "1013503897/jadx-headless-mcp",
+        "WebAssembly/wabt",
+        "pwndbg/pwndbg",
+        "pwntools",
+        "pyelftools",
+        "unicorn"
+      ],
+      "enabled": false
     }
   ],
   "customDatasources": {
