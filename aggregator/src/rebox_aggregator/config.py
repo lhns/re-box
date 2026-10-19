@@ -30,10 +30,15 @@ class ChildSpec:
 _ENV_REF = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
+def fill_in(text: str, values: Mapping[str, str]) -> str:
+    """{NAME} in `text` replaced by values[NAME]; an unknown name becomes empty."""
+    return _ENV_REF.sub(lambda m: values.get(m.group(1), ""), text)
+
+
 def child_env(spec: ChildSpec, environ: Mapping[str, str]) -> dict[str, str]:
     """The child's [child.env] with {NAME} filled in from `environ` (the supervisor's own environment,
-    REBOX_* included); an unknown name becomes empty."""
-    return {k: _ENV_REF.sub(lambda m: environ.get(m.group(1), ""), v) for k, v in spec.env.items()}
+    REBOX_* included)."""
+    return {k: fill_in(v, environ) for k, v in spec.env.items()}
 
 
 def service_env(environ: Mapping[str, str] = os.environ) -> dict[str, str]:
@@ -93,19 +98,28 @@ class Settings:
     orphan_timeout: float = 300.0  # idle limit of a session with no open GET stream; 0: same as idle_timeout
     evict_min_idle: float = 120.0  # at the session cap, sessions idle at least this long may be evicted
     progress_keepalive: float = 30.0  # synthetic progress for quiet requests with a progressToken; 0: off
+    # [session] texts of the TOML config, see load_texts.
+    instructions: str = ""
+    backend_failed: str = "The backend is {state}: {reason}. Try again later."
+    backend_starting: str = "The backend is still starting after {seconds} s. Try again later."
+
+
+def _tool_call(name: str, table: str, raw: Any) -> tuple[str, dict]:
+    tool = raw.get("tool") if isinstance(raw, dict) else None
+    args = raw.get("arguments", {}) if isinstance(raw, dict) else None
+    if not (isinstance(tool, str) and tool) or not isinstance(args, dict):
+        raise ConfigError(f"child {name}: {table} needs a non-empty tool name and an arguments table")
+    return tool, dict(args)
 
 
 def _autosave(name: str, raw: Any) -> Autosave | None:
     if raw is None:
         return None
-    tool = raw.get("tool") if isinstance(raw, dict) else None
-    args = raw.get("arguments", {}) if isinstance(raw, dict) else None
-    if not (isinstance(tool, str) and tool) or not isinstance(args, dict):
-        raise ConfigError(f"child {name}: autosave needs a non-empty tool name and an arguments table")
+    tool, args = _tool_call(name, "autosave", raw)
     before = raw.get("before_tools", [])
     if not (isinstance(before, list) and all(isinstance(t, str) and t for t in before)):
         raise ConfigError(f"child {name}: autosave.before_tools must be a list of tool names")
-    return Autosave(tool, dict(args), bool(raw.get("prune_empty", False)), tuple(before))
+    return Autosave(tool, args, bool(raw.get("prune_empty", False)), tuple(before))
 
 
 def _catalog_cache(name: str, raw: Any) -> CatalogCacheSpec | None:
@@ -118,21 +132,34 @@ def _catalog_cache(name: str, raw: Any) -> CatalogCacheSpec | None:
 
 
 def _on_ready(name: str, raw: Any) -> OnReady | None:
-    if raw is None:
-        return None
-    tool = raw.get("tool") if isinstance(raw, dict) else None
-    args = raw.get("arguments", {}) if isinstance(raw, dict) else None
-    if not (isinstance(tool, str) and tool) or not isinstance(args, dict):
-        raise ConfigError(f"child {name}: on_ready needs a non-empty tool name and an arguments table")
-    return OnReady(tool, dict(args))
+    return None if raw is None else OnReady(*_tool_call(name, "on_ready", raw))
+
+
+def _read(path: str) -> dict:
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise ConfigError(f"cannot read children config {path}: {e}") from e
+
+
+TEXTS = ("instructions", "backend_failed", "backend_starting")
+
+
+def load_texts(path: str, environ: Mapping[str, str] = os.environ) -> dict[str, str]:
+    """The [session] table: `instructions` (initialize result; {NAME} filled in from `environ`), and
+    `backend_failed` ({state}, {reason}) / `backend_starting` ({seconds}) for a call held for the backend."""
+    raw = _read(path).get("session", {})
+    if not isinstance(raw, dict) or not all(isinstance(raw.get(k, ""), str) for k in TEXTS) or set(raw) - set(TEXTS):
+        raise ConfigError(f"[session] in {path} takes only the strings {', '.join(TEXTS)}")
+    texts = {k: raw[k] for k in TEXTS if k in raw}
+    if "instructions" in texts:
+        texts["instructions"] = fill_in(texts["instructions"], environ).strip()
+    return texts
 
 
 def load_children(path: str) -> tuple[ChildSpec, ...]:
-    try:
-        with open(path, "rb") as f:
-            data = tomllib.load(f)
-    except (OSError, tomllib.TOMLDecodeError) as e:
-        raise ConfigError(f"cannot read children config {path}: {e}") from e
+    data = _read(path)
     specs = []
     for i, c in enumerate(data.get("child", [])):
         name = c.get("name", "")
@@ -160,7 +187,8 @@ def load_children(path: str) -> tuple[ChildSpec, ...]:
     return tuple(specs)
 
 
-def _num(env: Mapping[str, str], key: str, default: float, cast=float):
+def number(env: Mapping[str, str], key: str, default: float, cast=float):
+    """env[key] as a number (default when unset); ConfigError naming the key otherwise."""
     try:
         return cast(env.get(key, default))
     except ValueError:
@@ -197,38 +225,40 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
     cert, key = env.get("REBOX_TLS_CERT") or None, env.get("REBOX_TLS_KEY") or None
     if bool(cert) != bool(key):
         raise ConfigError("REBOX_TLS_CERT and REBOX_TLS_KEY must be set together")
-    max_sessions = _num(env, "REBOX_MAX_SESSIONS", 4, int)
+    max_sessions = number(env, "REBOX_MAX_SESSIONS", 4, int)
     if max_sessions < 1:
         raise ConfigError("REBOX_MAX_SESSIONS must be at least 1")
     state_dir = env.get("REBOX_STATE_DIR", "")
-    interval = _num(env, "REBOX_AUTOSAVE_INTERVAL", 300)
-    timeout = _num(env, "REBOX_AUTOSAVE_TIMEOUT", 20)
+    interval = number(env, "REBOX_AUTOSAVE_INTERVAL", 300)
+    timeout = number(env, "REBOX_AUTOSAVE_TIMEOUT", 20)
     if interval < 0 or timeout <= 0:
         raise ConfigError("REBOX_AUTOSAVE_INTERVAL must be >= 0 and REBOX_AUTOSAVE_TIMEOUT > 0")
-    orphan = _num(env, "REBOX_SESSION_ORPHAN_TIMEOUT", 300)
-    evict = _num(env, "REBOX_SESSION_EVICT_MIN_IDLE", 120)
-    keepalive = _num(env, "REBOX_PROGRESS_KEEPALIVE_INTERVAL", 30)
+    orphan = number(env, "REBOX_SESSION_ORPHAN_TIMEOUT", 300)
+    evict = number(env, "REBOX_SESSION_EVICT_MIN_IDLE", 120)
+    keepalive = number(env, "REBOX_PROGRESS_KEEPALIVE_INTERVAL", 30)
     if min(orphan, evict, keepalive) < 0:
         raise ConfigError(
             "REBOX_SESSION_ORPHAN_TIMEOUT, REBOX_SESSION_EVICT_MIN_IDLE and REBOX_PROGRESS_KEEPALIVE_INTERVAL must be >= 0"
         )
+    path = env.get("REBOX_CONFIG", "/etc/rebox/aggregator.toml")
     return Settings(
         token=token,
-        children=load_children(env.get("REBOX_CONFIG", "/etc/rebox/aggregator.toml")),
-        port=_num(env, "REBOX_PORT", 8443, int),
+        children=load_children(path),
+        **load_texts(path, env),
+        port=number(env, "REBOX_PORT", 8443, int),
         bind=env.get("REBOX_BIND", "0.0.0.0"),
         tls_cert=cert,
         tls_key=key,
         max_sessions=max_sessions,
-        idle_timeout=_num(env, "REBOX_SESSION_IDLE_TIMEOUT", 1800),
-        child_grace=_num(env, "REBOX_CHILD_GRACE", 5),
-        init_timeout=_num(env, "REBOX_INIT_TIMEOUT", 120),
-        max_body=_num(env, "REBOX_MAX_BODY_BYTES", 16 * 1024 * 1024, int),
+        idle_timeout=number(env, "REBOX_SESSION_IDLE_TIMEOUT", 1800),
+        child_grace=number(env, "REBOX_CHILD_GRACE", 5),
+        init_timeout=number(env, "REBOX_INIT_TIMEOUT", 120),
+        max_body=number(env, "REBOX_MAX_BODY_BYTES", 16 * 1024 * 1024, int),
         state_dir=state_dir,
         autosave_interval=interval,
         autosave_timeout=timeout,
         orphan_timeout=orphan,
         evict_min_idle=evict,
         progress_keepalive=keepalive,
-        start_timeout=_num(env, "REBOX_HEADLESS_START_TIMEOUT", 300),
+        start_timeout=number(env, "REBOX_HEADLESS_START_TIMEOUT", 300),
     )
