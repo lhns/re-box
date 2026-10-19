@@ -13,7 +13,8 @@ import anyio
 import pytest
 
 from conftest import wait_until
-from rebox_aggregator.supervisor import Headless, validate
+from rebox_aggregator.headless import Headless
+from rebox_aggregator.supervisor import validate
 
 pytestmark = pytest.mark.anyio
 FAKES = Path(__file__).parent / "fakes"

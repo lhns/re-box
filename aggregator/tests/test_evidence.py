@@ -1,13 +1,12 @@
 import json
 import os
 import sys
-import time
 
 import pytest
 
 from conftest import FAKE, raw_init, run_app
 from rebox_aggregator.config import Autosave, ChildSpec
-from rebox_aggregator.evidence import drop_if_empty, prune_old
+from rebox_aggregator.evidence import drop_if_empty
 
 pytestmark = pytest.mark.anyio
 
@@ -36,20 +35,6 @@ def test_bundle_with_content_or_unexpected_shape_is_kept(tmp_path, body):
 
 def test_drop_ignores_missing_file_and_bad_path(tmp_path):
     assert not drop_if_empty(str(tmp_path / "none.json")) and not drop_if_empty(None)
-
-
-def test_prune_old_deletes_by_age(tmp_path):
-    old, new, other = tmp_path / "old.json", tmp_path / "new.json", tmp_path / "keep.txt"
-    for p in (old, new, other):
-        p.write_text("{}")
-    now = time.time()
-    os.utime(old, (now - 40 * 86400,) * 2)
-    os.utime(other, (now - 40 * 86400,) * 2)
-    assert prune_old(str(tmp_path), 30) == 1
-    assert not old.exists() and new.exists() and other.exists()
-    os.utime(new, (now - 40 * 86400,) * 2)
-    assert prune_old(str(tmp_path), 0) == 0 and new.exists()  # 0 keeps everything
-    assert prune_old(str(tmp_path / "missing"), 30) == 0
 
 
 async def test_session_close_drops_an_empty_export(tmp_path):

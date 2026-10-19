@@ -14,7 +14,9 @@ from conftest import (
 from rebox_aggregator import session as session_mod
 from rebox_aggregator.children import Child, ChildError
 from rebox_aggregator.config import ChildSpec, ConfigError, read_token
+from rebox_aggregator.headless import Headless
 from rebox_aggregator.session import Session
+from rebox_aggregator.supervisor import validate
 
 pytestmark = pytest.mark.anyio
 
@@ -215,8 +217,6 @@ async def test_duplicate_request_id_rejected(running):
 # 8, 9. supervisor
 
 async def test_health_reason_is_fixed_text(tmp_path):
-    from rebox_aggregator.supervisor import Headless, validate
-
     cfg = validate({"REBOX_TOKEN": "t", "RE_WORKDIR": str(tmp_path), "REBOX_HEADLESS_START_TIMEOUT": "5"})
     assert Headless(cfg, "i").health() == (True, "", "stopped")  # nothing runs until a session wants it
 
@@ -253,8 +253,6 @@ async def test_health_reason_is_fixed_text(tmp_path):
 
 
 async def test_old_jvm_group_killed_before_restart(tmp_path, monkeypatch):
-    from rebox_aggregator.supervisor import Headless, validate
-
     bindir = tmp_path / "bin"
     bindir.mkdir()
     pidfile = tmp_path / "pid"

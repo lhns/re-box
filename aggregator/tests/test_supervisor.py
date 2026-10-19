@@ -11,7 +11,8 @@ import pytest
 
 from rebox_aggregator import log as rlog
 from rebox_aggregator.config import ConfigError
-from rebox_aggregator.supervisor import Headless, apply_state_env, ensure_project, headless_command, validate
+from rebox_aggregator.headless import Headless, ProjectError, ensure_project, headless_command
+from rebox_aggregator.supervisor import apply_state_env, validate
 
 pytestmark = pytest.mark.anyio
 
@@ -169,8 +170,6 @@ class FakeHeadless:
 
 
 async def test_ensure_project_reports_a_lock_held_elsewhere(tmp_path):
-    from rebox_aggregator.supervisor import ProjectError
-
     (tmp_path / "rebox.gpr").write_text("")
     with pytest.raises(ProjectError, match="locked by another Ghidra instance") as e:
         await run_ensure(False, tmp_path, reply={"error": "Project locked by another Ghidra instance: /x/rebox.lock"}, opens=False)
@@ -178,8 +177,6 @@ async def test_ensure_project_reports_a_lock_held_elsewhere(tmp_path):
 
 
 async def test_ensure_project_fails_when_it_is_still_not_open(tmp_path):
-    from rebox_aggregator.supervisor import ProjectError
-
     with pytest.raises(ProjectError, match="project not open"):
         await run_ensure(False, tmp_path, opens=False)
 

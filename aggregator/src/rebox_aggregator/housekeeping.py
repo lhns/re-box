@@ -1,14 +1,18 @@
 """Cleanup of leftovers that nothing else removes: temp dirs of killed processes, half-written exports,
-rolled Ghidra logs, and the size of the project (logged at each Ghidra start)."""
+old evidence bundles and rolled Ghidra logs, plus the project size (logged at each Ghidra start)."""
 
 import fnmatch
 import os
 import shutil
 import time
+from collections.abc import Iterable
 from pathlib import Path
+
+import anyio
 
 from .log import log
 
+PRUNE_INTERVAL = 86400.0
 LOG_RETENTION_DAYS = 30  # rolled Ghidra logs: Ghidra rolls at 50 MB and never deletes earlier days' files
 ROLLED_LOGS = ("application.log-*.log", "script.log-*.log")
 LOG_HOMES = ("ghidramcp*", "rebox-ghidra*")  # under $STATE/home/.config
@@ -97,20 +101,53 @@ def remove_partial_exports(evidence_dir: str) -> int:
     return removed
 
 
+def _remove_older(files: Iterable[Path], days: float, now: float | None) -> int:
+    """Unlink the regular files not modified for `days` days; returns how many."""
+    cutoff = (time.time() if now is None else now) - days * 86400
+    removed = 0
+    for f in files:
+        try:
+            if f.is_file() and not f.is_symlink() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def prune_evidence(directory: str, days: float, now: float | None = None) -> int:
+    """Delete *.json evidence bundles not modified for `days` days (0: keep everything)."""
+    if days <= 0:
+        return 0
+    removed = _remove_older(Path(directory).glob("*.json"), days, now)
+    if removed:
+        log("evidence_pruned", removed=removed, retention_days=days)
+    return removed
+
+
 def prune_rolled_logs(state_dir: str, days: float = LOG_RETENTION_DAYS, now: float | None = None) -> int:
     """Delete rolled Ghidra logs (application.log-DATE-N.log, script.log-...) not modified for `days` days."""
-    cutoff = (time.time() if now is None else now) - days * 86400
     base = Path(state_dir) / "home" / ".config"
-    removed = 0
-    for home in LOG_HOMES:
-        for pattern in ROLLED_LOGS:
-            for f in base.glob(f"{home}/**/{pattern}"):
-                try:
-                    if f.is_file() and not f.is_symlink() and f.stat().st_mtime < cutoff:
-                        f.unlink()
-                        removed += 1
-                except OSError:
-                    continue
+    files = (f for home in LOG_HOMES for pattern in ROLLED_LOGS for f in base.glob(f"{home}/**/{pattern}"))
+    removed = _remove_older(files, days, now)
     if removed:
         log("ghidra_logs_pruned", removed=removed, retention_days=days)
     return removed
+
+
+def _housekeep(state_dir: Path, retention_days: float, first: bool) -> None:
+    evidence = str(state_dir / "rea" / "evidence")
+    if first:
+        remove_partial_exports(evidence)
+    prune_evidence(evidence, retention_days)
+    prune_rolled_logs(str(state_dir))
+
+
+async def housekeeping_loop(state_dir: Path, evidence_retention_days: float) -> None:
+    """At start and then daily: drop old REA evidence bundles (when a retention is set), half-written
+    exports (at start only) and old rolled Ghidra logs."""
+    first = True
+    while True:
+        await anyio.to_thread.run_sync(_housekeep, state_dir, evidence_retention_days, first)
+        first = False
+        await anyio.sleep(PRUNE_INTERVAL)

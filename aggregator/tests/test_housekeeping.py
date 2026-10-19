@@ -2,7 +2,7 @@ import os
 import time
 
 from rebox_aggregator import log as rlog
-from rebox_aggregator.housekeeping import dir_size, prune_rolled_logs, remove_partial_exports, sweep_tmp
+from rebox_aggregator.housekeeping import dir_size, prune_evidence, prune_rolled_logs, remove_partial_exports, sweep_tmp
 
 
 def captured(fn, *a):
@@ -77,6 +77,21 @@ def test_partial_exports_removed_at_any_age(tmp_path):
     (tmp_path / "s.json").write_text("{}")
     assert remove_partial_exports(str(tmp_path)) == 1
     assert [p.name for p in tmp_path.iterdir()] == ["s.json"]
+
+
+def test_prune_evidence_deletes_by_age(tmp_path):
+    old, new, other = tmp_path / "old.json", tmp_path / "new.json", tmp_path / "keep.txt"
+    for p in (old, new, other):
+        p.write_text("{}")
+    now = time.time()
+    os.utime(old, (now - 40 * 86400,) * 2)
+    os.utime(other, (now - 40 * 86400,) * 2)
+    (res, events) = captured(prune_evidence, str(tmp_path), 30)
+    assert res == 1 and [e["event"] for e in events] == ["evidence_pruned"]
+    assert not old.exists() and new.exists() and other.exists()
+    os.utime(new, (now - 40 * 86400,) * 2)
+    assert prune_evidence(str(tmp_path), 0) == 0 and new.exists()  # 0 keeps everything
+    assert prune_evidence(str(tmp_path / "missing"), 30) == 0
 
 
 def test_rolled_logs_pruned_by_age(tmp_path):
