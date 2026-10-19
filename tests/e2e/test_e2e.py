@@ -79,7 +79,9 @@ def test_01b_official_sdk_client_interop():
     async def run():
         async with httpx.AsyncClient(headers={"Authorization": f"Bearer {TOKEN}"},
                                      timeout=httpx.Timeout(300, connect=10)) as http:
-            async with streamable_http_client(URL, http_client=http) as (read, write):
+            # The SDK caps one SSE event at 1 MiB by default; REA's full-profile tools/list is ~3 MB
+            # in one event (docs/CLIENTS.md).
+            async with streamable_http_client(URL, http_client=http, max_sse_event_size=None) as (read, write):
                 async with ClientSession(read, write) as cs:
                     await cs.initialize()
                     tools = (await cs.list_tools()).tools

@@ -117,7 +117,7 @@ set -eu
 locked=$(jq -r '.packages["node_modules/rea-agents"].version' /opt/rea/package-lock.json)
 [ "$locked" = "$REA_VERSION" ] || { echo "deps/rea locks rea-agents $locked, versions.env says $REA_VERSION" >&2; exit 1; }
 cd /opt/rea
-npm ci --omit=dev --ignore-scripts --no-audit --no-fund
+npm ci --omit=dev --ignore-scripts --no-audit --no-fund --fetch-retries=5
 rm -rf /root/.npm
 EOS
 

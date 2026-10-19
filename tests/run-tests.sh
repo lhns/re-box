@@ -20,9 +20,11 @@ MEM=/tmp/rebox-e2e/rss.log
 step() { printf '\n=== %s\n' "$*"; }
 
 # pids whose environment carries our instance id: the services and their descendants. The id is
-# deliberately not exported, so this script's own helpers never match.
+# deliberately not exported, so this script's own helpers never match. Read as PUID: without
+# CAP_SYS_PTRACE (Docker's default) root cannot read another uid's /proc/<pid>/environ.
+as_puid() { setpriv --reuid="$PUID" --regid="$PGID" --clear-groups "$@"; }
 instance_pids() {
-  grep -lsa "^REBOX_INSTANCE=$REBOX_INSTANCE\$" --null-data /proc/[0-9]*/environ 2>/dev/null \
+  as_puid sh -c 'grep -lsa --null-data "^REBOX_INSTANCE=$1\$" /proc/[0-9]*/environ' sh "$REBOX_INSTANCE" 2>/dev/null \
     | cut -d/ -f3 | grep -vx "$$" || true
 }
 
@@ -71,7 +73,8 @@ echo "ready after $(( $(date +%s) - start )) s"
 
 step "e2e"
 set +e
-(cd "$TESTS/e2e" && REBOX_INSTANCE="$REBOX_INSTANCE" "$PY" -m pytest -v -p no:cacheprovider -rA .)
+# As PUID, for the same /proc reason (test 10 finds a session's processes by their environment).
+(cd "$TESTS/e2e" && REBOX_INSTANCE="$REBOX_INSTANCE" as_puid "$PY" -m pytest -v -p no:cacheprovider -rA .)
 e2e=$?
 set -e
 

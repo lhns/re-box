@@ -29,7 +29,7 @@ def test_supervisor_lifecycle(tmp_path):
     cfg.write_text(f'[[child]]\nname = "a"\nprefix = "a_"\ncommand = ["{sys.executable}", "{FAKES / "fake_server.py"}", "a"]\n')
     port = free_port()
     env = {
-        **os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "REBOX_TOKEN": "tok", "REBOX_PORT": str(port),
+        **{k: v for k, v in os.environ.items() if k != "GHIDRA_PROJECTS_DIR"}, "PATH": f"{bindir}:{os.environ['PATH']}", "REBOX_TOKEN": "tok", "REBOX_PORT": str(port),
         "REBOX_BIND": "127.0.0.1", "REBOX_CONFIG": str(cfg), "RE_WORKDIR": str(work), "FAKE_MARKER": str(marker),
         "REBOX_INSTANCE": "supervisor-test", "REBOX_HEADLESS_START_TIMEOUT": "30",
     }
