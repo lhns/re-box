@@ -10,8 +10,8 @@
 //       REBOX_REA_BRIDGE_DIR, REBOX_REA_ATTACH_SCRIPT
 import { request } from "node:http";
 import { connect } from "node:net";
-import { existsSync, readFileSync } from "node:fs";
-import { basename } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 
 const base = new URL(process.env.REBOX_GHIDRA_URL ?? "http://127.0.0.1:8089");
 const bridgeDir = process.env.REBOX_REA_BRIDGE_DIR ?? "/opt/rebox/rea-attach/ghidra_scripts";
@@ -36,6 +36,30 @@ const descriptor = JSON.parse(readFileSync(descriptorPath, "utf8"));
 // /run_ghidra_script splits its args on whitespace.
 if (!scriptLog || /\s/u.test(descriptorPath + scriptLog + bridgeDir))
 	die("the descriptor, script log and bridge paths must be set and contain no whitespace");
+
+// A per-target lock shared by every helper of this container (same uid). TMPDIR is REA's private
+// per-session directory here, so the lock lives at a fixed path. A lock whose holder died is taken over.
+const LOCKS = "/tmp/rebox-attach-locks";
+const lockTarget = async (sha256) => {
+	mkdirSync(LOCKS, { recursive: true, mode: 0o700 });
+	const path = join(LOCKS, `${sha256}.lock`);
+	for (;;) {
+		try {
+			writeFileSync(path, String(process.pid), { flag: "wx" });
+			return () => rmSync(path, { force: true });
+		} catch (e) {
+			if (e.code !== "EEXIST") throw e;
+		}
+		const holder = Number(readFileSync(path, { encoding: "utf8", flag: "a+" }));
+		let alive = false;
+		try {
+			process.kill(holder, 0);
+			alive = holder > 0;
+		} catch { /* gone */ }
+		if (!alive) rmSync(path, { force: true });
+		else await sleep(250);
+	}
+};
 
 // node:http, not fetch: fetch gives up on a response after 300 s, and an import with
 // auto-analysis answers only when the analysis is done. REA's startup deadline bounds it.
@@ -76,12 +100,19 @@ for (;;) {
 // folder of its own. The only place that knows how ghidra-mcp imports.
 const importTarget = async (folder) => {
 	const body = { file_path: target, project_folder: folder, auto_analyze: true };
-	// Two sessions importing the same new file at once: one wins, the other then reuses it.
-	const imported = await call("/import_file", body).catch(async () => {
-		await sleep(2000);
-		return call("/import_file", body);
-	});
+	// import_file checks for an existing program, then imports: two sessions opening the same new
+	// file at once both import it, and Ghidra saves the second as "<name>.0", a separate program
+	// (seen in CI: one session's rename landed in the copy). Take turns per target.
+	const release = await lockTarget(descriptor.target_sha256);
+	let imported;
+	try {
+		imported = await call("/import_file", body);
+	} finally {
+		release();
+	}
 	const program = imported.path;
+	if (basename(program) !== basename(target))
+		throw new Error(`import_file gave ${program}, not ${basename(target)}: a concurrent import?`);
 	if (imported.reused_existing) {
 		const status = await call(`/analysis_status?program=${encodeURIComponent(program)}`);
 		const entry = (status.programs ?? [status]).find((p) => p.analyzed !== undefined) ?? {};

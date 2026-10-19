@@ -160,6 +160,9 @@ def test_concurrent_rea_sessions_share_one_program(session):
     [t.join(600) for t in threads]
     assert not errors, errors
     assert len(helpers()) == 2 and len(ghidra_mcp_jvm()) == 1 and not rea_jvms()
+    # Both opened the same new file at once: one program, not a "shared_debug.0" copy as well.
+    programs = jtext(ok(a.tool("gh_list_open_programs", {})))["programs"]
+    assert [p["path"] for p in programs if p["name"].startswith("shared_debug")] == ["/shared_debug"], programs
     ok(a.tool("rea_annotate_native_function", {"procedure": "compute", "name": "SharedCompute"}))
     # Same program for all: a new session sees a's rename. (b does not, even after reopening: REA
     # caches what it read for the life of its process; DECISIONS.md.)
