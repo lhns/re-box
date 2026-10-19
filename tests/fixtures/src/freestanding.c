@@ -23,7 +23,8 @@ KEEP float negate(float x) {
     return -x;
 }
 
-/* Never called and never referenced: auto-analysis does not find it; the seeds file points at it. */
+/* Never called or referenced. Ghidra still finds it by its prologue; the seeds file points at it so
+ * that, in the stripped ELF, the seed's name is what shows it took effect. */
 KEEP int hidden_seed_target(int a, int b) {
     return (a ^ 0x5eed) * b + 0x1234;
 }
