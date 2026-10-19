@@ -5,7 +5,7 @@ Renovate bumps the *_VERSION / *_REF lines; this keeps the rest in step:
 - <X>_URL + <X>_SHA256: the digest of the file the URL names (GitHub's asset digest when the
   API has one, else a download).
 - GHIDRA_RELEASE_DATE: the date part of the release asset's name.
-- GHIDRA_MCP_COMMIT: the commit the GHIDRA_MCP_REF tag points at.
+- <X>_COMMIT: the commit the <X>_REF tag points at (repo from the renovate comment's depName).
 - REA_VERSION must equal the rea-agents version locked in deps/rea/package-lock.json.
 
 Exit 1 when anything is stale (without --update) or cannot be resolved.
@@ -86,16 +86,20 @@ def main() -> int:
             problems.append(f"no Ghidra zip asset in {names}")
         else:
             wanted["GHIDRA_RELEASE_DATE"] = date
-    if "GHIDRA_MCP_REF" in values:
-        ref = values["GHIDRA_MCP_REF"]
-        out = subprocess.run(["git", "ls-remote", "https://github.com/bethington/ghidra-mcp.git",
-                              f"refs/tags/{ref}", f"refs/tags/{ref}^{{}}"], capture_output=True, text=True, check=True).stdout
+    # <X>_REF (a git tag) + <X>_COMMIT: the repo is the depName of the renovate comment above.
+    for m in re.finditer(r"^#\s*renovate:.*?depName=(\S+).*\n([A-Z][A-Z0-9_]*)_REF=", text, re.M):
+        repo, prefix = m.group(1), m.group(2)
+        if f"{prefix}_COMMIT" not in values:
+            continue
+        ref = values[f"{prefix}_REF"]
+        out = subprocess.run(["git", "ls-remote", f"https://github.com/{repo}.git", f"refs/tags/{ref}",
+                              f"refs/tags/{ref}^{{}}"], capture_output=True, text=True, check=True).stdout
         commits = dict(reversed(line.split("\t")) for line in out.splitlines())
         commit = commits.get(f"refs/tags/{ref}^{{}}") or commits.get(f"refs/tags/{ref}")
-        if not commit:
-            problems.append(f"ghidra-mcp tag {ref} not found")
+        if commit:
+            wanted[f"{prefix}_COMMIT"] = commit
         else:
-            wanted["GHIDRA_MCP_COMMIT"] = commit
+            problems.append(f"{repo} has no tag {ref}")
 
     # Digests are computed from the URLs as they read after the fixes above.
     for key, value in wanted.items():

@@ -1,6 +1,8 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
-  "extends": ["config:recommended"],
+  "extends": [
+    "config:recommended"
+  ],
   "description": [
     "Every bump goes through the Dockerfile's test stage (build.yml) before it can merge.",
     "versions.env pins are bumped by the regex manager below; their digests are not, so check-pins.py runs as a post-upgrade task where the Renovate instance allows it, and CI fails on a stale digest otherwise."
@@ -9,37 +11,61 @@
     {
       "description": "versions.env: a `# renovate: datasource=... depName=... [extractVersion=...] [versioning=...]` comment directly above the version line.",
       "customType": "regex",
-      "managerFilePatterns": ["/(^|/)versions\\.env$/"],
+      "managerFilePatterns": [
+        "/(^|/)versions\\.env$/"
+      ],
       "matchStrings": [
         "#\\s*renovate:\\s*datasource=(?<datasource>\\S+)\\s+depName=(?<depName>\\S+)(?:\\s+extractVersion=(?<extractVersion>\\S+))?(?:\\s+versioning=(?<versioning>\\S+))?\\s*\\n[A-Z][A-Z0-9_]*=(?<currentValue>\\S+)"
       ]
     }
   ],
   "postUpgradeTasks": {
-    "commands": ["python3 scripts/check-pins.py --update"],
-    "fileFilters": ["versions.env"],
+    "commands": [
+      "python3 scripts/check-pins.py --update"
+    ],
+    "fileFilters": [
+      "versions.env"
+    ],
     "executionMode": "branch"
   },
   "packageRules": [
     {
       "description": "Node follows the 24 LTS line (NODE_MAJOR in the spec); REA supports 22.19+, 24.11+, 26+.",
-      "matchDepNames": ["node"],
+      "matchDepNames": [
+        "node"
+      ],
       "allowedVersions": "<25"
     },
     {
       "description": "Temurin release tags look like 21.0.12.1+1.",
-      "matchDepNames": ["adoptium/temurin21-binaries"],
+      "matchDepNames": [
+        "adoptium/temurin21-binaries"
+      ],
       "versioning": "loose"
     },
     {
       "description": "REA_VERSION in versions.env and deps/rea/package.json + lockfile move together; the build refuses a mismatch.",
-      "matchDepNames": ["rea-agents"],
+      "matchDepNames": [
+        "rea-agents"
+      ],
       "groupName": "rea-agents"
     },
     {
       "description": "Ghidra, ghidra-mcp and REA interlock (REA accepts one Ghidra minor line; ghidra-mcp targets one Ghidra release): never automerge, review with the e2e results.",
-      "matchDepNames": ["NationalSecurityAgency/ghidra", "bethington/ghidra-mcp", "rea-agents"],
+      "matchDepNames": [
+        "NationalSecurityAgency/ghidra",
+        "bethington/ghidra-mcp",
+        "rea-agents"
+      ],
       "automerge": false
     }
-  ]
+  ],
+  "customDatasources": {
+    "chrome-for-testing": {
+      "defaultRegistryUrlTemplate": "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json",
+      "transformTemplates": [
+        "{\"releases\": [{\"version\": channels.Stable.version}]}"
+      ]
+    }
+  }
 }
