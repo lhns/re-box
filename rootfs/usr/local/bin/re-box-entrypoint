@@ -7,6 +7,8 @@ set -euo pipefail
 if [ "$(id -u)" = 0 ]; then
   puid=${PUID:-1000} pgid=${PGID:-1000}
   case "$puid$pgid" in *[!0-9]*) echo "re-box: PUID and PGID must be numeric" >&2; exit 2 ;; esac
+  if [ ${#puid} -gt 10 ] || [ ${#pgid} -gt 10 ]; then echo "re-box: PUID/PGID out of range" >&2; exit 2; fi
+  puid=$((10#$puid)) pgid=$((10#$pgid))  # "00" is root too
   if [ "$puid" = 0 ] || [ "$pgid" = 0 ]; then
     echo "re-box: refusing to run the services as root (PUID/PGID 0)" >&2; exit 2
   fi

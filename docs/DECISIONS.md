@@ -146,3 +146,52 @@ docs/CLIENTS.md says when to switch to `compact`/`off`.
   `2G`; `src/ghidra/GhidraJavaLaunch.ts`).
 - **Two Python environments:** the ghidra-mcp bridge pins `mcp>=1.28.1,<2`; the aggregator uses
   `mcp` 2.3.0. Each runs from its own venv by absolute path.
+- **Supervision: tini + `rebox-supervisor`, not s6-overlay.** The in-cluster build runs the test
+  stage under rootless BuildKit with no init and no PID namespace, so the test stage must start the
+  services itself; s6-overlay needs to be PID 1. One supervisor (Python, part of `aggregator/`)
+  serves both: dependency order (aggregator after the headless server and its project are ready),
+  readiness, headless restart with backoff, and the SIGTERM order the spec asks for (sessions
+  closed, then `/exit_ghidra`, which saves all programs). The test stage exercises exactly the
+  production start path.
+- **Image user.** The image's `USER` is `1000:1000`, so it runs non-root under plain `docker run`
+  and Kubernetes `runAsNonRoot`. The PUID/PGID remap (spec 6.1) needs root, so it applies only when
+  the container is started as root (compose example: `user: "0:0"` plus `CHOWN`, `SETUID`, `SETGID`);
+  the entrypoint then drops to the remapped user with `setpriv --no-new-privs`. Test 8.3.9 runs in
+  the remap mode (uid 4321); the uid-1000 mode is checked in `tests/smoke/image.sh` (no remap,
+  warning, writable HOME fallback).
+- **Test 8.3.10** finds a session's processes by the `REBOX_SESSION` tag every child inherits and
+  by their process groups, never by scanning for process names, because the in-cluster build has
+  no PID isolation. Reading another uid's `/proc/<pid>/environ` needs `CAP_SYS_PTRACE`, which
+  Docker does not grant root, so the e2e tests run as the PUID user.
+- **Pins outside versions.env.** Base images are pinned tag@digest in the `FROM` lines (a `FROM`
+  cannot read a file; Renovate's dockerfile manager tracks them). Package trees are lockfiles with
+  hashes: `aggregator/uv.lock`, `deps/rea/package-lock.json` (sha512 integrity for all 174
+  packages instead of `npm i -g`, which would float transitive versions), `deps/tools/requirements-*.txt`,
+  and ghidra-mcp's own `uv.lock` exported with hashes for the bridge venv. `REA_VERSION` must
+  equal the locked rea-agents version; the build and `check-pins.py` refuse a mismatch.
+- **npm install scripts are skipped** (`npm ci --ignore-scripts`). The only one is frida's, which
+  downloads an unpinned prebuilt binary; REA's Frida features therefore report unavailable.
+- **Tools** (deps/tools/install-tools.sh): apktool 2.12.1 from upstream instead of Ubuntu's
+  2.7.0 (in REA's CVE-2024-21633 advisory window); binwalk 3.1.0 built from its pinned commit
+  (3.x ships no binaries, Ubuntu has 2.3.4); Chrome for Testing instead of Ubuntu's chromium snap;
+  mitmproxy's standalone build, the one REA verifies. `unar` (pulls in GNUstep) and pwndbg's
+  `ziglang` (optional command only) are left out. `rea doctor` / `rea providers` report only the
+  Ghidra, JADX and the commercial/macOS providers, not the CLI tools, so `tests/smoke/tools.sh`
+  proves each tool through the REA command that drives it and checks the provider named in the
+  Evidence.
+- **Spec 8.1, ghidra-mcp upstream tests:** the Python offline tier (`tests/offline/` and the
+  read-only integration suite against upstream's fake server) runs at the pinned ref in the
+  `ghidra-mcp-test` stage. The Java unit tests are not run: they resolve junit/mockito from Maven
+  Central without verification.
+- **Spec 8.4 (upstream verification lanes):** skipped. REA's `verify:*` scripts need a source
+  checkout and its dev dependencies; they do not run against the installed package.
+
+## Findings for clients
+
+- **Python SDK 2.x clients** cap one SSE event at 1 MiB by default (`max_sse_event_size`). REA's
+  full-profile `tools/list` is ~3 MB in one event, so such a client fails `list_tools` unless it
+  raises the cap or the container uses `REA_MCP_INPUT_SCHEMA_PROFILE=compact` and
+  `REA_MCP_OUTPUT_SCHEMA_PROFILE=off`. The aggregator does not paginate `tools/list`: clients that
+  do not follow `nextCursor` would silently lose tools. Claude Code 2.1.303 handles the full catalog.
+- **Claude Code `-p` exits without DELETE**, so its session (and REA's Ghidra JVM) lives until the
+  idle timeout and counts against `REBOX_MAX_SESSIONS` (docs/OPERATIONS.md).

@@ -67,5 +67,10 @@
         "{\"releases\": [{\"version\": channels.Stable.version}]}"
       ]
     }
+  },
+  "pip-compile": {
+    "managerFilePatterns": [
+      "/^deps/tools/requirements-[^/]+\\.txt$/"
+    ]
   }
 }

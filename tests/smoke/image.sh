@@ -21,7 +21,9 @@ grep -q 'ignoring them' <<<"$out" || fail "no PUID warning in uid-1000 mode: $ou
   || fail "arbitrary uid did not get a writable HOME"
 
 # As root, PUID/PGID 0 is refused.
-if env PUID=0 /usr/local/bin/re-box-entrypoint true 2>/dev/null; then fail "PUID=0 accepted"; fi
+for bad in 0 00 "" x1; do
+  if [ -n "$bad" ] && env PUID="$bad" /usr/local/bin/re-box-entrypoint true 2>/dev/null; then fail "PUID=$bad accepted"; fi
+done
 
 # Security defaults.
 [ "${GHIDRA_MCP_ALLOW_SCRIPTS:-}" = 0 ] || fail "GHIDRA_MCP_ALLOW_SCRIPTS is '${GHIDRA_MCP_ALLOW_SCRIPTS:-}'"

@@ -150,6 +150,12 @@ ENV GHIDRA_INSTALL_DIR=/opt/ghidra
 FROM runtime-core AS runtime
 # Ubuntu's image ships a uid-1000 user `ubuntu`; rebox takes that id.
 RUN userdel -r ubuntu 2>/dev/null; groupadd -g 1000 rebox && useradd -u 1000 -g 1000 -m -s /bin/bash rebox
+# The analysis tools REA drives on Linux (spec 6.3); deps/tools/install-tools.sh.
+RUN --mount=type=bind,from=pins,source=/pins/tools.env,target=/run/pins.env     --mount=type=bind,source=deps/tools,target=/build/tools     sh /build/tools/install-tools.sh
+# Where REA finds each tool. REA enables the firmware, packet, signal and WASM features only for
+# absolute paths, and compares REA_BROWSER_NO_SANDBOX to the string "true": Chromium's sandbox
+# needs user namespaces the container does not grant, the container is the sandbox.
+ENV REA_RIZIN_COMMAND=/usr/local/bin/rizin     REA_OBJDUMP_COMMAND=/usr/bin/objdump     REA_GDB_COMMAND=/usr/bin/gdb     REA_JADX_MCP_JAR=/opt/rebox/tools/jadx/jadx-headless-mcp.jar     REA_JADX_HEAP_MIB=2048     REA_APKTOOL_COMMAND=/usr/local/bin/apktool     REA_ADB_PATH=/usr/bin/adb     REA_BINWALK_COMMAND=/usr/local/bin/binwalk     REA_UNBLOB_COMMAND=/usr/local/bin/unblob     REA_FIRMWARE_PRLIMIT_COMMAND=/usr/bin/prlimit     REA_TSHARK_COMMAND=/usr/bin/tshark     REA_CAPINFOS_COMMAND=/usr/bin/capinfos     REA_TSHARK_PRLIMIT_COMMAND=/usr/bin/prlimit     REA_SIGROK_COMMAND=/usr/bin/sigrok-cli     REA_SIGROK_PRLIMIT_COMMAND=/usr/bin/prlimit     REA_WABT_BIN_DIRECTORY=/opt/rebox/tools/wabt/bin     REA_PWNTOOLS_PYTHON=/opt/rebox/tools/pwntools/bin/python     REA_PWNDBG_GDB=/usr/bin/gdb     REA_PWNDBG_GDBINIT=/opt/rebox/tools/pwndbg/src/gdbinit.py     REA_PWNDBG_VENV_PATH=/opt/rebox/tools/pwndbg/venv     REA_MITMDUMP_COMMAND=/opt/rebox/tools/mitmproxy/mitmdump     REA_BROWSER_EXECUTABLE=/opt/rebox/tools/chrome/chrome     REA_BROWSER_NO_SANDBOX=true
 COPY aggregator /src/aggregator
 RUN UV_PROJECT_ENVIRONMENT=/opt/rebox/venv uv sync -q --frozen --no-dev --no-editable --project /src/aggregator \
  && rm -rf /src /root/.cache
@@ -200,7 +206,8 @@ USER root
 COPY --from=ghidra-mcp-test /ghidra-mcp-offline-passed /opt/rebox/
 COPY --from=fixtures /fixtures /opt/rebox/fixtures
 COPY aggregator /src/aggregator
-RUN UV_PROJECT_ENVIRONMENT=/opt/rebox/test-venv uv sync -q --frozen --project /src/aggregator
+# UV_NO_CACHE: HOME is /home/rebox here, and a root-owned cache there breaks the tools as rebox.
+RUN UV_NO_CACHE=1 UV_PROJECT_ENVIRONMENT=/opt/rebox/test-venv uv sync -q --frozen --project /src/aggregator
 COPY --chmod=0755 tests /src/tests
 RUN /src/tests/run-tests.sh
 
