@@ -169,13 +169,13 @@ def test_03b_delete_program(session):
     assert first.get("success"), first
     name = first["name"]
     assert name in s.tool("ghidra_list_open_programs", {}).text()
-    assert name in s.tool("ghidra_list_project_files", {}).text()
+    assert name in s.tool("ghidra_list_project_files", {"folder": "/"}).text()
 
     deleted = _json(s.tool("ghidra_delete_file", {"filePath": first["path"]}))
     assert deleted.get("success") and deleted.get("deleted") is True, deleted
     assert copy.is_file(), "the source file must stay"
     assert name not in s.tool("ghidra_list_open_programs", {}).text()
-    assert name not in s.tool("ghidra_list_project_files", {}).text()
+    assert name not in s.tool("ghidra_list_project_files", {"folder": "/"}).text()
     assert _json(s.tool("ghidra_delete_file", {"filePath": first["path"]})).get("deleted") is False
 
     again = _json(s.tool("ghidra_import_file", {"file_path": str(copy)}))

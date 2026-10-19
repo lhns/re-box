@@ -157,7 +157,7 @@ and re-importing costs the analysis again. The project grows by every binary imp
 `rea_open_binary` imports under `/rea/<sha256 prefix>/`). To remove ones you no longer need,
 ask the agent to:
 
-1. list them with `ghidra_list_project_files`;
+1. list them with `ghidra_list_project_files {"folder": "/"}` (REA's under `/rea/…`);
 2. `rea_close_binary` first if REA has the program open (deleting under an attached REA session
    is untested);
 3. call `ghidra_delete_file {"filePath": "/path/in/project"}`. It removes the program from the
