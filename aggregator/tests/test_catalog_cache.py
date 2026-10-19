@@ -112,6 +112,18 @@ async def test_cached_catalog_is_served_cold_and_a_held_call_is_released(tmp_pat
         assert json.loads(cache_file(tmp_path).read_text())["tools"].__len__() > 5
 
 
+async def test_ready_backend_but_unconnected_bridge_serves_the_cache(tmp_path):
+    # Ghidra is up, but the bridge booted before it connected: its listing is the static one.
+    seed(tmp_path)
+    with run_app([spec()], state_dir=str(tmp_path), autosave_interval=0, start_timeout=30.0) as r:
+        r.app.backend = FakeBackend(ready=True)
+        async with r.raw() as http:
+            sid, _ = await raw_init(http, r.url)
+            assert "a_echo" in await tool_names(http, r, sid)  # the cache or the connected listing, never the static one
+            msgs = await raw_call(http, r.url, sid, "tools/call", {"name": "a_echo", "arguments": {"text": "hi"}}, 7)
+            assert msgs[-1]["result"]["content"][0]["text"] == "hi"  # held until connected, then served
+
+
 async def test_static_tools_are_callable_while_cold(tmp_path):
     seed(tmp_path)
     with run_app([spec()], state_dir=str(tmp_path), autosave_interval=0, start_timeout=30.0) as r:
