@@ -15,9 +15,10 @@ Why custom, and the protocol-era decision: `docs/DECISIONS.md`, "5.2".
 | `catalog.py` | prefixing, name validation, merged tools/prompts/resources catalog |
 | `session.py` | per-session router between the downstream transport and the children |
 | `app.py` | ASGI app: auth, `/healthz`, `/mcp` session manager (cap, idle reaping, era rejection) |
-| `supervisor.py` | headless JVM lifecycle (on demand), Ghidra project, evidence pruning, runs the app, signal handling |
-| `evidence.py` | REA evidence bundles: drop an empty export, prune old ones |
-| `housekeeping.py` | leftovers nothing else removes: `/tmp` sweep at start, half-written exports, rolled Ghidra logs, project size |
+| `supervisor.py` | container entry point: config checks, the 8089 auth token, runs the app and the headless server, catalog warm-up, signal handling |
+| `headless.py` | the ghidra-mcp JVM (on demand: start, health, save, idle stop, crash restart) and the Ghidra project |
+| `evidence.py` | REA evidence bundles: drop an empty export |
+| `housekeeping.py` | leftovers nothing else removes (`/tmp` sweep, half-written exports, old evidence bundles, rolled Ghidra logs), the daily loop, project size |
 | `catalogcache.py` | per-child catalog cache (key, atomic save/load) and the session-less listing used by the warm-up |
 | `log.py` | JSON-lines logging to stdout |
 
@@ -219,10 +220,13 @@ results.**
    `$REBOX_STATE_DIR/ghidra-projects`, any absolute path) has a path element starting with `.`
    (Ghidra refuses those). It creates `ghidra-projects/`, `home/`, `cache/` and `rea/evidence/`
    under the state dir as the running user (plus a `.gitignore` of `*` there if none exists, since
-   the default sits in the work dir) and never chowns. `GHIDRA_MCP_FILE_ROOT` stays
-   `RE_WORKDIR`.
+   the default sits in the work dir) and never chowns.
 2. Export `HOME=$STATE/home`, `XDG_{CONFIG,DATA,STATE}_HOME` below it and `XDG_CACHE_HOME=$STATE/cache`
-   (inherited by the JVM and every child). Set `REBOX_INSTANCE` to a random id in its own environment, unless it is already set (the
+   (inherited by the JVM and every child). Unless `GHIDRA_MCP_AUTH_TOKEN` is already set (the test stage presets it), set it to a
+   random token: ghidra-mcp's HTTP port 8089 then wants `Authorization: Bearer <token>` on every call except `/check_connection`
+   and `/mcp/health`. It is made once per container start, so the bridges survive a JVM restart; the JVM, the bridges and REA's
+   attach helper inherit it, and the supervisor's own calls send it. It is never logged or put in a `REBOX_*` variable.
+   Set `REBOX_INSTANCE` to a random id in its own environment, unless it is already set (the
    test-stage runner sets it to find every process of the instance).
 3. Before anything else runs, remove what killed processes left in the temp dir (`sweep_tmp`:
    `rea-*` and `rebox-attach-locks/*.lock` only; logged as `tmp_swept`). No session exists yet,
@@ -235,17 +239,19 @@ results.**
    com.xebyte.headless.GhidraMCPHeadlessServer --port 8089 --bind 127.0.0.1
    --project <projects>/rebox.gpr` (plus `-Duser.home=$STATE/home`), env minus `REBOX_*` plus
    `REBOX_INSTANCE`,
-   with `GHIDRA_MCP_FILE_ROOT=$RE_WORKDIR` forced; if `rebox.gpr` is missing it is first created with
+   with `GHIDRA_MCP_FILE_ROOT=$RE_WORKDIR:<REA's TMPDIR>` (`REBOX_REA_TMP`) and
+   `GHIDRA_MCP_IMPORT_SCRIPT_ROOTS=<REBOX_REA_ATTACH_DIR>/import_scripts` forced; REA's attach script is copied to
+   `$STATE/home/ghidra_scripts` at every start; if `rebox.gpr` is missing it is first created with
    `analyzeHeadless <dir> rebox -preScript ReboxNoop.java` (the HTTP API cannot create projects
    outside the file root); its output relayed as `headless_log` lines.
 4. Wait for `GET http://127.0.0.1:8089/check_connection` to answer `{"status":"ok",...}`
    (`REBOX_HEADLESS_START_TIMEOUT`, 300 s). Then check the project (and log its size on disk as `project_size`): `GET /get_project_info`;
-   if `has_project` is false (fallback, works only inside the file root), `POST /open_project {"path": "<dir>/rebox.gpr"}` when it exists,
-   else `POST /create_project {"parentDir": "<dir>", "name": "rebox"}` (JSON bodies).
+   if `has_project` is false (works only inside the file root), `POST /open_project {"path": "<dir>/rebox.gpr"}` (JSON body).
+   The `.gpr` exists by then, so there is no create fallback.
 5. `/healthz` is 200 with `"ghidra": "<state>"` when stopped, stopping, ready, or starting within
    `REBOX_HEADLESS_START_TIMEOUT`; 503 (with `reason`) when failed, shutting down, or starting
    past the timeout. `ready` means the last `check_connection` (polled every 10 s) succeeded and
-   the project is open; each transition to ready calls every session's `on_ready` hook.
+   the project is open; every transition into ready (the first, and each recovery after a failed poll) calls the `on_ready` hook.
    Every `REBOX_AUTOSAVE_INTERVAL` seconds a separate task `POST`s `/save_all_programs`
    (sequential, never overlapping; logged as `autosave` with `component: ghidra` when something
    was saved or failed).
