@@ -218,7 +218,7 @@ async def test_health_reason_is_fixed_text(tmp_path):
     from rebox_aggregator.supervisor import Headless, validate
 
     cfg = validate({"REBOX_TOKEN": "t", "RE_WORKDIR": str(tmp_path), "REBOX_HEADLESS_START_TIMEOUT": "5"})
-    assert Headless(cfg, "i").health() == (False, "starting")
+    assert Headless(cfg, "i").health() == (True, "", "stopped")  # nothing runs until a session wants it
 
     from http.server import BaseHTTPRequestHandler, HTTPServer
     import threading
@@ -245,7 +245,7 @@ async def test_health_reason_is_fixed_text(tmp_path):
         h = Headless(cfg, "i", base=f"http://127.0.0.1:{server.server_port}")
         proc = await anyio.open_process(["sleep", "60"], start_new_session=True)
         await h._monitor(proc, anyio.CancelScope())
-        assert h.health() == (False, "project not open")
+        assert h.health() == (False, "project not open", "failed")
         await proc.wait()
         assert proc.returncode == -signal.SIGKILL
     finally:
@@ -265,6 +265,7 @@ async def test_old_jvm_group_killed_before_restart(tmp_path, monkeypatch):
     cfg = validate({"REBOX_TOKEN": "t", "RE_WORKDIR": str(tmp_path), "REBOX_HEADLESS_START_TIMEOUT": "5"})
     (cfg.projects_dir / "rebox.gpr").write_text("")  # skip project creation
     h = Headless(cfg, "i")
+    h.want(True)
     with anyio.move_on_after(3):
         await h.run()  # returns only on stop; it sleeps in backoff after the JVM "exits"
     straggler = int(pidfile.read_text())

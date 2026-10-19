@@ -38,8 +38,9 @@ def fake_spec(name: str, prefix: str, **env: str) -> ChildSpec:
 
 
 class Running:
-    def __init__(self, settings: Settings, app: App, server, thread, events: list):
+    def __init__(self, settings: Settings, app: App, server, thread, events: list, loop):
         self.settings, self.app, self.server, self.thread, self.events = settings, app, server, thread, events
+        self.loop = loop
         self.url = f"http://127.0.0.1:{settings.port}/mcp"
         self.base = f"http://127.0.0.1:{settings.port}"
 
@@ -56,6 +57,24 @@ class Running:
     def logged(self, event: str) -> list[dict]:
         return [e for e in self.events if e["event"] == event]
 
+    def on_loop(self, fn) -> None:
+        """Run fn on the server's event loop (app state is not thread-safe)."""
+        self.loop.call_soon_threadsafe(fn)
+
+
+class FakeBackend:
+    """Stands in for the supervisor's Ghidra lifecycle: records want() calls, ready is a flag."""
+
+    def __init__(self, ready: bool = True):
+        self.wants: list[bool] = []
+        self.is_ready = ready
+
+    def want(self, wanted: bool) -> None:
+        self.wants.append(wanted)
+
+    def ready(self) -> bool:
+        return self.is_ready
+
 
 @contextlib.contextmanager
 def run_app(children=None, **overrides):
@@ -71,7 +90,14 @@ def run_app(children=None, **overrides):
     )
     app = App(settings, instance="testinstance")
     server = make_server(app)
-    thread = threading.Thread(target=lambda: asyncio.run(server.serve()), daemon=True)
+    loops: list = []
+
+    def serve() -> None:
+        loop = asyncio.new_event_loop()
+        loops.append(loop)
+        loop.run_until_complete(server.serve())
+
+    thread = threading.Thread(target=serve, daemon=True)
     thread.start()
     deadline = time.time() + 10
     while time.time() < deadline:
@@ -81,7 +107,7 @@ def run_app(children=None, **overrides):
         except OSError:
             time.sleep(0.05)
     try:
-        yield Running(settings, app, server, thread, events)
+        yield Running(settings, app, server, thread, events, loops[0])
     finally:
         server.should_exit = True
         thread.join(30)

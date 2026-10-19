@@ -82,3 +82,58 @@ def test_autosave_settings(tmp_path):
     for bad in ("-1", "x"):
         with pytest.raises(ConfigError):
             load_settings({"REBOX_TOKEN": "t", "REBOX_CONFIG": cfg, "REBOX_AUTOSAVE_INTERVAL": bad})
+
+
+CHILD = '[[child]]\nname = "rea"\nprefix = "rea_"\ncommand = ["/bin/true"]\n'
+READY = '[child.on_ready]\ntool = "connect"\narguments = { project = "p" }\n'
+
+
+def test_deny_and_on_ready_parsed(tmp_path):
+    (spec,) = load_children(toml(tmp_path, CHILD.replace("\n[child", "\n[child") + 'deny = ["run_script"]\n' + READY))
+    assert spec.deny == ("run_script",)
+    assert (spec.on_ready.tool, dict(spec.on_ready.arguments)) == ("connect", {"project": "p"})
+    (spec,) = load_children(toml(tmp_path, GOOD))
+    assert spec.deny == () and spec.on_ready is None
+
+
+@pytest.mark.parametrize("bad", ['deny = "x"\n', 'deny = [1]\n', 'deny = [""]\n'])
+def test_bad_deny(tmp_path, bad):
+    with pytest.raises(ConfigError, match="deny"):
+        load_children(toml(tmp_path, CHILD + bad))
+
+
+@pytest.mark.parametrize("bad", ['[child.on_ready]\ntool = ""\n', '[child.on_ready]\narguments = {}\n'])
+def test_bad_on_ready(tmp_path, bad):
+    with pytest.raises(ConfigError, match="on_ready"):
+        load_children(toml(tmp_path, GOOD + bad))
+
+
+def test_prune_empty_parsed(tmp_path):
+    (spec,) = load_children(toml(tmp_path, AUTOSAVE + "prune_empty = true\n"))
+    assert spec.autosave.prune_empty is True
+    assert load_children(toml(tmp_path, AUTOSAVE))[0].autosave.prune_empty is False
+
+
+def test_shipped_config_denies_scripts_and_connects_on_ready():
+    from pathlib import Path
+
+    repo = Path(__file__).parents[2] / "rootfs/etc/rebox/aggregator.toml"
+    specs = {s.name: s for s in load_children(str(repo if repo.exists() else "/etc/rebox/aggregator.toml"))}
+    assert specs["ghidra"].deny == ("run_ghidra_script", "run_script_inline")
+    assert (specs["ghidra"].on_ready.tool, dict(specs["ghidra"].on_ready.arguments)) == ("connect_instance", {"project": "rebox"})
+    assert specs["rea"].autosave.prune_empty and not specs["rea"].deny
+
+
+def test_session_policy_settings(tmp_path):
+    cfg = toml(tmp_path, GOOD)
+    s = load_settings({"REBOX_TOKEN": "t", "REBOX_CONFIG": cfg})
+    assert (s.orphan_timeout, s.evict_min_idle, s.progress_keepalive) == (300, 120, 30)
+    s = load_settings({
+        "REBOX_TOKEN": "t", "REBOX_CONFIG": cfg, "REBOX_SESSION_ORPHAN_TIMEOUT": "60",
+        "REBOX_SESSION_EVICT_MIN_IDLE": "10", "REBOX_PROGRESS_KEEPALIVE_INTERVAL": "0",
+    })
+    assert (s.orphan_timeout, s.evict_min_idle, s.progress_keepalive) == (60, 10, 0)
+    for key in ("REBOX_SESSION_ORPHAN_TIMEOUT", "REBOX_SESSION_EVICT_MIN_IDLE", "REBOX_PROGRESS_KEEPALIVE_INTERVAL"):
+        for bad in ("-1", "x"):
+            with pytest.raises(ConfigError):
+                load_settings({"REBOX_TOKEN": "t", "REBOX_CONFIG": cfg, key: bad})

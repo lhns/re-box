@@ -5,7 +5,7 @@ import os
 import signal
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -17,6 +17,7 @@ from anyio.streams.text import TextReceiveStream
 from .app import App, make_server
 from .children import kill_leftovers
 from .config import ConfigError, harden, load_settings, read_token
+from .evidence import prune_old
 from .log import log
 
 HEADLESS_PORT = 8089
@@ -28,6 +29,8 @@ SUBDIRS = ("ghidra-projects", "home", "cache", "rea/evidence")
 SCRIPT_PATH = "/usr/local/lib/rebox/ghidra_scripts"
 AUTOSAVE_CLIENT_TIMEOUT = 3600.0  # save_all_programs waits for running auto-analysis
 SHUTDOWN_SAVE_WAIT = 30.0
+PRUNE_INTERVAL = 86400.0
+HEALTHY_STATES = ("stopped", "stopping", "ready")  # /healthz is 200 in these (and while starting within the timeout)
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,8 @@ class SupervisorConfig:
     java_opts: list[str]
     start_timeout: float
     autosave_interval: float = 0.0
+    idle_timeout: float = 0.0  # stop the Ghidra server this long after the last session closed; 0: never
+    evidence_retention_days: float = 0.0  # 0: keep REA evidence bundles forever
 
 
 def _dot_element(path: Path) -> bool:
@@ -60,6 +65,16 @@ def _ensure_writable(path: Path, what: str) -> None:
         ) from None
 
 
+def _keep_out_of_git(state: Path) -> None:
+    """The state dir can sit inside a repo (it defaults to RE_WORKDIR/re-box-state): ignore all of it."""
+    ignore = state / ".gitignore"
+    if not ignore.exists():
+        try:
+            ignore.write_text("*\n")
+        except OSError:
+            pass
+
+
 def validate(env: Mapping[str, str]) -> SupervisorConfig:
     """Raise ConfigError (one clear line) when the container is misconfigured."""
     read_token(env)
@@ -78,11 +93,19 @@ def validate(env: Mapping[str, str]) -> SupervisorConfig:
     try:
         timeout = float(env.get("REBOX_HEADLESS_START_TIMEOUT", 300))
         interval = float(env.get("REBOX_AUTOSAVE_INTERVAL", 300))
+        idle = float(env.get("REBOX_GHIDRA_IDLE_TIMEOUT", 300))
+        retention = float(env.get("REBOX_EVIDENCE_RETENTION_DAYS", 30))
     except ValueError:
-        raise ConfigError("REBOX_HEADLESS_START_TIMEOUT and REBOX_AUTOSAVE_INTERVAL must be numbers") from None
-    if interval < 0:
-        raise ConfigError("REBOX_AUTOSAVE_INTERVAL must be >= 0")
+        raise ConfigError(
+            "REBOX_HEADLESS_START_TIMEOUT, REBOX_AUTOSAVE_INTERVAL, REBOX_GHIDRA_IDLE_TIMEOUT and "
+            "REBOX_EVIDENCE_RETENTION_DAYS must be numbers"
+        ) from None
+    if min(interval, idle, retention) < 0:
+        raise ConfigError(
+            "REBOX_AUTOSAVE_INTERVAL, REBOX_GHIDRA_IDLE_TIMEOUT and REBOX_EVIDENCE_RETENTION_DAYS must be >= 0"
+        )
     _ensure_writable(state, "REBOX_STATE_DIR")
+    _keep_out_of_git(state)
     for sub in SUBDIRS:
         _ensure_writable(state / sub, "REBOX_STATE_DIR")
     if projects != state / "ghidra-projects":
@@ -96,6 +119,8 @@ def validate(env: Mapping[str, str]) -> SupervisorConfig:
         java_opts=env.get("JAVA_OPTS", "").split(),
         start_timeout=timeout,
         autosave_interval=interval,
+        idle_timeout=idle,
+        evidence_retention_days=retention,
     )
 
 
@@ -140,19 +165,58 @@ async def ensure_project(http: httpx2.AsyncClient, base: str, projects_dir: Path
 
 
 class Headless:
+    """The ghidra-mcp JVM, run on demand: started when a session wants it, stopped after it has been idle.
+
+    States: stopped, starting, ready, failed (crashed, backing off), stopping (idle stop), shutting_down.
+    """
+
     def __init__(self, cfg: SupervisorConfig, instance: str, base: str | None = None):
         self.cfg, self.instance = cfg, instance
         self.base = base or f"http://127.0.0.1:{HEADLESS_PORT}"
-        self.ready = anyio.Event()
-        self.reason = "starting"
+        self.state = "stopped"
+        self.reason = ""
+        self.on_ready: Callable[[], None] | None = None  # called each time the server becomes ready
         self._proc: anyio.abc.Process | None = None
         self._healthy = False
-        self._stopping = False
+        self._stopping = False  # container shutdown
+        self._idle_stopped = False  # the current process is being stopped for lack of sessions
+        self._want = False
+        self._wake = anyio.Event()
+        self._starting_since = 0.0
         self._saving = anyio.Lock()  # one save_all_programs at a time
         self._http = httpx2.AsyncClient(timeout=10)
 
-    def health(self) -> tuple[bool, str]:
-        return (True, "") if self._healthy else (False, self.reason)
+    def want(self, wanted: bool) -> None:
+        """Sessions exist (True) or none do (False)."""
+        if wanted != self._want:
+            self._want = wanted
+            self._poke()
+
+    def ready(self) -> bool:
+        return self._healthy
+
+    def health(self) -> tuple[bool, str, str]:
+        """(ok, reason, state): a stopped server is fine (it starts with the next session); a failed one is not."""
+        if self.state in HEALTHY_STATES:
+            return True, "", self.state
+        if self.state == "starting" and time.monotonic() - self._starting_since <= self.cfg.start_timeout:
+            return True, "", self.state
+        return False, self.reason or "headless server did not start in time", self.state
+
+    def _set(self, state: str, reason: str = "") -> None:
+        if state == "starting":
+            self._starting_since = time.monotonic()
+        if state != self.state:
+            log("headless_state", state=state, **({"reason": reason} if reason else {}))
+        self.state, self.reason = state, reason
+
+    def _poke(self) -> None:
+        woken, self._wake = self._wake, anyio.Event()
+        woken.set()
+
+    async def _until(self, pred: Callable[[], bool]) -> None:
+        while not pred():
+            await self._wake.wait()
 
     async def _check(self) -> bool:
         try:
@@ -220,19 +284,24 @@ class Headless:
                 await self.save_all("interval")
 
     async def run(self) -> None:
-        """Start the headless server, keep it healthy, restart it with backoff when it exits."""
+        """Start the headless server while sessions want it; restart it with backoff when it crashes."""
         backoff = 5.0
         while not self._stopping:
+            await self._until(lambda: self._want or self._stopping)
+            if self._stopping:
+                return
             env = {k: v for k, v in os.environ.items() if not k.startswith("REBOX_")}
             env["GHIDRA_MCP_FILE_ROOT"] = str(self.cfg.workdir)
             env["REBOX_INSTANCE"] = self.instance  # lets the shutdown sweep find a stuck JVM too
             started = time.monotonic()
-            self.reason = "starting"
+            self._set("starting")
             if not await self._create_project(env):
-                self.reason = "project not created"
-                await anyio.sleep(backoff)
+                self._set("failed", "project not created")
+                await self._backoff(backoff)
                 backoff = min(60.0, backoff * 2)
                 continue
+            if self._stopping:
+                return
             self._proc = proc = await anyio.open_process(
                 headless_command(self.cfg), env=env, stdout=-1, stderr=-2, start_new_session=True
             )
@@ -240,18 +309,56 @@ class Headless:
                 tg.start_soon(self._relay, proc)
                 tg.start_soon(self._monitor, proc, tg.cancel_scope)
                 tg.start_soon(self._autosave_loop)
+                tg.start_soon(self._idle_stop, proc)
                 await proc.wait()
                 tg.cancel_scope.cancel()
             self._healthy = False
             self._kill_group(proc, signal.SIGKILL)  # stragglers of the old JVM's group
-            self.reason = "headless server down"
             if self._stopping:
                 return
+            if self._idle_stopped:
+                self._idle_stopped = False
+                self._set("stopped")
+                backoff = 5.0
+                continue
             log("headless_exit", "error", exit_code=proc.returncode)
             if time.monotonic() - started > 60:
                 backoff = 5.0
-            await anyio.sleep(backoff)
+            if not self._want:
+                self._set("stopped")  # nobody is waiting for it; the next session starts it again
+                continue
+            self._set("failed", "headless server down")
+            await self._backoff(backoff)
             backoff = min(60.0, backoff * 2)
+
+    async def _backoff(self, seconds: float) -> None:
+        """Sleep, but wake early when the last session goes away (no point in restarting then)."""
+        with anyio.move_on_after(seconds):
+            await self._until(lambda: not self._want or self._stopping)
+        if not self._want and not self._stopping:
+            self._set("stopped")
+
+    async def _idle_stop(self, proc: anyio.abc.Process) -> None:
+        """Stop the server once no session has wanted it for the idle timeout."""
+        timeout = self.cfg.idle_timeout
+        if timeout <= 0:
+            return
+        while True:
+            await self._until(lambda: not self._want)
+            with anyio.move_on_after(timeout) as idle:
+                await self._until(lambda: self._want)
+            if not idle.cancelled_caught:
+                continue  # a session came back
+            with anyio.move_on_after(SHUTDOWN_SAVE_WAIT):
+                await self.save_all("idle")
+            if not self._want:
+                break
+        log("headless_idle_stop", idle_s=timeout)
+        graceful = self._healthy
+        self._idle_stopped = True
+        self._healthy = False
+        self._set("stopping")
+        await self._terminate(proc, anyio.Event(), graceful)
 
     async def _monitor(self, proc: anyio.abc.Process, scope: anyio.CancelScope) -> None:
         with anyio.move_on_after(self.cfg.start_timeout) as waiting:
@@ -259,23 +366,32 @@ class Headless:
                 await anyio.sleep(1)
         if waiting.cancelled_caught:
             log("headless_start_timeout", "error")
+            self._set("failed", "headless server did not start in time")
             self._kill_group(proc, signal.SIGKILL)
             return
         try:
             await ensure_project(self._http, self.base, self.cfg.projects_dir)
         except (httpx2.HTTPError, ValueError) as e:
-            self.reason = "project not open"
+            self._set("failed", "project not open")
             log("project_failed", "error", error=str(e)[:500])
             self._kill_group(proc, signal.SIGKILL)
             return
+        if self.state != "starting":  # being stopped meanwhile
+            return
         self._healthy = True
-        self.ready.set()
+        self._set("ready")
+        if self.on_ready:
+            self.on_ready()
         while True:
             await anyio.sleep(POLL_INTERVAL)
+            if self.state not in ("ready", "failed"):
+                continue
             ok = await self._check()
             self._healthy = ok
-            if not ok:
-                self.reason = "headless server down"
+            if ok:
+                self._set("ready")
+            else:
+                self._set("failed", "headless server down")
 
     @staticmethod
     def _kill_group(proc: anyio.abc.Process, sig: int) -> None:
@@ -285,23 +401,31 @@ class Headless:
             pass
 
     async def stop(self, skip: anyio.Event) -> None:
-        """Save and exit Ghidra, then escalate: exit_ghidra, wait 60 s, SIGTERM, SIGKILL, instance sweep."""
+        """Container shutdown: save and exit Ghidra, escalate, then sweep the instance's leftovers."""
         self._stopping = True
+        graceful = self._healthy
         self._healthy = False
-        self.reason = "shutting down"
+        self._set("shutting_down", "shutting down")
+        self._poke()
         proc = self._proc
         if proc is not None and proc.returncode is None:
+            await self._terminate(proc, skip, graceful)
+        await anyio.to_thread.run_sync(kill_leftovers, None, self.instance)
+
+    async def _terminate(self, proc: anyio.abc.Process, skip: anyio.Event, graceful: bool) -> None:
+        """exit_ghidra (saves; skipped for a server that never came up), wait 60 s, SIGTERM, SIGKILL."""
+        if graceful:
             try:
                 await self._http.post(f"{self.base}/exit_ghidra", timeout=30)
             except httpx2.HTTPError:
                 pass
-            for sig, wait in ((None, 60), (signal.SIGTERM, 5), (signal.SIGKILL, 5)):
-                if sig is not None:
-                    self._kill_group(proc, sig)
+        for sig, wait in ((None, 60 if graceful else 0), (signal.SIGTERM, 5), (signal.SIGKILL, 5)):
+            if sig is not None:
+                self._kill_group(proc, sig)
+            if wait:
                 await self._wait_exit(proc, skip, wait)
-                if proc.returncode is not None:
-                    break
-        await anyio.to_thread.run_sync(kill_leftovers, None, self.instance)
+            if proc.returncode is not None:
+                break
 
     @staticmethod
     async def _wait_exit(proc: anyio.abc.Process, skip: anyio.Event, timeout: float) -> None:
@@ -319,9 +443,20 @@ class Headless:
                 tg.start_soon(skipped)
 
 
+async def prune_evidence_loop(cfg: SupervisorConfig) -> None:
+    """Delete REA evidence bundles older than the retention, at start and then daily."""
+    while True:
+        await anyio.to_thread.run_sync(prune_old, str(cfg.state_dir / "rea" / "evidence"), cfg.evidence_retention_days)
+        if cfg.evidence_retention_days <= 0:
+            return
+        await anyio.sleep(PRUNE_INTERVAL)
+
+
 async def supervise(cfg: SupervisorConfig, app: App) -> int:
     headless = Headless(cfg, app.instance)
     app.health = headless.health
+    app.backend = headless
+    headless.on_ready = app.backend_became_ready
     skip = anyio.Event()
     server = make_server(app)
     async with anyio.create_task_group() as tg:
@@ -350,16 +485,11 @@ async def supervise(cfg: SupervisorConfig, app: App) -> int:
 
         tg.start_soon(on_signals)
         tg.start_soon(headless.run)
-        with anyio.move_on_after(cfg.start_timeout + 30) as waiting:
-            await headless.ready.wait()
-        if waiting.cancelled_caught:
-            print("rebox-supervisor: headless server did not become ready", file=sys.stderr)
-            await headless.stop(skip)
-            tg.cancel_scope.cancel()
-            return 1
-        await server.serve()
+        tg.start_soon(prune_evidence_loop, cfg)
+        await server.serve()  # the port opens at once; Ghidra starts with the first session
         tg.cancel_scope.cancel()
     return 0
+
 
 
 def main() -> None:

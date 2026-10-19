@@ -35,6 +35,7 @@ class Catalog:
     resources: dict[str, str]  # uri -> child
     templates: tuple[tuple[str, str], ...]  # (static uri prefix, child), longest first
     lists: dict[str, list[dict]]  # method result key -> merged items
+    denied: frozenset[str] = frozenset()  # prefixed names of tools hidden by a child's `deny`
 
     @classmethod
     def build(cls, specs: tuple[ChildSpec, ...], parts: dict[str, ChildCatalog]) -> "Catalog":
@@ -43,6 +44,7 @@ class Catalog:
         prompts: dict[str, tuple[str, str]] = {}
         resources: dict[str, str] = {}
         templates: list[tuple[str, str]] = []
+        denied: set[str] = set()
         lists: dict[str, list[dict]] = {"tools": [], "prompts": [], "resources": [], "resourceTemplates": []}
 
         def claim(kind: str, table: dict, name: str, child: str, original: str) -> None:
@@ -59,6 +61,9 @@ class Catalog:
                 continue
             for tool in part.tools:
                 item = _prefixed(spec.prefix, tool)
+                if tool.get("name") in spec.deny:
+                    denied.add(item["name"])
+                    continue
                 claim("tool", tools, item["name"], spec.name, tool.get("name", ""))
                 lists["tools"].append(item)
             for prompt in part.prompts:
@@ -77,7 +82,7 @@ class Catalog:
         if problems:
             raise CatalogError(problems)
         templates.sort(key=lambda t: -len(t[0]))
-        return cls(tools, prompts, resources, tuple(templates), lists)
+        return cls(tools, prompts, resources, tuple(templates), lists, frozenset(denied))
 
     def owner_of_uri(self, uri: str) -> str | None:
         if uri in self.resources:

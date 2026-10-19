@@ -18,6 +18,7 @@ replies: list = []
 cancel_events: dict = {}
 extra_tools: list[str] = []
 saves: list[str] = []
+connects: list = []
 
 
 def tool(name, props=None):
@@ -27,7 +28,7 @@ def tool(name, props=None):
 
 def tools():
     names = ["echo", "pid", "env", "set_state", "get_state", "slow", "get_cancelled", "progress",
-             "add_tool", "crash", "spawn", "structured", "fail", "ask_roots", "bad_msgs", "save"]
+             "add_tool", "crash", "spawn", "structured", "fail", "ask_roots", "bad_msgs", "save", "sleep", "connect_instance", "get_connects"]
     out = [tool(n) for n in names + os.environ.get("FAKE_EXTRA_TOOLS", "").split(",") + extra_tools if n]
     if os.environ.get("FAKE_BIG"):
         t = tool("big")
@@ -56,8 +57,16 @@ async def call(rid, name, args, meta):
         if os.environ.get("FAKE_SAVE_FAIL"):
             return text("disk full", isError=True)
         with open(args["path"], "w") as f:
-            f.write(json.dumps({"saves": len(saves)}))
+            f.write(json.dumps({"records": [], "unknowns": []} if os.environ.get("FAKE_SAVE_EMPTY") else {"saves": len(saves)}))
         return text("saved")
+    if name == "sleep":
+        await asyncio.sleep(float(args.get("seconds", 1)))
+        return text("slept")
+    if name == "connect_instance":
+        connects.append(args)
+        return text("connected")
+    if name == "get_connects":
+        return text(json.dumps(connects))
     if name == "pid":
         return text(str(os.getpid()))
     if name == "env":

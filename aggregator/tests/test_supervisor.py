@@ -78,6 +78,25 @@ def test_autosave_interval_validated(tmp_path):
             validate(env(tmp_path, REBOX_AUTOSAVE_INTERVAL=bad))
 
 
+def test_idle_and_retention_validated(tmp_path):
+    cfg = validate(env(tmp_path))
+    assert (cfg.idle_timeout, cfg.evidence_retention_days) == (300, 30)
+    cfg = validate(env(tmp_path, REBOX_GHIDRA_IDLE_TIMEOUT="0", REBOX_EVIDENCE_RETENTION_DAYS="0"))
+    assert (cfg.idle_timeout, cfg.evidence_retention_days) == (0, 0)
+    for key in ("REBOX_GHIDRA_IDLE_TIMEOUT", "REBOX_EVIDENCE_RETENTION_DAYS"):
+        for bad in ("-1", "x"):
+            with pytest.raises(ConfigError, match=key):
+                validate(env(tmp_path, **{key: bad}))
+
+
+def test_state_dir_gets_a_gitignore(tmp_path):
+    cfg = validate(env(tmp_path))
+    assert (cfg.state_dir / ".gitignore").read_text() == "*\n"
+    (cfg.state_dir / ".gitignore").write_text("mine\n")
+    validate(env(tmp_path))
+    assert (cfg.state_dir / ".gitignore").read_text() == "mine\n"  # never overwritten
+
+
 def test_missing_token(tmp_path):
     with pytest.raises(ConfigError, match="REBOX_TOKEN"):
         validate({"RE_WORKDIR": str(tmp_path)})

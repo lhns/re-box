@@ -7,17 +7,26 @@ prefix = "rea_"
 command = ["/usr/local/bin/rea", "mcp"]
 # REA's database is private to the process; its evidence bundle is the supported way to keep
 # annotations. Run on session close and periodically when REBOX_STATE_DIR is set; {state_dir} and
-# {session} are substituted.
+# {session} are substituted. prune_empty deletes the file again when the bundle holds nothing.
 [child.autosave]
 tool = "export_evidence_bundle"
 arguments = { path = "{state_dir}/rea/evidence/{session}.json", overwrite = true }
+prune_empty = true
 
 [[child]]
 name = "ghidra"
 prefix = "gh_"
 command = ["/opt/ghidra-mcp/venv/bin/bridge-mcp-ghidra", "--transport", "stdio"]
+# Hidden from tools/list and refused on call. The child's own names, without the prefix.
+deny = ["run_ghidra_script", "run_script_inline"]
 [child.env]
 GHIDRA_MCP_URL = "http://127.0.0.1:8089"
 # The headless server and its project are shared by all sessions: never let a call fall back to
 # another session's "current program".
 GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS = "1"
+# The Ghidra server starts with the first session, so a bridge usually boots before it. When it
+# is up (and the client has sent `initialized`), the bridge is told to connect to it; it then sends
+# tools/list_changed and the gh_ tools appear. Its own 15 s retry is the fallback.
+[child.on_ready]
+tool = "connect_instance"
+arguments = { project = "rebox" }

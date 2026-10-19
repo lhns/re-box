@@ -40,7 +40,7 @@ class H(BaseHTTPRequestHandler):
         project["open"] = True
         self.reply({"success": True, "saved_count": 0, "errors": []})
         if self.path == "/exit_ghidra":
-            threading.Thread(target=lambda: os._exit(0)).start()
+            threading.Timer(float(os.environ.get("FAKE_EXIT_DELAY", "0")), lambda: os._exit(0)).start()
 
 
 print("fake headless starting", flush=True)

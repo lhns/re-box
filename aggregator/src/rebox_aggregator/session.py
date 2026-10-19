@@ -29,6 +29,7 @@ from . import __version__
 from .catalog import Catalog, CatalogError, ChildCatalog
 from .children import Child, ChildError, kill_leftovers, valid_id
 from .config import Settings
+from .evidence import drop_if_empty
 from .log import log
 
 LIST_CHANGED = {
@@ -60,6 +61,9 @@ class Inflight:
     child: Child | None = None
     child_id: int | None = None
     done: bool = False
+    token: Any = None  # the request's progressToken, once forwarded to a child
+    progress: float = 0.0  # highest progress value sent downstream for it
+    progress_at: float = 0.0  # monotonic time of the last progress downstream (real or synthetic)
 
 
 class _Slot:
@@ -81,8 +85,13 @@ class Session:
         settings: Settings,
         instance: str,
         on_close: Callable[["Session"], None],
+        backend_ready: Callable[[], bool] = lambda: True,
     ):
         self.sid, self.transport, self.settings, self.instance, self.on_close = sid, transport, settings, instance, on_close
+        self.backend_ready = backend_ready
+        self.get_streams = 0  # open standalone GET (notification) streams; maintained by the app
+        self._client_ready = False  # the client sent notifications/initialized
+        self._pending_ready: set[str] = set()  # children whose on_ready call is still owed
         self.tag = hashlib.sha256(sid.encode()).hexdigest()[:16]
         self.opened_at = time.monotonic()
         self.last_activity = self.opened_at
@@ -120,6 +129,8 @@ class Session:
                     task_status.started()
                     tg.start_soon(self._write_downstream)
                     tg.start_soon(self._idle_watch)
+                    if self.settings.progress_keepalive > 0:
+                        tg.start_soon(self._keepalive_loop)
                     if self._autosave_on() and self.settings.autosave_interval > 0:
                         tg.start_soon(self._autosave_loop)
                     try:
@@ -166,14 +177,46 @@ class Session:
         if self._tg is not None:
             self._tg.cancel_scope.cancel()
 
+    def idle_timeout(self) -> float:
+        """A client that keeps its GET stream open is present (an interactive agent); one without is
+        probably gone (`claude -p` exited), so it gives up its slot, and its REA JVM, sooner."""
+        s = self.settings
+        if self.get_streams > 0 or s.orphan_timeout <= 0:
+            return s.idle_timeout
+        return min(s.idle_timeout, s.orphan_timeout)
+
+    @property
+    def busy(self) -> bool:
+        return bool(self._inflight)
+
+    def idle_for(self) -> float:
+        return time.monotonic() - self.last_activity
+
     async def _idle_watch(self) -> None:
-        timeout = self.settings.idle_timeout
         while True:
+            timeout = self.idle_timeout()
             await anyio.sleep(max(0.05, min(5.0, timeout / 5)))
-            idle = time.monotonic() - self.last_activity
+            timeout = self.idle_timeout()
+            idle = self.idle_for()
             # A long call may legitimately keep a session quiet; a client silent for 4x is gone.
             if idle > timeout and (not self._inflight or idle > 4 * timeout):
-                await self.close("idle")
+                await self.close("orphaned" if timeout < self.settings.idle_timeout else "idle")
+
+    async def _keepalive_loop(self) -> None:
+        """Clients abort a request after minutes without progress; imports and analysis can be quiet longer."""
+        interval = self.settings.progress_keepalive
+        while True:
+            await anyio.sleep(max(0.02, interval / 4))
+            now = time.monotonic()
+            for fl in list(self._inflight.values()):
+                if fl.token is not None and not fl.done and now - fl.progress_at >= interval:
+                    fl.progress += 0.001  # must increase; real values from the child stay larger
+                    fl.progress_at = now
+                    await self._notify_down(
+                        "notifications/progress",
+                        {"progressToken": fl.token, "progress": fl.progress, "message": "still working"},
+                        fl.id,
+                    )
 
     # -- autosave ---------------------------------------------------------
 
@@ -218,6 +261,8 @@ class Session:
                     if result.get("isError"):
                         outcome = "tool_error"
                         error = " ".join(c.get("text", "") for c in result.get("content") or [] if isinstance(c, dict))
+                    elif child.spec.autosave.prune_empty:
+                        await anyio.to_thread.run_sync(drop_if_empty, args.get("path"))
                 except ChildError as e:
                     outcome, error = "rpc_error", e.message
                 except OSError as e:
@@ -244,8 +289,10 @@ class Session:
                     await self._autosave(child, "interval")
 
     async def on_exit(self, child: Child) -> None:
-        if self.initialized and not self._closing and all(c.dead for c in self.children.values()):
-            self._tg.start_soon(self.close, "all_children_exited")
+        # A session missing a backend is half dead (no rea_ tools, or no gh_ edits); the client's
+        # next request gets 404 and re-initializes into a whole one.
+        if self.initialized and not self._closing:
+            self._tg.start_soon(self.close, "child_exited")
 
     # -- helpers ----------------------------------------------------------
 
@@ -321,6 +368,9 @@ class Session:
                     pass
             if fl.unanswered:
                 await fl.unanswered()
+        elif msg.method == "notifications/initialized":
+            self._client_ready = True
+            self.backend_changed()
         elif msg.method == "notifications/roots/list_changed":
             for child in self.children.values():
                 if not child.dead:
@@ -379,6 +429,8 @@ class Session:
             kind = "tool" if method == "tools/call" else "prompt"
             owner = (cat.tools if kind == "tool" else cat.prompts).get(p.get("name"))  # type: ignore[arg-type]
             if owner is None:
+                if kind == "tool" and p.get("name") in cat.denied:
+                    raise RpcError(-32602, f"Tool {p.get('name')} is disabled by this re-box's configuration")
                 raise RpcError(-32602, f"Unknown {kind}: {p.get('name')}")
             return await self._forward(self.children[owner[0]], method, {**p, "name": owner[1]}, fl)
         if method in ("resources/read", "resources/subscribe", "resources/unsubscribe"):
@@ -424,6 +476,8 @@ class Session:
         if owns:
             self._tokens[key] = fl.id
         fl.child = child
+        if owns:
+            fl.token, fl.progress_at = token, time.monotonic()
 
         def set_id(cid: int) -> None:
             fl.child_id = cid
@@ -464,6 +518,8 @@ class Session:
         async def boot(spec: Any) -> None:
             if self._closing:
                 return
+            if spec.on_ready and not self.backend_ready():
+                self._pending_ready.add(spec.name)  # booted before its backend: told once that it is up
             env = {**base, **spec.env, "REBOX_INSTANCE": self.instance, "REBOX_SESSION": self.tag}
             child = self.children[spec.name] = Child(spec, self.tag, env, self.settings.child_grace, self)
             try:
@@ -497,7 +553,65 @@ class Session:
             "protocolVersion": version,
             "capabilities": self._merged_capabilities(up),
             "serverInfo": {"name": "rebox-aggregator", "version": __version__},
+            "instructions": self._instructions(),
         }
+
+    def _instructions(self) -> str:
+        """What an agent cannot see from the tool list: where state lives and how the two backends differ."""
+        s = self.settings
+        lines = [
+            "re-box: Ghidra (gh_ tools) and REA (rea_ tools) behind one endpoint.",
+            "gh_: one persistent Ghidra project shared by all sessions. Pass the program selector on every call; "
+            "gh_import_file only reads files under RE_WORKDIR" + (f" ({os.environ['RE_WORKDIR']})." if os.environ.get("RE_WORKDIR") else "."),
+            "rea_: this session's own analysis; it is discarded when the session ends. Reopen the binary in a new "
+            "session and import the evidence bundle to get your findings back.",
+            "Paths: the container sees host paths unchanged (same-path mount). On Windows send the Git Bash form "
+            "(/c/Users/you/re/x.bin), not C:\\... .",
+            "Ghidra starts with the first session: on a cold start the gh_ tools appear after about 40 s, announced by "
+            "tools/list_changed. If they are missing, wait and list tools again.",
+        ]
+        if s.state_dir:
+            ev = next((self._autosave_call(c)[1].get("path") for c in self.children.values() if c.spec.autosave), None)
+            lines.append(
+                f"State directory: {s.state_dir}. Session tag: {self.tag}."
+                + (f" Evidence is saved to {ev} on close and periodically." if ev else "")
+            )
+        return "\n".join(lines)
+
+    # -- backend readiness ------------------------------------------------
+
+    def on_backend_ready(self) -> None:
+        """The shared backend (Ghidra) came up: tell every child that wants to know."""
+        self._pending_ready |= {n for n, c in self.children.items() if c.spec.on_ready}
+        self.backend_changed()
+
+    def backend_changed(self) -> None:
+        if not (self._client_ready and self.initialized and not self._closing and self.backend_ready()):
+            return
+        for name in list(self._pending_ready):
+            self._pending_ready.discard(name)
+            child = self.children.get(name)
+            if child is not None and not child.dead:
+                self._tg.start_soon(self._call_on_ready, child)
+
+    async def _call_on_ready(self, child: Child) -> None:
+        spec = child.spec.on_ready
+        assert spec
+        outcome, error = "ok", None
+        try:
+            with anyio.fail_after(60):
+                result = await child.request(
+                    "tools/call", {"name": spec.tool, "arguments": dict(spec.arguments)}, bypass=True
+                )
+            if result.get("isError"):
+                outcome = "tool_error"
+                error = " ".join(c.get("text", "") for c in result.get("content") or [] if isinstance(c, dict))
+        except (ChildError, TimeoutError) as e:
+            outcome, error = "failed", str(e) or type(e).__name__
+        log(
+            "on_ready", "info" if outcome == "ok" else "warn", session=self.tag, child=child.name, outcome=outcome,
+            **({"error": error[:300]} if error else {}),
+        )
 
     def _build_catalog(self, parts: dict[str, ChildCatalog] | None = None) -> Catalog:
         parts = self.parts if parts is None else parts
@@ -589,6 +703,12 @@ class Session:
         if method == "notifications/progress" and isinstance(params, dict):
             token = params.get("progressToken")
             related = self._tokens.get((child.name, token)) if valid_id(token) else None
+            fl = self._inflight.get(related) if related is not None else None
+            if fl is not None:
+                fl.progress_at = time.monotonic()
+                value = params.get("progress")
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    fl.progress = max(fl.progress, float(value))
             await self._notify_down(method, params, related)
         elif method == "notifications/cancelled" and isinstance(params, dict):
             rid = params.get("requestId")
