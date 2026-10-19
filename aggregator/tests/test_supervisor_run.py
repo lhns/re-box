@@ -37,12 +37,14 @@ def supervisor(tmp_path, **extra):
     cfg = tmp_path / "agg.toml"
     cfg.write_text(f'[[child]]\nname = "a"\nprefix = "a_"\ncommand = ["{sys.executable}", "{FAKES / "fake_server.py"}", "a"]\n')
     port = free_port()
+    tmp = tmp_path / "t"  # the supervisor sweeps its temp dir at start: never the real one
+    tmp.mkdir(exist_ok=True)
     env = {
         **{k: v for k, v in os.environ.items() if k not in ("GHIDRA_PROJECTS_DIR", "REBOX_STATE_DIR")},
         "PATH": f"{bindir}:{os.environ['PATH']}", "REBOX_TOKEN": "tok", "REBOX_PORT": str(port),
         "REBOX_BIND": "127.0.0.1", "REBOX_CONFIG": str(cfg), "RE_WORKDIR": str(work), "FAKE_MARKER": str(marker),
         "REBOX_INSTANCE": f"supervisor-test-{port}", "GHIDRA_INSTALL_DIR": str(ghidra), "REBOX_AUTOSAVE_INTERVAL": "1",
-        "REBOX_HEADLESS_START_TIMEOUT": "30", **extra,
+        "REBOX_HEADLESS_START_TIMEOUT": "30", "TMPDIR": str(tmp), **extra,
     }
     proc = subprocess.Popen([SUPERVISOR], env=env, stdout=subprocess.PIPE, text=True)
     base = f"http://127.0.0.1:{port}"
@@ -115,6 +117,7 @@ def test_supervisor_lifecycle(tmp_path):
             httpx2.get(f"{base}/healthz")
     out = proc.stdout.read()
     assert '"event": "session_close"' in out and '"reason": "shutdown"' in out
+    assert '"event": "project_size"' in out
 
 
 def test_sigterm_while_stopped_exits_cleanly(tmp_path):
@@ -134,6 +137,29 @@ def test_supervisor_prunes_old_evidence_at_start(tmp_path):
     with supervisor(tmp_path, REBOX_EVIDENCE_RETENTION_DAYS="30") as _:
         assert wait_for(lambda: not old.exists(), 10)
         assert fresh.exists()
+
+
+def test_supervisor_sweeps_leftover_tmp_at_start(tmp_path):
+    t = tmp_path / "t"
+    (t / "rea-ghidra-x").mkdir(parents=True)
+    (t / "rea-ghidra-x" / "target.bin").write_bytes(b"x" * 10)
+    (t / "rebox-attach-locks").mkdir()
+    (t / "rebox-attach-locks" / "a.lock").write_text("")
+    (t / "unrelated").mkdir()
+    with supervisor(tmp_path) as (proc, base, work, marker):
+        assert not (t / "rea-ghidra-x").exists() and not (t / "rebox-attach-locks" / "a.lock").exists()
+        assert (t / "unrelated").exists()
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(30) == 0
+    out = proc.stdout.read()
+    assert '"event": "tmp_swept"' in out and '"removed": 2' in out and '"bytes": 10' in out
+
+
+def test_supervisor_removes_partial_exports_at_start(tmp_path):
+    ev = tmp_path / "work" / "re-box-state" / "rea" / "evidence"
+    (ev / ".rea-write-abc").mkdir(parents=True)
+    with supervisor(tmp_path) as _:
+        assert wait_for(lambda: not (ev / ".rea-write-abc").exists(), 10)
 
 
 def test_supervisor_refuses_without_token(tmp_path):
