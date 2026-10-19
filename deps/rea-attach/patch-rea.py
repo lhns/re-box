@@ -77,16 +77,19 @@ CLASS_DECL_NEW = CLASS_DECL + """
 
     private JsonElement reboxHandle(Request request, SessionDescriptor descriptor) throws Exception {
         if (!REBOX_EDITS.contains(request.method)) return handleRequest(request, descriptor);
-        if (reboxWriteLock != null) reboxWriteLock.lockInterruptibly();
-        try {
-            // gh_ writes that don't take the lock: wait for theirs to end rather than join it.
-            long deadline = System.nanoTime() + 60_000_000_000L;
-            while (currentProgram.getCurrentTransactionInfo() != null && System.nanoTime() < deadline)
-                Thread.sleep(20);
-            return handleRequest(request, descriptor);
-        }
-        finally {
-            if (reboxWriteLock != null) reboxWriteLock.unlock();
+        // Writers that don't take the lock (analysis, scripts): wait for their transaction to end
+        // rather than join it, but never while holding the lock, which every gh_ call needs.
+        long deadline = System.nanoTime() + 60_000_000_000L;
+        while (true) {
+            if (reboxWriteLock != null) reboxWriteLock.lockInterruptibly();
+            try {
+                if (currentProgram.getCurrentTransactionInfo() == null || System.nanoTime() > deadline)
+                    return handleRequest(request, descriptor);
+            }
+            finally {
+                if (reboxWriteLock != null) reboxWriteLock.unlock();
+            }
+            Thread.sleep(20);
         }
     }
     // --- end re-box"""

@@ -4,8 +4,10 @@
 // it ends the bridge (the host script's watchdog), and its exit tells REA the provider is gone.
 //
 // argv: --target <original path> <the AnalyzeHeadless arguments REA built>
-// env:  REBOX_GHIDRA_URL (default http://127.0.0.1:8089), REBOX_HEADLESS_START_TIMEOUT
-//       (seconds to wait for a cold JVM, default 300), REBOX_REA_BRIDGE_DIR, REBOX_REA_ATTACH_SCRIPT
+// env:  REBOX_GHIDRA_URL (default http://127.0.0.1:8089), REBOX_REA_GHIDRA_WAIT (seconds to wait
+//       for the JVM, default 600: the supervisor starts it with the session, and REA's own startup
+//       deadline, REA_GHIDRA_STARTUP_TIMEOUT_MS, bounds the whole open anyway),
+//       REBOX_REA_BRIDGE_DIR, REBOX_REA_ATTACH_SCRIPT
 import { request } from "node:http";
 import { connect } from "node:net";
 import { existsSync, readFileSync } from "node:fs";
@@ -14,7 +16,7 @@ import { basename } from "node:path";
 const base = new URL(process.env.REBOX_GHIDRA_URL ?? "http://127.0.0.1:8089");
 const bridgeDir = process.env.REBOX_REA_BRIDGE_DIR ?? "/opt/rebox/rea-attach/ghidra_scripts";
 const hostScript = process.env.REBOX_REA_ATTACH_SCRIPT ?? "ReboxReaAttach.java";
-const startWait = Number(process.env.REBOX_HEADLESS_START_TIMEOUT || 300);
+const startWait = Number(process.env.REBOX_REA_GHIDRA_WAIT || 600);
 const SHA_MISMATCH = "REBOX_SHA_MISMATCH";
 
 const die = (msg) => {
