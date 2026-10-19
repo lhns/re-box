@@ -37,6 +37,9 @@ class NoBackend:
     def ready(self) -> bool:
         return True
 
+    def status(self) -> tuple[str, str]:
+        return "ready", ""
+
 
 class App:
     def __init__(self, settings: Settings, *, instance: str | None = None, health: Health | None = None):
@@ -159,7 +162,7 @@ class App:
         transport = StreamableHTTPServerTransport(mcp_session_id=uuid.uuid4().hex)
         session = Session(
             transport.mcp_session_id, transport, self.settings, self.instance, self._forget,  # type: ignore[arg-type]
-            lambda: self.backend.ready(),
+            lambda: self.backend.ready(), lambda: self.backend.status(),
         )
         self.sessions[session.sid] = session
         self.backend.want(True)

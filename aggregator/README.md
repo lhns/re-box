@@ -17,6 +17,7 @@ Why custom, and the protocol-era decision: `docs/DECISIONS.md`, "5.2".
 | `app.py` | ASGI app: auth, `/healthz`, `/mcp` session manager (cap, idle reaping, era rejection) |
 | `supervisor.py` | headless JVM lifecycle (on demand), Ghidra project, evidence pruning, runs the app, signal handling |
 | `evidence.py` | REA evidence bundles: drop an empty export, prune old ones |
+| `catalogcache.py` | per-child catalog cache (key, atomic save/load) and the session-less listing used by the warm-up |
 | `log.py` | JSON-lines logging to stdout |
 
 Entry points: `rebox-supervisor` (container default), `rebox-aggregator` (app only, no
@@ -55,6 +56,8 @@ prune_empty = true           # optional: delete the file again if it is an evide
 [child.on_ready]             # optional: a child tool called when the Ghidra server becomes ready after the child booted
 tool = "connect_instance"
 arguments = { project = "rebox" }
+[child.catalog_cache]        # optional: remember the child's full catalog, advertise it while the backend starts
+key = "{file:/opt/ghidra-mcp/VERSION}-lazy{GHIDRA_MCP_LAZY}"   # {NAME}: env var, {file:/path}: file content
 ```
 
 **Deny list:** `deny` names tools by the child's own (unprefixed) names. They are dropped from
@@ -68,6 +71,22 @@ and shows only static tools. When the server becomes ready (and the client has s
 bypass path as autosave; the bridge connects and sends `tools/list_changed`, which is relayed. A
 session that opens while Ghidra is already up gets no call. Logged as `on_ready` (`outcome`
 ok/tool_error/failed); the bridge's own 15 s retry is the fallback.
+
+**Catalog cache:** clients cannot be relied on to follow `tools/list_changed`, so a session must
+advertise the child's full catalog from its first `tools/list` even while the backend is down.
+Whenever a child's listing is complete (it booted against a ready backend, or `on_ready` succeeded
+and the child was re-listed) it is written, atomically, to
+`$REBOX_STATE_DIR/cache/rebox-catalog/<child>-<key>.json` (files for other keys are removed; a
+smaller listing never replaces a bigger one). A session that opens with the backend not ready
+advertises the cache instead of the child's partial listing; the child's tools that existed at
+boot (the bridge's static ones) stay callable at once, a `tools/call` for any other cached tool is
+held (progress keepalive applies) until the live listing has replaced the cache, at most
+`REBOX_HEADLESS_START_TIMEOUT`, and then fails with a tool result `isError` saying
+"Ghidra is failed: <reason>" / "still starting". When the live listing differs, `list_changed` is
+sent. With no cache the session's `initialize` reply is held until the child is connected (bounded;
+on timeout the partial listing is used and `catalog_cold` is logged), and the supervisor, at
+container start, runs the server once and lists the child itself (`catalog_warmup`) so that rarely
+happens. Without `REBOX_STATE_DIR` the feature is off.
 
 Autosave runs when `REBOX_STATE_DIR` is set, for children that served a `tools/call` since their
 last save (dirty): on session close (all reasons, concurrently, before the children are closed,
@@ -230,8 +249,11 @@ results.**
    opening concurrently). A session opening during the stop gets a second start once the old
    process has exited. A crash with sessions restarts with backoff (5 s doubling to 60 s; the last
    session leaving cancels the wait); a crash without sessions leaves it stopped.
-7. REA evidence bundles older than `REBOX_EVIDENCE_RETENTION_DAYS` are deleted at start and daily.
-8. SIGTERM/SIGINT: at once `POST /save_all_programs` (concurrently with closing the sessions, so a
+7. At start, if a child with a `catalog_cache` has none for its current key, the server is started
+   without a session, the child listed against it, the cache written and the server released to the
+   normal idle stop (`warm_up`).
+8. REA evidence bundles older than `REBOX_EVIDENCE_RETENTION_DAYS` are deleted at start and daily.
+9. SIGTERM/SIGINT: at once `POST /save_all_programs` (concurrently with closing the sessions, so a
    short `docker stop` grace cannot lose it; waited for at most 30 s), refuse new sessions, close all sessions, `POST /exit_ghidra` (saves all
    programs), wait up to 60 s for the JVM, then SIGTERM/SIGKILL its group, then SIGKILL anything
    left with this `REBOX_INSTANCE`; exit 0. A second signal skips the waits.

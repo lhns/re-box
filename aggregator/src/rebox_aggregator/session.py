@@ -25,7 +25,7 @@ from mcp_types import (
 )
 from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, LATEST_HANDSHAKE_VERSION
 
-from . import __version__
+from . import __version__, catalogcache
 from .catalog import Catalog, CatalogError, ChildCatalog
 from .children import Child, ChildError, kill_leftovers, valid_id
 from .config import Settings
@@ -77,6 +77,10 @@ def _error(rid: Any, code: int, message: str, data: Any = None) -> JSONRPCError:
     return JSONRPCError(jsonrpc="2.0", id=rid, error=err)
 
 
+def _tool_error(text: str) -> dict:
+    return {"content": [{"type": "text", "text": text}], "isError": True}
+
+
 class Session:
     def __init__(
         self,
@@ -86,12 +90,16 @@ class Session:
         instance: str,
         on_close: Callable[["Session"], None],
         backend_ready: Callable[[], bool] = lambda: True,
+        backend_status: Callable[[], tuple[str, str]] = lambda: ("ready", ""),
     ):
         self.sid, self.transport, self.settings, self.instance, self.on_close = sid, transport, settings, instance, on_close
         self.backend_ready = backend_ready
         self.get_streams = 0  # open standalone GET (notification) streams; maintained by the app
         self._client_ready = False  # the client sent notifications/initialized
         self._pending_ready: set[str] = set()  # children whose on_ready call is still owed
+        self.backend_status = backend_status
+        self._cached: set[str] = set()  # children whose advertised catalog is the cache, not yet their live listing
+        self._boot_tools: dict[str, set] = {}  # children's tool names as listed at boot (callable while cold)
         self.tag = hashlib.sha256(sid.encode()).hexdigest()[:16]
         self.opened_at = time.monotonic()
         self.last_activity = self.opened_at
@@ -432,6 +440,13 @@ class Session:
                 if kind == "tool" and p.get("name") in cat.denied:
                     raise RpcError(-32602, f"Tool {p.get('name')} is disabled by this re-box's configuration")
                 raise RpcError(-32602, f"Unknown {kind}: {p.get('name')}")
+            if kind == "tool" and owner[0] in self._cached and owner[1] not in self._boot_tools.get(owner[0], ()):
+                early = await self._wait_live(self.children[owner[0]], fl, p)
+                if early is not None:
+                    return early
+                owner = self.catalog.tools.get(p.get("name"))  # type: ignore[union-attr,arg-type]
+                if owner is None:
+                    raise RpcError(-32602, f"Unknown tool: {p.get('name')}")
             return await self._forward(self.children[owner[0]], method, {**p, "name": owner[1]}, fl)
         if method in ("resources/read", "resources/subscribe", "resources/unsubscribe"):
             return await self._forward(self._owner_of_uri(p.get("uri")), method, p, fl)
@@ -528,6 +543,8 @@ class Session:
                     child.capabilities = (await child.request("initialize", child_params)).get("capabilities") or {}
                     await child.notify("notifications/initialized")
                     self.parts[spec.name] = await self._fetch(child, ("tools", "prompts", "resources"))
+                if spec.catalog_cache and self.settings.state_dir:
+                    await self._cold_catalog(child, spec)
             except (ChildError, OSError, TimeoutError) as e:
                 log("child_init_failed", "error", session=self.tag, child=spec.name, error=(str(e) or type(e).__name__)[:500])
                 self.parts.pop(spec.name, None)
@@ -567,8 +584,8 @@ class Session:
             "session and import the evidence bundle to get your findings back.",
             "Paths: the container sees host paths unchanged (same-path mount). On Windows send the Git Bash form "
             "(/c/Users/you/re/x.bin), not C:\\... .",
-            "Ghidra starts with the first session: on a cold start the gh_ tools appear after about 40 s, announced by "
-            "tools/list_changed. If they are missing, wait and list tools again.",
+            "Ghidra starts with the first session (about 40 s). A gh_ call made while it starts waits for it; "
+            "if it fails you get a tool error saying why.",
         ]
         if s.state_dir:
             ev = next((self._autosave_call(c)[1].get("path") for c in self.children.values() if c.spec.autosave), None)
@@ -595,6 +612,84 @@ class Session:
                 self._tg.start_soon(self._call_on_ready, child)
 
     async def _call_on_ready(self, child: Child) -> None:
+        if await self._run_on_ready(child) == "ok" and child.name in self._cached:
+            await self._resync(child)  # the bridge will say so itself; do not depend on that
+
+    async def _resync(self, child: Child) -> None:
+        """Replace a cached catalog with the child's live one."""
+        try:
+            part = await self._fetch(child, ("tools", "prompts", "resources"), self.parts.get(child.name))
+            if self._adopt(child, part):
+                for kind in ("tools",):
+                    await self._notify_down(f"notifications/{kind}/list_changed", None, None, droppable=False)
+        except (ChildError, CatalogError) as e:
+            log("refresh_failed", "warn", session=self.tag, child=child.name, error=str(e)[:500])
+
+    def _adopt(self, child: Child, part: ChildCatalog) -> bool:
+        """Install a freshly listed catalog part, remember it in the cache. True when the client must be told."""
+        candidate = self._build_catalog({**self.parts, child.name: part})
+        changed = part != self.parts.get(child.name) or child.name not in self._cached
+        self.parts[child.name] = part
+        self.catalog = candidate
+        self._cached.discard(child.name)
+        if child.spec.catalog_cache and self.settings.state_dir:
+            self._tg.start_soon(self._save_cache, child.spec, part)
+        return changed
+
+    async def _save_cache(self, spec: Any, part: ChildCatalog) -> None:
+        await anyio.to_thread.run_sync(catalogcache.save, self.settings.state_dir, spec, part)
+
+    async def _cold_catalog(self, child: Child, spec: Any) -> None:
+        """A child with a catalog cache booted: decide what the session advertises for it."""
+        part = self.parts[spec.name]
+        self._boot_tools[spec.name] = {t.get("name") for t in part.tools}
+        if self.backend_ready():  # booted against a live backend: the listing is complete
+            self._tg.start_soon(self._save_cache, spec, part)
+            return
+        cached = catalogcache.load(self.settings.state_dir, spec)
+        if cached is not None:  # advertised now; calls wait for the live catalog (_wait_live)
+            self.parts[spec.name] = cached
+            self._cached.add(spec.name)
+            return
+        # Nothing cached: hold the initialize reply until the child is connected, so the first list is complete.
+        with anyio.move_on_after(self.settings.start_timeout) as waited:
+            while not self.backend_ready():
+                if self.backend_status()[0] in ("failed", "shutting_down"):
+                    log("catalog_cold", "warn", session=self.tag, child=spec.name, reason=self.backend_status()[1])
+                    return
+                await anyio.sleep(0.25)
+            if await self._run_on_ready(child) == "ok":
+                self._pending_ready.discard(spec.name)
+                try:
+                    live = await self._fetch(child, ("tools", "prompts", "resources"), part)
+                except ChildError as e:
+                    log("catalog_cold", "warn", session=self.tag, child=spec.name, reason=e.message[:300])
+                    return
+                self.parts[spec.name] = live
+                self._tg.start_soon(self._save_cache, spec, live)
+        if waited.cancelled_caught:
+            log("catalog_cold", "warn", session=self.tag, child=spec.name, reason="backend did not start in time")
+
+    async def _wait_live(self, child: Child, fl: Inflight, p: dict) -> dict | None:
+        """Hold a call to a cached tool until the child's live catalog has replaced the cache.
+        Returns a tool error result when that cannot happen, else None."""
+        meta = p.get("_meta")
+        token = meta.get("progressToken") if isinstance(meta, dict) else None
+        if valid_id(token):
+            fl.token, fl.progress_at = token, time.monotonic()  # keepalive progress covers the wait
+        with anyio.move_on_after(self.settings.start_timeout) as waited:
+            while child.name in self._cached:
+                state, reason = self.backend_status()
+                if state in ("failed", "shutting_down"):
+                    return _tool_error(f"Ghidra is {state}: {reason}. Try again later.")
+                if child.dead:
+                    raise child.gone_error()
+                await anyio.sleep(0.2)
+        if waited.cancelled_caught:
+            return _tool_error(f"Ghidra is still starting after {self.settings.start_timeout:.0f} s. Try again later.")
+        return None
+
+    async def _run_on_ready(self, child: Child) -> str:
         spec = child.spec.on_ready
         assert spec
         outcome, error = "ok", None
@@ -612,6 +707,7 @@ class Session:
             "on_ready", "info" if outcome == "ok" else "warn", session=self.tag, child=child.name, outcome=outcome,
             **({"error": error[:300]} if error else {}),
         )
+        return outcome
 
     def _build_catalog(self, parts: dict[str, ChildCatalog] | None = None) -> Catalog:
         parts = self.parts if parts is None else parts
@@ -736,15 +832,17 @@ class Session:
                 self._refreshing[child.name] = set()
                 try:
                     part = await self._fetch(child, kinds, self.parts.get(child.name))
-                    candidate = self._build_catalog({**self.parts, child.name: part})
+                    if child.name in self._cached and not self.backend_ready():
+                        continue  # still the bridge's partial listing; the cached one stays
+                    changed = self._adopt(child, part)
                 except ChildError as e:
                     log("refresh_failed", "warn", session=self.tag, child=child.name, error=e.message[:500])
                     continue
                 except CatalogError as e:
                     log("catalog_rejected", "error", session=self.tag, child=child.name, problems=e.problems)
                     continue
-                self.parts[child.name] = part
-                self.catalog = candidate
+                if not changed:
+                    continue
                 for kind in sorted(kinds):
                     await self._notify_down(
                         f"notifications/{kind}/list_changed", None, self._related_for(child), droppable=False

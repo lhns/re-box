@@ -136,7 +136,7 @@ async def test_initialize_carries_instructions(tmp_path):
             text = init["result"]["instructions"]
             tag = r.app.sessions[sid].tag
         assert str(tmp_path) in text and tag in text and f"{tmp_path}/ev/{tag}.json" in text
-        for needle in ("gh_", "rea_", "discarded", "/c/Users", "tools/list_changed", "program selector"):
+        for needle in ("gh_", "rea_", "discarded", "/c/Users", "waits for it", "program selector"):
             assert needle in text
 
 

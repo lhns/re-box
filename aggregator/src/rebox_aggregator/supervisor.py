@@ -14,6 +14,7 @@ import anyio.abc
 import httpx2
 from anyio.streams.text import TextReceiveStream
 
+from . import catalogcache
 from .app import App, make_server
 from .children import kill_leftovers
 from .config import ConfigError, harden, load_settings, read_token
@@ -162,6 +163,22 @@ async def ensure_project(http: httpx2.AsyncClient, base: str, projects_dir: Path
     else:
         r = await http.post(f"{base}/create_project", json={"parentDir": str(projects_dir), "name": PROJECT_NAME})
     r.raise_for_status()
+    # ghidra-mcp answers 200 with {"error": ...} when it cannot open the project, e.g. while another
+    # container holds its lock; trust only a re-check.
+    try:
+        error = r.json().get("error")
+    except (ValueError, AttributeError):
+        error = None
+    again = await http.get(f"{base}/get_project_info")
+    again.raise_for_status()
+    if error or not again.json().get("has_project"):
+        locked = "lock" in str(error or "").lower()
+        log("project_failed", "error", error=str(error or "project did not open")[:500])
+        raise ProjectError("project locked by another Ghidra instance" if locked else "project not open")
+
+
+class ProjectError(ValueError):
+    """The Ghidra project could not be opened; the message is a fixed, client-safe reason."""
 
 
 class Headless:
@@ -180,20 +197,37 @@ class Headless:
         self._healthy = False
         self._stopping = False  # container shutdown
         self._idle_stopped = False  # the current process is being stopped for lack of sessions
-        self._want = False
+        self._sessions = False
+        self._warming = False
+        self._fail = ""  # why the last start failed, once known (shown in /healthz)
         self._wake = anyio.Event()
         self._starting_since = 0.0
         self._saving = anyio.Lock()  # one save_all_programs at a time
         self._http = httpx2.AsyncClient(timeout=10)
 
+    @property
+    def _want(self) -> bool:
+        return self._sessions or self._warming
+
     def want(self, wanted: bool) -> None:
         """Sessions exist (True) or none do (False)."""
-        if wanted != self._want:
-            self._want = wanted
+        before = self._want
+        self._sessions = wanted
+        if self._want != before:
+            self._poke()
+
+    def warm(self, warming: bool) -> None:
+        """The catalog warm-up needs the server, with no session around."""
+        before = self._want
+        self._warming = warming
+        if self._want != before:
             self._poke()
 
     def ready(self) -> bool:
         return self._healthy
+
+    def status(self) -> tuple[str, str]:
+        return self.state, self.reason
 
     def health(self) -> tuple[bool, str, str]:
         """(ok, reason, state): a stopped server is fine (it starts with the next session); a failed one is not."""
@@ -294,6 +328,7 @@ class Headless:
             env["GHIDRA_MCP_FILE_ROOT"] = str(self.cfg.workdir)
             env["REBOX_INSTANCE"] = self.instance  # lets the shutdown sweep find a stuck JVM too
             started = time.monotonic()
+            self._fail = ""
             self._set("starting")
             if not await self._create_project(env):
                 self._set("failed", "project not created")
@@ -327,7 +362,7 @@ class Headless:
             if not self._want:
                 self._set("stopped")  # nobody is waiting for it; the next session starts it again
                 continue
-            self._set("failed", "headless server down")
+            self._set("failed", self._fail or "headless server down")
             await self._backoff(backoff)
             backoff = min(60.0, backoff * 2)
 
@@ -372,7 +407,8 @@ class Headless:
         try:
             await ensure_project(self._http, self.base, self.cfg.projects_dir)
         except (httpx2.HTTPError, ValueError) as e:
-            self._set("failed", "project not open")
+            self._fail = str(e) if isinstance(e, ProjectError) else "project not open"
+            self._set("failed", self._fail)
             log("project_failed", "error", error=str(e)[:500])
             self._kill_group(proc, signal.SIGKILL)
             return
@@ -452,6 +488,30 @@ async def prune_evidence_loop(cfg: SupervisorConfig) -> None:
         await anyio.sleep(PRUNE_INTERVAL)
 
 
+async def warm_up(cfg: SupervisorConfig, app: App, headless: Headless) -> None:
+    """Fill missing catalog caches at container start: run the server once, list the children against it
+    exactly as a session would, then let the normal idle stop take the server down again."""
+    state = app.settings.state_dir
+    todo = [s for s in app.settings.children if s.catalog_cache and state and catalogcache.load(state, s) is None]
+    if not todo:
+        return
+    log("catalog_warmup", names=[s.name for s in todo])
+    headless.warm(True)
+    try:
+        with anyio.fail_after(cfg.start_timeout + 60):
+            while not headless.ready():
+                await anyio.sleep(0.5)
+            base = {k: v for k, v in os.environ.items() if not k.startswith("REBOX_")}
+            for spec in todo:
+                env = {**base, **spec.env, "REBOX_INSTANCE": app.instance, "REBOX_SESSION": "warmup"}
+                part = await catalogcache.fetch_catalog(spec, env)
+                await anyio.to_thread.run_sync(catalogcache.save, state, spec, part)
+    except Exception as e:  # a background nicety: sessions fall back to holding their initialize
+        log("catalog_warmup_failed", "warn", error=(str(e) or type(e).__name__)[:300])
+    finally:
+        headless.warm(False)
+
+
 async def supervise(cfg: SupervisorConfig, app: App) -> int:
     headless = Headless(cfg, app.instance)
     app.health = headless.health
@@ -486,6 +546,7 @@ async def supervise(cfg: SupervisorConfig, app: App) -> int:
         tg.start_soon(on_signals)
         tg.start_soon(headless.run)
         tg.start_soon(prune_evidence_loop, cfg)
+        tg.start_soon(warm_up, cfg, app, headless)
         await server.serve()  # the port opens at once; Ghidra starts with the first session
         tg.cancel_scope.cancel()
     return 0

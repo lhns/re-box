@@ -124,6 +124,19 @@ def test_shipped_config_denies_scripts_and_connects_on_ready():
     assert specs["rea"].autosave.prune_empty and not specs["rea"].deny
 
 
+def test_catalog_cache_parsed_and_shipped(tmp_path):
+    from pathlib import Path
+
+    (spec,) = load_children(toml(tmp_path, GOOD + '[child.catalog_cache]\nkey = "k-{X}"\n'))
+    assert spec.catalog_cache.key == "k-{X}"
+    assert load_children(toml(tmp_path, GOOD))[0].catalog_cache is None
+    with pytest.raises(ConfigError, match="catalog_cache"):
+        load_children(toml(tmp_path, GOOD + "[child.catalog_cache]\n"))
+    repo = Path(__file__).parents[2] / "rootfs/etc/rebox/aggregator.toml"
+    specs = {s.name: s for s in load_children(str(repo if repo.exists() else "/etc/rebox/aggregator.toml"))}
+    assert specs["ghidra"].catalog_cache and not specs["rea"].catalog_cache
+
+
 def test_session_policy_settings(tmp_path):
     cfg = toml(tmp_path, GOOD)
     s = load_settings({"REBOX_TOKEN": "t", "REBOX_CONFIG": cfg})

@@ -68,6 +68,10 @@ class FakeBackend:
     def __init__(self, ready: bool = True):
         self.wants: list[bool] = []
         self.is_ready = ready
+        self.state, self.reason = ("ready" if ready else "starting"), ""
+
+    def status(self) -> tuple[str, str]:
+        return self.state, self.reason
 
     def want(self, wanted: bool) -> None:
         self.wants.append(wanted)

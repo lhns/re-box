@@ -1,6 +1,7 @@
 """Raw JSON-RPC stdio MCP server (no SDK) for the aggregator tests.
 
 Env: FAKE_EXTRA_TOOLS=a,b adds no-op tools; FAKE_BIG=N adds a tool whose description is N bytes;
+FAKE_COLD=1 lists only connect_instance/get_connects until connect_instance is called (a bridge without its backend);
 FAKE_SAVE_SLEEP=N delays the `save` tool (it writes its `path` argument); FAKE_FAIL_INIT=1 exits during initialize; FAKE_HANG_INIT=1 never answers it.
 """
 
@@ -27,6 +28,8 @@ def tool(name, props=None):
 
 
 def tools():
+    if os.environ.get("FAKE_COLD") and not connects:  # a bridge whose backend is not up: static tools only
+        return [tool("connect_instance"), tool("get_connects")]
     names = ["echo", "pid", "env", "set_state", "get_state", "slow", "get_cancelled", "progress",
              "add_tool", "crash", "spawn", "structured", "fail", "ask_roots", "bad_msgs", "save", "sleep", "connect_instance", "get_connects"]
     out = [tool(n) for n in names + os.environ.get("FAKE_EXTRA_TOOLS", "").split(",") + extra_tools if n]
@@ -64,6 +67,7 @@ async def call(rid, name, args, meta):
         return text("slept")
     if name == "connect_instance":
         connects.append(args)
+        send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
         return text("connected")
     if name == "get_connects":
         return text(json.dumps(connects))
