@@ -132,11 +132,13 @@ results.**
    not writable, if `GHIDRA_PROJECTS_DIR` (default `$RE_WORKDIR/ghidra-projects`) is outside
    `RE_WORKDIR` (`GHIDRA_MCP_FILE_ROOT` is `RE_WORKDIR`) or has a path element starting with `.`
    (Ghidra refuses those).
-2. Set `REBOX_INSTANCE` to a random id in its own environment.
+2. Set `REBOX_INSTANCE` to a random id in its own environment, unless it is already set (the
+   test-stage runner sets it to find every process of the instance).
 3. Start the headless server in its own process group:
    `java $JAVA_OPTS -Djava.awt.headless=true -Dghidra.home=$GHIDRA_INSTALL_DIR
    -Dapplication.name=GhidraMCP -classpath <jar>:<Ghidra/{Framework,Features,Processors}/*/lib/*.jar>
-   com.xebyte.headless.GhidraMCPHeadlessServer --port 8089 --bind 127.0.0.1`, env minus `REBOX_*`
+   com.xebyte.headless.GhidraMCPHeadlessServer --port 8089 --bind 127.0.0.1`, env minus `REBOX_*` plus
+   `REBOX_INSTANCE`,
    with `GHIDRA_MCP_FILE_ROOT=$RE_WORKDIR` forced; its output relayed as `headless_log` lines.
 4. Wait for `GET http://127.0.0.1:8089/check_connection` to answer `{"status":"ok",...}`
    (`REBOX_HEADLESS_START_TIMEOUT`, 300 s). Then ensure the project: `GET /get_project_info`;
