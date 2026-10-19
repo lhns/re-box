@@ -46,8 +46,9 @@ done
 
 # Security defaults.
 # Scripts are on for REA's attach (DECISIONS.md); clients must not reach the script tools.
-grep -q '^deny = \["run_ghidra_script", "run_script_inline"\]' /etc/rebox/aggregator.toml \
-  || fail "ghidra-mcp's script tools are not denied"
+for t in run_ghidra_script run_script_inline delete_project; do
+  grep -q "^deny = \[.*\"$t\"" /etc/rebox/aggregator.toml || fail "ghidra-mcp's $t is not denied"
+done
 grep -q '^REBOX_REA_ATTACH_HELPER = "/opt/rebox/rea-attach/helper.mjs"' /etc/rebox/aggregator.toml \
   || fail "REA attach helper not configured"
 [ -f /opt/rebox/rea-attach/helper.mjs ] && [ -f /opt/rebox/rea-attach/ReboxReaAttach.java ] \
