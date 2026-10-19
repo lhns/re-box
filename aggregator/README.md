@@ -48,12 +48,14 @@ name = "rea"                 # [a-z0-9-]+, used in logs and errors
 prefix = "rea_"              # prepended to tool and prompt names
 command = ["/usr/local/bin/rea", "mcp"]   # absolute path required
 deny = ["run_script"]        # optional: the child's own tool names to hide and refuse
-[child.env]                  # forced: overrides the container env
+[child.env]                  # forced: overrides the container env; {NAME}: the supervisor's env var
 REA_LOG_LEVEL = "warn"
+TMPDIR = "{REBOX_REA_TMP}"
 [child.autosave]             # optional: a child tool that persists its work
 tool = "export_evidence_bundle"   # the child's own (unprefixed) tool name
 arguments = { path = "{state_dir}/rea/evidence/{session}.json", overwrite = true }  # {state_dir}, {session} substituted
 prune_empty = true           # optional: delete the file again if it is an evidence bundle with no records/unknowns
+before_tools = ["close_binary"]  # optional: the child's tools that drop its work; saved before they are forwarded
 [child.on_ready]             # optional: a child tool called when the Ghidra server becomes ready after the child booted
 tool = "connect_instance"
 arguments = { project = "rebox" }

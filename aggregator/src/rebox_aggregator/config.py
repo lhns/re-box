@@ -27,6 +27,15 @@ class ChildSpec:
     catalog_cache: "CatalogCacheSpec | None" = None
 
 
+_ENV_REF = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def child_env(spec: ChildSpec, environ: Mapping[str, str]) -> dict[str, str]:
+    """The child's [child.env] with {NAME} filled in from `environ` (the supervisor's own environment,
+    REBOX_* included); an unknown name becomes empty."""
+    return {k: _ENV_REF.sub(lambda m: environ.get(m.group(1), ""), v) for k, v in spec.env.items()}
+
+
 @dataclass(frozen=True)
 class CatalogCacheSpec:
     """Remember the child's full catalog under REBOX_STATE_DIR so a session can advertise it while the

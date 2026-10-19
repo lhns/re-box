@@ -125,9 +125,10 @@ def test_shipped_config_denies_scripts_and_connects_on_ready():
     assert specs["ghidra"].deny == ("run_ghidra_script", "run_script_inline", "delete_project")
     assert (specs["ghidra"].on_ready.tool, dict(specs["ghidra"].on_ready.arguments)) == ("connect_instance", {"project": "rebox"})
     assert specs["rea"].autosave.prune_empty and not specs["rea"].deny
-    from rebox_aggregator.supervisor import REA_TMP
+    from rebox_aggregator.config import child_env
 
-    assert specs["rea"].env["TMPDIR"] == str(REA_TMP)  # the supervisor makes it a file root
+    # The supervisor sets REBOX_REA_TMP and makes it a ghidra-mcp file root.
+    assert child_env(specs["rea"], {"REBOX_REA_TMP": "/tmp/r"})["TMPDIR"] == "/tmp/r"
 
 
 def test_catalog_cache_parsed_and_shipped(tmp_path):
@@ -156,3 +157,10 @@ def test_session_policy_settings(tmp_path):
         for bad in ("-1", "x"):
             with pytest.raises(ConfigError):
                 load_settings({"REBOX_TOKEN": "t", "REBOX_CONFIG": cfg, key: bad})
+
+
+def test_child_env_fills_in_environment_variables():
+    from rebox_aggregator.config import ChildSpec, child_env
+
+    spec = ChildSpec("a", "a_", ("x",), {"TMPDIR": "{T}/x", "PLAIN": "v", "MISSING": "{NOPE}"})
+    assert child_env(spec, {"T": "/tmp/t"}) == {"TMPDIR": "/tmp/t/x", "PLAIN": "v", "MISSING": ""}

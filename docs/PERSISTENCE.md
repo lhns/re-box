@@ -92,7 +92,7 @@ Suggested places for an agent's own REA exports (not created automatically): `re
 
 | what | where | why not |
 | --- | --- | --- |
-| REA's per-session runtime (`rea-ghidra-*`: descriptor, socket, target snapshot, logs) | `/tmp/rebox-rea` (REA's `TMPDIR`) | REA creates it privately per session and deletes it when the session closes the binary (leftovers of killed sessions are swept at start, above); the program itself is imported into the project from the snapshot |
+| REA's per-session runtime (`rea-ghidra-*`: descriptor, socket, target snapshot, logs) | `/tmp/rebox-rea-<uid>` (REA's `TMPDIR`) | REA creates it privately per session and deletes it when the session closes the binary (leftovers of killed sessions are swept at start, above); the program itself is imported into the project from the snapshot |
 | mitmproxy config and CA, apktool frameworks, extraction scratch | `/tmp`, per REA operation | REA gives each run its own directory (`confdir=<run dir>`, `--frame-path <run dir>`), so there is no long-lived CA to keep or trust. Extraction output a caller wants kept goes to a path the caller names |
 | Ghidra temp files, JVM perf data, ghidra-mcp's socket | `/tmp` | scratch |
 | aggregator and supervisor logs | stdout | the container runtime's logging driver keeps them; Ghidra's own log is under `home/` |

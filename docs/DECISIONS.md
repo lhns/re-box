@@ -269,7 +269,7 @@ over a unix socket) runs on a thread inside the ghidra-mcp JVM, against a progra
   instead of a JVM, with the AnalyzeHeadless arguments it would have used. REA's descriptor,
   token, sha check, process ownership and cleanup are unchanged.
 - The helper maps that whole command line onto ghidra-mcp's `/import_file`: REA's verified
-  target snapshot (REA's `TMPDIR`, `/tmp/rebox-rea`, is a second ghidra-mcp file root), loader,
+  target snapshot (REA's `TMPDIR`, `/tmp/rebox-rea-<uid>`, is a second ghidra-mcp file root), loader,
   loader options, processor and compiler spec, REA's pre- and post-scripts (raw and COM
   preparation, seeds, analyzer options, no-return fix, MIPS soft-float storage), into
   `/rea/<sha256[:12]>-<profile digest[:8]>/<file name>`. A program already there with the same

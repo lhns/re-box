@@ -28,7 +28,7 @@ from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, LATEST_HANDSHAKE_VERS
 from . import __version__, catalogcache
 from .catalog import Catalog, CatalogError, ChildCatalog
 from .children import Child, ChildError, kill_leftovers, valid_id
-from .config import Settings
+from .config import Settings, child_env
 from .evidence import drop_if_empty
 from .log import log
 
@@ -539,7 +539,7 @@ class Session:
                 return
             if spec.on_ready and not self.backend_ready():
                 self._pending_ready.add(spec.name)  # booted before its backend: told once that it is up
-            env = {**base, **spec.env, "REBOX_INSTANCE": self.instance, "REBOX_SESSION": self.tag}
+            env = {**base, **child_env(spec, os.environ), "REBOX_INSTANCE": self.instance, "REBOX_SESSION": self.tag}
             child = self.children[spec.name] = Child(spec, self.tag, env, self.settings.child_grace, self)
             try:
                 with anyio.fail_after(self.settings.init_timeout):

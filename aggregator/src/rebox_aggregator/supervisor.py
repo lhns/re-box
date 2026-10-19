@@ -19,16 +19,16 @@ from anyio.streams.text import TextReceiveStream
 from . import catalogcache
 from .app import App, make_server
 from .children import kill_by_command, kill_leftovers
-from .config import ConfigError, harden, load_settings, read_token
+from .config import ConfigError, child_env, harden, load_settings, read_token
 from .evidence import prune_old
 from .housekeeping import dir_size, prune_rolled_logs, remove_partial_exports, sweep_tmp
 from .log import log
 
 HEADLESS_PORT = 8089
-# REA's TMPDIR (the rea child's [child.env] in aggregator.toml): its runtime roots, with the
-# target snapshot the attach helper has ghidra-mcp import, live here, so it is a file root too.
-# Created at start by the service user; REA makes its own 0700 directories inside.
-REA_TMP = Path("/tmp/rebox-rea")
+# REA's TMPDIR (REBOX_REA_TMP, which the rea child's [child.env] in aggregator.toml passes on): its
+# runtime roots, with the target snapshot the attach helper has ghidra-mcp import, live here, so it
+# is a file root too. Per uid: a container started as root runs its services as PUID.
+REA_TMP = Path(os.environ.get("REBOX_REA_TMP") or f"/tmp/rebox-rea-{os.getuid()}")
 PROJECT_NAME = "rebox"
 POLL_INTERVAL = 10.0
 SUBDIRS = ("ghidra-projects", "home", "cache", "rea/evidence")
@@ -553,7 +553,7 @@ async def warm_up(cfg: SupervisorConfig, app: App, headless: Headless) -> None:
                 await anyio.sleep(0.5)
             base = {k: v for k, v in os.environ.items() if not k.startswith("REBOX_")}
             for spec in todo:
-                env = {**base, **spec.env, "REBOX_INSTANCE": app.instance, "REBOX_SESSION": "warmup"}
+                env = {**base, **child_env(spec, os.environ), "REBOX_INSTANCE": app.instance, "REBOX_SESSION": "warmup"}
                 part = await catalogcache.fetch_catalog(spec, env)
                 await anyio.to_thread.run_sync(catalogcache.save, state, spec, part)
     except Exception as e:  # a background nicety: sessions fall back to holding their initialize
@@ -613,6 +613,7 @@ def main() -> None:
     try:
         cfg = validate(os.environ)
         _ensure_writable(REA_TMP, "REA's TMPDIR")
+        os.environ["REBOX_REA_TMP"] = str(REA_TMP)
         apply_state_env(cfg)
         settings = load_settings()
     except ConfigError as e:
