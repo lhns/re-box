@@ -303,7 +303,9 @@ Rejected:
 - One Ghidra JVM; REA's edits persist in the shared project (autosave, shutdown save) and are
   visible to ghidra_ tools and other sessions. REA's own texts ("ephemeral", `project_ephemeral`,
   `persists_after_close: false`) are stale under re-box. A target the agent also imports with
-  `ghidra_import_file` is analyzed twice (once per folder).
+  `ghidra_import_file` is analyzed twice (once per folder). Inside Ghidra such a program keeps the
+  snapshot's name (`target-<sha256[:12]>.<ext>`, e.g. in `ghidra_list_open_programs`); the project
+  file, which `program` selectors resolve, is named after the original file.
 - ghidra-mcp runs with scripts enabled; `run_ghidra_script`/`run_script_inline` (and
   `delete_project`, which would drop the shared project) are denied in the aggregator (8089
   stays loopback-only), and import scripts must lie in
