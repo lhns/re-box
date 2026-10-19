@@ -2,6 +2,7 @@
 
 import glob
 import os
+import shutil
 import signal
 import sys
 import time
@@ -16,7 +17,7 @@ from anyio.streams.text import TextReceiveStream
 
 from . import catalogcache
 from .app import App, make_server
-from .children import kill_leftovers
+from .children import kill_by_command, kill_leftovers
 from .config import ConfigError, harden, load_settings, read_token
 from .evidence import prune_old
 from .log import log
@@ -46,6 +47,7 @@ class SupervisorConfig:
     autosave_interval: float = 0.0
     idle_timeout: float = 0.0  # stop the Ghidra server this long after the last session closed; 0: never
     evidence_retention_days: float = 0.0  # 0: keep REA evidence bundles forever
+    rea_attach_dir: Path = Path("/opt/rebox/rea-attach")  # REA attach files (deps/rea-attach), when present
 
 
 def _dot_element(path: Path) -> bool:
@@ -122,7 +124,32 @@ def validate(env: Mapping[str, str]) -> SupervisorConfig:
         autosave_interval=interval,
         idle_timeout=idle,
         evidence_retention_days=retention,
+        rea_attach_dir=Path(env.get("REBOX_REA_ATTACH_DIR", "/opt/rebox/rea-attach")),
     )
+
+
+ATTACH_SCRIPT = "ReboxReaAttach.java"
+ATTACH_HELPER = "rea-attach/helper.mjs"
+
+
+def install_attach_script(cfg: SupervisorConfig) -> None:
+    """Put REA's attach host script where ghidra-mcp runs scripts from (~/ghidra_scripts of the JVM).
+
+    Copied at every start, so an image upgrade replaces it. It has to live there: ghidra-mcp copies a
+    script from anywhere else into that directory and deletes it after the run, which races between
+    sessions attaching at once.
+    """
+    src = cfg.rea_attach_dir / ATTACH_SCRIPT
+    if not src.is_file():
+        return
+    dest = cfg.state_dir / "home" / "ghidra_scripts"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+        tmp = dest / f".{ATTACH_SCRIPT}.{os.getpid()}"
+        shutil.copyfile(src, tmp)
+        os.replace(tmp, dest / ATTACH_SCRIPT)
+    except OSError as e:
+        log("rea_attach_install", "warn", error=str(e)[:300])
 
 
 def apply_state_env(cfg: SupervisorConfig) -> None:
@@ -337,6 +364,7 @@ class Headless:
                 continue
             if self._stopping:
                 return
+            install_attach_script(self.cfg)
             self._proc = proc = await anyio.open_process(
                 headless_command(self.cfg), env=env, stdout=-1, stderr=-2, start_new_session=True
             )
@@ -349,6 +377,9 @@ class Headless:
                 tg.cancel_scope.cancel()
             self._healthy = False
             self._kill_group(proc, signal.SIGKILL)  # stragglers of the old JVM's group
+            # REA bridges served from that JVM are gone; their helpers would notice within seconds,
+            # killing them now makes REA report it at once (reopen the binary to attach again).
+            await anyio.to_thread.run_sync(kill_by_command, self.instance, ATTACH_HELPER)
             if self._stopping:
                 return
             if self._idle_stopped:

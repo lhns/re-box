@@ -275,11 +275,11 @@ def test_10_session_cleanup():
     s = Session(URL, TOKEN)
     s.initialize()
     tag = tag_of(s.session_id)
-    # Start REA's Ghidra JVM too, so the check covers grandchildren.
+    # Start REA's Ghidra provider too (the attach helper), so the check covers grandchildren.
     s.tool("rea_open_binary", {"path": fixture_path("hello_debug"), "provider_id": "ghidra"})
     s.tool("rea_binary_overview", {})
     procs = session_processes(tag)
-    assert len(procs) >= 3, f"expected rea, bridge and a Ghidra JVM, got {procs}"
+    assert len(procs) >= 3, f"expected rea, bridge and REA's attach helper, got {procs}"
     pgids = set(procs.values())
     assert s.delete() in (200, 204)
     deadline = time.monotonic() + 30
