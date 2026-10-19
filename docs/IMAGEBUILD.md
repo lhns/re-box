@@ -20,7 +20,10 @@ Docker Desktop, 20 CPUs, 64 GB, BuildKit, empty build cache (2026-10-19):
 | test stage, peak RSS of the services | 2.5-2.7 GiB (headless JVM + one REA Ghidra JVM at a time) |
 | `final` image | 3.66 GB uncompressed |
 
-Rootless BuildKit in a pod is slower than Docker Desktop; allow about twice the local time.
+The RSS figure sums per-process RSS of the services during the suite (shared pages counted twice)
+and does not cover build steps (Gradle, cargo). None of this ran under rootless BuildKit yet; do a
+first ImageBuild with generous limits and tighten them from the pod's metrics. Rootless BuildKit
+in a pod is slower than Docker Desktop; allow about twice the local time.
 
 ## Draft manifest
 
