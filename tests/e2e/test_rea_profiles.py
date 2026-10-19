@@ -125,8 +125,8 @@ def test_elf_language_override(session):
         assert_in_shared_jvm(gh, target)
         # The imported program carries the pinned language.
         path = rea_program_path(gh, target)
-        ok(gh.tool("gh_open_program", {"path": path}))
-        open_programs = json.loads(ok(gh.tool("gh_list_open_programs", {})).text())["programs"]
+        ok(gh.tool("ghidra_open_program", {"path": path}))
+        open_programs = json.loads(ok(gh.tool("ghidra_list_open_programs", {})).text())["programs"]
         languages = {p["language"] for p in open_programs if p["path"] == path}
         assert languages == {"x86:LE:64:default"}, open_programs
 

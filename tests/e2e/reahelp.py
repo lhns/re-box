@@ -71,11 +71,11 @@ def wait_for(predicate, seconds: float, what: str):
 
 
 def rea_programs(gh) -> list[str]:
-    """Paths of the programs under /rea/ in the shared project, listed through a gh_ session."""
+    """Paths of the programs under /rea/ in the shared project, listed through a ghidra_ session."""
 
     def listing(folder: str) -> dict:
         try:
-            call = gh.tool("gh_list_project_files", {"folder": folder})
+            call = gh.tool("ghidra_list_project_files", {"folder": folder})
         except McpError:
             return {}
         if call.result.get("isError"):  # the folder does not exist yet

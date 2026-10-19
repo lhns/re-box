@@ -61,7 +61,7 @@ CLASS_DECL_NEW = CLASS_DECL + """
     // Sessions share this class, each serving on its own thread.
     private static final ThreadLocal<AddressSpace> SESSION_SPACE = new ThreadLocal<>();
     // Set by ReboxReaAttach: ghidra-mcp's write lock. Ghidra merges concurrent transactions into
-    // one, so an aborted REA edit would discard a gh_ edit made meanwhile, and the other way round.
+    // one, so an aborted REA edit would discard a ghidra_ edit made meanwhile, and the other way round.
     private java.util.concurrent.locks.Lock reboxWriteLock;
     private static final Set<String> REBOX_EDITS =
         Set.of("annotate_native_function", "set_address_name", "set_addresses_names");
@@ -78,7 +78,7 @@ CLASS_DECL_NEW = CLASS_DECL + """
         }
         if (!REBOX_EDITS.contains(request.method)) return handleRequest(request, descriptor);
         // Writers that don't take the lock (analysis, scripts): wait for their transaction to end
-        // rather than join it, but never while holding the lock, which every gh_ call needs.
+        // rather than join it, but never while holding the lock, which every ghidra_ call needs.
         long deadline = System.nanoTime() + 60_000_000_000L;
         while (true) {
             if (reboxWriteLock != null) reboxWriteLock.lockInterruptibly();

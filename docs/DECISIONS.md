@@ -227,8 +227,8 @@ stops `REBOX_GHIDRA_IDLE_TIMEOUT` (300 s) after the last one closed; an idle con
   another. REA also kills its JVM's process group on cancel, which would take ghidra-mcp's unsaved
   edits with it. Superseded by "REA attaches to the ghidra-mcp JVM" below, which hosts
   REA's bridge on a thread instead.
-- **Start on the first session, not the first `gh_` call:** a bridge that boots without Ghidra
-  shows only static tools, so the client would never see a `gh_` tool to call. `initialize` is not
+- **Start on the first session, not the first `ghidra_` call:** a bridge that boots without Ghidra
+  shows only static tools, so the client would never see a `ghidra_` tool to call. `initialize` is not
   held when a catalog cache exists (39 s against client connect timeouts); the bridge starts at once,
   and when Ghidra is ready the aggregator calls the bridge's `connect_instance(project="rebox")`
   (`[child.on_ready]`), which discovers the server (verified in the image: matches project `rebox`,
@@ -273,7 +273,7 @@ over a unix socket) runs on a thread inside the ghidra-mcp JVM, against a progra
   loader options, processor and compiler spec, REA's pre- and post-scripts (raw and COM
   preparation, seeds, analyzer options, no-return fix, MIPS soft-float storage), into
   `/rea/<sha256[:12]>-<profile digest[:8]>/<file name>`. A program already there with the same
-  bytes is reused; the agent's own `gh_` import of the file never is (other options, no REA
+  bytes is reused; the agent's own `ghidra_` import of the file never is (other options, no REA
   scripts). It refuses an argument it does not know, so a new REA option fails loudly.
 - Then it starts the bridge through `/run_ghidra_script` (`ReboxReaAttach.java`) and lives as
   long as the bridge.
@@ -297,15 +297,16 @@ Rejected:
   version did): two code paths, a second JVM with its own memory budget, and edits on those
   targets lost at session end. Extending the import was a contained patch.
 - Running import scripts as any path a client names: with scripts enabled for the bridge, that
-  would hand agents arbitrary code through `gh_import_file` past the script-tool deny list.
+  would hand agents arbitrary code through `ghidra_import_file` past the script-tool deny list.
 
 **Consequences.**
 - One Ghidra JVM; REA's edits persist in the shared project (autosave, shutdown save) and are
   visible to ghidra_ tools and other sessions. REA's own texts ("ephemeral", `project_ephemeral`,
   `persists_after_close: false`) are stale under re-box. A target the agent also imports with
   `ghidra_import_file` is analyzed twice (once per folder).
-- ghidra-mcp runs with scripts enabled; `run_ghidra_script`/`run_script_inline` (and `delete_project`, which would drop the shared
-  project) are denied in the aggregator (8089 stays loopback-only), and import scripts must lie in
+- ghidra-mcp runs with scripts enabled; `run_ghidra_script`/`run_script_inline` (and
+  `delete_project`, which would drop the shared project) are denied in the aggregator (8089
+  stays loopback-only), and import scripts must lie in
   `/opt/rebox/rea-attach/ghidra_scripts`. The supervisor copies the host script into
   `$REBOX_STATE_DIR/home/ghidra_scripts` at every JVM start: `/run_ghidra_script` runs scripts
   only from there. That script must stay free of compile-time references to
@@ -319,7 +320,7 @@ Rejected:
   cannot happen while a session, hence a REA binary, is open.
 - Ghidra merges concurrent transactions into one, so an aborted edit discards the other side's
   work (measured; ghidra-mcp's `WriteTx` even joins an open transaction on purpose). With patch
-  0001 every gh_ write holds the server's write lock; the bridge holds the same lock around its
+  0001 every ghidra_ write holds the server's write lock; the bridge holds the same lock around its
   edits and starts one only when no other transaction is open (it releases the lock while it
   waits, at most 60 s). Transactions that take no lock remain (auto-analysis, script runs): a
   REA edit waits for them rather than joining.
