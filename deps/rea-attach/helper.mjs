@@ -184,13 +184,26 @@ const main = async () => {
 	let program;
 	try {
 		program = await importTarget();
-		await call("/run_ghidra_script", {
+		const body = {
 			script_name: hostScript,
 			args: [spec.descriptor, bridgeDir, process.pid, spec.scriptLog, descriptor.run_id,
 				descriptor.target_sha256].join(" "),
 			program,
 			timeout_seconds: 1800,
-		});
+		};
+		// Ghidra guards script bundle builds with a file lock meant for separate JVMs. ghidra-mcp
+		// serializes its loads (patch 0002), but /run_ghidra_script then runs the script through
+		// GhidraScript.runScript, which loads it once more outside that lock: two attaches at once
+		// can still meet OverlappingFileLockException there. Take turns.
+		for (let attempt = 1; ; attempt++) {
+			try {
+				await call("/run_ghidra_script", body);
+				break;
+			} catch (e) {
+				if (!e.message.includes("OverlappingFileLockException") || attempt >= 30) throw e;
+				await sleep(500 + Math.random() * 1000);
+			}
+		}
 	} catch (e) {
 		die(e.message);
 	}
