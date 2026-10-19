@@ -122,6 +122,15 @@ cd /opt/rea
 npm ci --omit=dev --ignore-scripts --no-audit --no-fund --fetch-retries=5
 rm -rf /root/.npm
 EOS
+# REA's Ghidra sessions attach to the ghidra-mcp JVM (deps/rea-attach, DECISIONS.md). The tests
+# check the patch anchors against this REA release first; any mismatch fails the build.
+RUN --mount=type=bind,source=deps/rea-attach,target=/src/rea-attach <<'EOS'
+set -eu
+cd /src/rea-attach
+REA_PACKAGE=/opt/rea/node_modules/rea-agents python3 -B -m unittest -q test_patch_rea
+python3 -B patch-rea.py /opt/rea/node_modules/rea-agents /opt/rebox/rea-attach/ghidra_scripts
+install -m 0644 ReboxReaAttach.java helper.mjs /opt/rebox/rea-attach/
+EOS
 
 # --- fixtures: test binaries (spec 8.2).
 FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS fixtures
@@ -145,7 +154,11 @@ FROM base AS runtime-core
 COPY --from=ghidra /opt/ghidra /opt/ghidra
 COPY --from=ghidra-mcp /opt/ghidra-mcp /opt/ghidra-mcp
 COPY --from=rea /opt/rea /opt/rea
+COPY --from=rea /opt/rebox/rea-attach /opt/rebox/rea-attach
 RUN ln -s /opt/rea/node_modules/.bin/rea /usr/local/bin/rea
+# The patched bridge must still compile against this Ghidra, or sessions would fail at open.
+RUN --mount=type=bind,source=deps/rea-attach/compile-check.sh,target=/run/compile-check.sh \
+    sh /run/compile-check.sh /opt/ghidra /opt/rebox/rea-attach
 ENV GHIDRA_INSTALL_DIR=/opt/ghidra
 
 # --- runtime: everything the release image needs.

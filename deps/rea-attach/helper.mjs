@@ -1,86 +1,128 @@
-// Stands in for REA's Ghidra JVM (spawned by the patched launcher, patch-rea.py): imports the
+// Stands in for REA's Ghidra JVM (spawned by the patched launcher, see patch-rea.py): imports the
 // target into the shared project through ghidra-mcp, starts REA's bridge inside the ghidra-mcp
-// JVM, then lives until REA stops it. REA owns this process: its exit or kill ends the bridge.
+// JVM (ReboxReaAttach.java), then lives as long as that bridge. REA owns this process: killing
+// it ends the bridge (the host script's watchdog), and its exit tells REA the provider is gone.
 //
-// argv: --target <original path> <AnalyzeHeadless arguments REA built>
-// env:  REBOX_GHIDRA_URL (default http://127.0.0.1:8089), REBOX_REA_BRIDGE_DIR,
-//       REBOX_REA_ATTACH_SCRIPT (host script path), REBOX_GHIDRA_WAIT_SECONDS (default 300)
-const base = process.env.REBOX_GHIDRA_URL ?? "http://127.0.0.1:8089";
+// argv: --target <original path> <the AnalyzeHeadless arguments REA built>
+// env:  REBOX_GHIDRA_URL (default http://127.0.0.1:8089), REBOX_HEADLESS_START_TIMEOUT
+//       (seconds to wait for a cold JVM, default 300), REBOX_REA_BRIDGE_DIR, REBOX_REA_ATTACH_SCRIPT
+import { request } from "node:http";
+import { connect } from "node:net";
+import { existsSync, readFileSync } from "node:fs";
+import { basename } from "node:path";
+
+const base = new URL(process.env.REBOX_GHIDRA_URL ?? "http://127.0.0.1:8089");
 const bridgeDir = process.env.REBOX_REA_BRIDGE_DIR ?? "/opt/rebox/rea-attach/ghidra_scripts";
 const hostScript = process.env.REBOX_REA_ATTACH_SCRIPT ?? "ReboxReaAttach.java";
-const waitSeconds = Number(process.env.REBOX_GHIDRA_WAIT_SECONDS ?? 300);
+const startWait = Number(process.env.REBOX_HEADLESS_START_TIMEOUT || 300);
+const SHA_MISMATCH = "REBOX_SHA_MISMATCH";
 
 const die = (msg) => {
 	process.stderr.write(`re-box attach: ${msg}\n`);
 	process.exit(1);
 };
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 const args = process.argv.slice(2);
 if (args[0] !== "--target" || args.length < 4) die("usage: --target <path> <AnalyzeHeadless args>");
 const target = args[1];
 const headless = args.slice(2);
-const after = (flag) => {
-	const i = headless.indexOf(flag);
-	return i < 0 ? undefined : headless[i + 1];
-};
-const descriptor = headless.at(-1);  // -postScript <bridge> <descriptor> is always last
-const scriptLog = after("-scriptlog");
-const runId = JSON.parse(await (await import("node:fs/promises")).readFile(descriptor, "utf8")).run_id;
-if (!scriptLog || /\s/u.test(descriptor + scriptLog + bridgeDir)) die("paths must be set and contain no whitespace");
+const scriptLogAt = headless.indexOf("-scriptlog");
+const scriptLog = scriptLogAt < 0 ? undefined : headless[scriptLogAt + 1];
+const descriptorPath = headless.at(-1);  // -postScript <bridge> <descriptor> always comes last
+const descriptor = JSON.parse(readFileSync(descriptorPath, "utf8"));
+// /run_ghidra_script splits its args on whitespace.
+if (!scriptLog || /\s/u.test(descriptorPath + scriptLog + bridgeDir))
+	die("the descriptor, script log and bridge paths must be set and contain no whitespace");
 
-const call = async (path, body) => {
-	const r = await fetch(base + path, body === undefined ? {} : {
-		method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+// node:http, not fetch: fetch gives up on a response after 300 s, and an import with
+// auto-analysis answers only when the analysis is done. REA's startup deadline bounds it.
+const call = (path, body) => new Promise((resolve, reject) => {
+	const data = body === undefined ? undefined : JSON.stringify(body);
+	const req = request(new URL(path, base), {
+		method: data === undefined ? "GET" : "POST",
+		headers: data === undefined ? {} : { "content-type": "application/json", "content-length": Buffer.byteLength(data) },
+	}, (res) => {
+		let text = "";
+		res.setEncoding("utf8");
+		res.on("data", (c) => { text += c; });
+		res.on("end", () => {
+			let json;
+			try { json = JSON.parse(text); } catch { /* reported below */ }
+			if (res.statusCode !== 200 || json === undefined || json.success === false || json.error !== undefined)
+				reject(new Error(`${path}: HTTP ${res.statusCode} ${text.slice(0, 2000)}`));
+			else resolve(json);
+		});
 	});
-	const text = await r.text();
-	let json;
-	try { json = JSON.parse(text); } catch { json = undefined; }
-	if (!r.ok || json === undefined || json.success === false || json.error !== undefined)
-		throw new Error(`${path}: HTTP ${r.status} ${text.slice(0, 2000)}`);
-	return json;
-};
+	req.on("error", reject);
+	req.end(data);
+});
 
-// The supervisor starts the JVM on demand; wait for it and its project.
-const deadline = Date.now() + waitSeconds * 1000;
+// With the on-demand lifecycle the JVM may still be starting: wait for it and its project.
+const deadline = Date.now() + startWait * 1000;
 for (;;) {
 	try {
 		if ((await call("/get_project_info")).has_project) break;
 	} catch { /* not up yet */ }
-	if (Date.now() > deadline) die(`ghidra-mcp not ready at ${base} after ${waitSeconds} s`);
-	await new Promise((r) => setTimeout(r, 1000));
+	if (Date.now() > deadline) die(`ghidra-mcp not ready at ${base.origin} after ${startWait} s`);
+	await sleep(1000);
 }
 
-try {
-	// Synchronous: returns after auto-analysis. A file of that name already in the project is
-	// reused as is; the bridge's sha check refuses it if it is a different binary.
-	const imported = await call("/import_file", { file_path: target, project_folder: "/", auto_analyze: true });
+// The target, imported and analyzed, as a program path in the project. import_file returns after
+// auto-analysis. A file of the same name already in the folder is reused as it is; the host
+// script refuses it when its bytes differ from REA's target, and the target then goes to a
+// folder of its own. The only place that knows how ghidra-mcp imports.
+const importTarget = async (folder) => {
+	const imported = await call("/import_file", { file_path: target, project_folder: folder, auto_analyze: true });
 	const program = imported.path;
 	if (imported.reused_existing) {
 		const status = await call(`/analysis_status?program=${encodeURIComponent(program)}`);
-		const entry = (status.programs ?? status.results ?? [status]).find((p) => p.analyzed !== undefined) ?? {};
+		const entry = (status.programs ?? [status]).find((p) => p.analyzed !== undefined) ?? {};
 		if (entry.analyzed === false) await call("/reanalyze", { program });
 	}
-	const started = await call("/run_ghidra_script", {
+	return program;
+};
+
+const attach = async (folder) => {
+	const program = await importTarget(folder);
+	await call("/run_ghidra_script", {
 		script_name: hostScript,
-		args: [descriptor, bridgeDir, process.pid, scriptLog, runId].join(" "),
+		args: [descriptorPath, bridgeDir, process.pid, scriptLog, descriptor.run_id, descriptor.target_sha256].join(" "),
 		program,
 		timeout_seconds: 1800,
 	});
-	process.stderr.write(`re-box attach: ${program}: ${String(started.console_output ?? "").split("\n").filter((l) => l.startsWith("REA bridge")).join(" ")}\n`);
+	return program;
+};
+
+let program;
+try {
+	try {
+		program = await attach("/");
+	} catch (e) {
+		if (!e.message.includes(SHA_MISMATCH)) throw e;
+		program = await attach(`/rea/${descriptor.target_sha256.slice(0, 12)}`);
+	}
 } catch (e) {
 	die(e.message);
 }
+process.stderr.write(`re-box attach: REA bridge ${descriptor.run_id} serving ${program} (${basename(target)})\n`);
 
-// Live until REA's cleanup kills the process group. If the JVM goes away, so did the bridge:
-// exit, and REA reports the provider gone (reopen the binary to attach again).
-const { connect } = await import("node:net");
-const { hostname, port } = new URL(base);
-const alive = () => new Promise((resolve) => {
-	const s = connect({ host: hostname, port: Number(port), timeout: 5000 });
+// Live as long as the bridge: it removes its socket when it ends, and a JVM that went away took
+// it along. Either way exit, and REA reports the provider gone (reopen the binary to attach again).
+const socket = descriptor.endpoint_path;
+const jvmAlive = () => new Promise((resolve) => {
+	const s = connect({ host: base.hostname, port: Number(base.port || 80), timeout: 5000 });
 	s.once("connect", () => { s.destroy(); resolve(true); });
 	s.once("timeout", () => { s.destroy(); resolve(false); });
 	s.once("error", () => resolve(false));
 });
-setInterval(async () => {
-	if (!(await alive())) die("ghidra-mcp went away; the REA bridge with it");
-}, 2000);
+for (let waited = 0; !existsSync(socket); waited += 200) {
+	if (waited > 120_000) die("the bridge never opened its socket");
+	await sleep(200);
+}
+for (;;) {
+	await sleep(2000);
+	// As REA's own JVM does once its bridge returns (after `shutdown`, or on a lost connection).
+	if (!existsSync(socket)) process.exit(0);
+	if (!(await jvmAlive())) die("ghidra-mcp went away, and the REA bridge with it");
+}
