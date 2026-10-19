@@ -122,7 +122,7 @@ def test_shipped_config_denies_scripts_and_connects_on_ready():
 
     repo = Path(__file__).parents[2] / "rootfs/etc/rebox/aggregator.toml"
     specs = {s.name: s for s in load_children(str(repo if repo.exists() else "/etc/rebox/aggregator.toml"))}
-    assert specs["ghidra"].deny == ("run_ghidra_script", "run_script_inline")
+    assert specs["ghidra"].deny == ("run_ghidra_script", "run_script_inline", "delete_project")
     assert (specs["ghidra"].on_ready.tool, dict(specs["ghidra"].on_ready.arguments)) == ("connect_instance", {"project": "rebox"})
     assert specs["rea"].autosave.prune_empty and not specs["rea"].deny
 
