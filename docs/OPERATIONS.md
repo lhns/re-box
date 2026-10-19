@@ -40,11 +40,11 @@ Design: `aggregator/README.md`; why: `docs/DECISIONS.md`.
 | `REBOX_AUTOSAVE_INTERVAL` | `300` | seconds between saves of changed ghidra-mcp programs, and between evidence exports of REA sessions with new calls; `0` disables both periodic saves (shutdown and session-end saves stay) |
 | `REBOX_AUTOSAVE_TIMEOUT` | `20` | seconds a REA evidence export may take at session end before the session is closed anyway |
 | `PUID` / `PGID` | `1000` | owner of files written to `RE_WORKDIR`; only applied when the container starts as root (below) |
-| `JAVA_OPTS` | `-Xmx4g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30` | headless server JVM; the G1 flags return heap to the OS after a burst (REA's own JVMs reject JVM option overrides and keep the defaults) |
-| `GHIDRA_HEADLESS_MAXMEM` | `1536m` | heap of each REA Ghidra JVM (REA's own variable; upstream default 2G) |
+| `JAVA_OPTS` | `-Xmx8g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30` | the shared Ghidra JVM, which also holds the programs REA opens; the G1 flags return heap to the OS after a burst (REA's own JVMs reject JVM option overrides and keep the defaults) |
+| `GHIDRA_HEADLESS_MAXMEM` | `1536m` | heap of a REA session that still runs its own Ghidra JVM: raw, DOS COM/MZ, PSP and similar targets (REA's own variable; upstream default 2G) |
 | `REA_JADX_HEAP_MIB` | `2048` | heap of REA's JADX JVM for Android work |
 | `GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS` | `1`, forced | every program-scoped ghidra-mcp call must name its program; the project is shared |
-| `GHIDRA_MCP_ALLOW_SCRIPTS` | `0` | `1` enables ghidra-mcp's script and inline-script tools (arbitrary code in the headless JVM) |
+| `GHIDRA_MCP_ALLOW_SCRIPTS` | `1` | needed by REA's attach (its bridge is started through ghidra-mcp's script endpoint); clients still cannot run scripts, the aggregator denies `run_ghidra_script` and `run_script_inline`. `0` breaks REA's Ghidra sessions unless `REBOX_REA_ATTACH_HELPER` is also removed from the rea child's `[child.env]` (REA then runs its own JVMs) |
 | `GHIDRA_MCP_LAZY` | `0` | `1` loads ghidra-mcp tool groups lazily (needs a client that follows `tools/list_changed`); `0` lists all 197 tools up front. Part of the catalog-cache key |
 | `GHIDRA_MCP_LOG_LEVEL` | `WARNING` | bridge log level |
 | `REA_ANALYSIS_PROVIDER` | `ghidra` | REA's default native provider |
@@ -109,22 +109,27 @@ macOS-only features.
 Per container:
 
 ```
-limit ≥ (JAVA_OPTS -Xmx + 1 GiB)                                headless server
-      + REBOX_MAX_SESSIONS × (GHIDRA_HEADLESS_MAXMEM + 1 GiB)  one REA Ghidra JVM, decompiler,
-                                                                node and bridge per session
+limit ≥ (JAVA_OPTS -Xmx + 1 GiB)                                Ghidra JVM (ghidra-mcp and REA)
+      + REBOX_MAX_SESSIONS × 0.5 GiB                            rea node, attach helper, bridge
       + 1 GiB                                                   supervisor, aggregator, page cache
+      [+ (GHIDRA_HEADLESS_MAXMEM + 1 GiB) per concurrent REA session in its own JVM]
       [+ (REA_JADX_HEAP_MIB + 0.5 GiB) per concurrent Android analysis]
 ```
 
-Defaults: (4 + 1) + 4 × (1.5 + 1) + 1 = 16 GiB, the compose example's limit. A REA session with
+REA opens its targets in the shared JVM (docs/DECISIONS.md, "REA attaches to the ghidra-mcp JVM");
+only raw, DOS COM/MZ, PSP and similar targets still start a JVM of their own. Defaults:
+(8 + 1) + 4 × 0.5 + 1 = 12 GiB, which leaves room for one such session ((1.5 + 1) GiB) under the
+compose example's 16 GiB limit. The shared heap holds every open program: one small binary
+measured 0.4 GiB RSS for the whole JVM, a small PE after analysis 1.3 GiB; size `-Xmx` for the
+programs open at once across all sessions, not per session. A REA session with
 no Ghidra call yet costs about 0.2 GiB; the headless server idles at about 130 MB RSS (measured)
 and is gone entirely `REBOX_GHIDRA_IDLE_TIMEOUT` after the last session.
 
 **Laptop profile** (Docker Desktop / WSL2, 8 GB for the VM): `REBOX_MAX_SESSIONS=2`,
-`JAVA_OPTS="-Xmx2g -XX:+UseG1GC"` (+ the G1 flags above), `GHIDRA_HEADLESS_MAXMEM=1g`, container
-limit 7g: the formula gives (2 + 1) + 2 × (1 + 1) + 1 = 8 GiB, so this runs 1 GiB below the worst
-case and relies on the headless server and the REA JVMs not peaking together (they rarely do; an
-OOM kill is what happens if they do). With a 10 GB VM use `--memory 8g` and `-Xmx3g`. Docker
+`JAVA_OPTS="-Xmx4g -XX:+UseG1GC"` (+ the G1 flags above), `GHIDRA_HEADLESS_MAXMEM=1g`, container
+limit 7g: the formula gives (4 + 1) + 2 × 0.5 + 1 = 7 GiB, plus 2 GiB while a raw or DOS target
+runs in REA's own JVM, which then relies on the heaps not peaking together (an OOM kill is what
+happens if they do). With a 10 GB VM use `--memory 8g` and `-Xmx5g`. Docker
 Desktop's VM limit (Settings, Resources, or `.wslconfig` `memory=`) must be at least the container
 limit. To fit less memory lower `REBOX_MAX_SESSIONS` first; to
 analyse very large binaries raise `GHIDRA_HEADLESS_MAXMEM` and `JAVA_OPTS` and the limit with
