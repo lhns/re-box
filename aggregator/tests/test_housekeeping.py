@@ -31,16 +31,23 @@ def test_sweep_tmp_removes_only_known_patterns(tmp_path):
     locks.mkdir()
     (locks / "a.lock").write_text("")
     (locks / "keep.txt").write_text("")
+    for uid in ("1000", "4321"):  # REA's TMPDIR, named after the service uid
+        (tmp_path / f"rebox-rea-{uid}" / f"rea-ghidra-{uid}").mkdir(parents=True)
+        (tmp_path / f"rebox-rea-{uid}" / f"rea-ghidra-{uid}" / "target.bin").write_bytes(b"x" * 10)
+    (tmp_path / "rebox-rea-1000" / "other").write_text("")
     keep = [tmp_path / "rebox-e2e", tmp_path / "ghidra-mcp-rebox", tmp_path / "hsperfdata_x", tmp_path / "area-1"]
     for k in keep:
         k.mkdir()
     (tmp_path / "rebox-e2e" / "f").write_text("")
+    (tmp_path / "rebox-e2e" / "rea-nested").mkdir()
     (res, freed), events = captured(sweep_tmp, str(tmp_path))
-    assert res == 3 and freed == 102
+    assert res == 5 and freed == 122
     assert not (tmp_path / "rea-ghidra-abc123").exists() and not (tmp_path / "rea-other").exists()
+    assert not list(tmp_path.glob("rebox-rea-*/rea-*")) and (tmp_path / "rebox-rea-1000" / "other").exists()
     assert not (locks / "a.lock").exists() and (locks / "keep.txt").exists()
     assert all(k.exists() for k in keep) and (tmp_path / "rebox-e2e" / "f").exists()
-    assert [(e["event"], e["removed"], e["bytes"]) for e in events] == [("tmp_swept", 3, 102)]
+    assert (tmp_path / "rebox-e2e" / "rea-nested").exists()
+    assert [(e["event"], e["removed"], e["bytes"]) for e in events] == [("tmp_swept", 5, 122)]
 
 
 def test_sweep_tmp_does_not_follow_symlinks(tmp_path):
@@ -50,8 +57,11 @@ def test_sweep_tmp_does_not_follow_symlinks(tmp_path):
     tmp = tmp_path / "tmp"
     tmp.mkdir()
     os.symlink(outside, tmp / "rea-link")
+    (outside / "rea-inside").mkdir()
+    os.symlink(outside, tmp / "rebox-rea-1000")  # not REA's TMPDIR: never entered
     (res, _), _ = captured(sweep_tmp, str(tmp))
     assert res == 1 and not os.path.lexists(tmp / "rea-link")
+    assert (outside / "rea-inside").exists()
     assert (outside / "precious").read_text() == "data"
 
 

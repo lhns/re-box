@@ -77,10 +77,12 @@ in the `ghidra_` project.
 - Ghidra's `application.log` and `script.log` roll at 50 MB (20 files per day), but Ghidra never
   deletes rolled files of earlier days. Rolled files (`*.log-DATE-N.log`) not modified for 30 days
   (fixed, not configurable) are deleted at start and daily (`ghidra_logs_pruned`).
-- `/tmp`: REA's per-session `rea-ghidra-*` directory (it holds a full copy of the target) is
-  deleted on a normal `rea_close_binary` but survives a `docker kill` or a crash, and the attach
-  helper's `rebox-attach-locks/*.lock` stay. The supervisor removes `rea-*` entries and those lock
-  files from the temp dir at each start (`tmp_swept`, count and bytes), before any session exists.
+- `/tmp`: REA's per-session `rea-ghidra-*` directory in its `TMPDIR` `/tmp/rebox-rea-<uid>` (it
+  holds a full copy of the target) is deleted on a normal `rea_close_binary` but survives a
+  `docker kill` or a crash, and the attach helper's `rebox-attach-locks/*.lock` stay. The supervisor
+  removes `rea-*` entries from the temp dir and from every `rebox-rea-*` in it (any uid, as PUID may
+  have changed), and those lock files, at each start (`tmp_swept`, count and bytes), before any
+  session exists.
   Limit: a session that is SIGKILLed while the container keeps running leaves its `rea-ghidra-*`
   until the next container start. Ghidra's own temp files clean up after themselves.
 - The size of `ghidra-projects/` is logged as `project_size` at every Ghidra start.

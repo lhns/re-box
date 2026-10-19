@@ -108,8 +108,9 @@ if [ "$e2e" = 0 ]; then
   # Same work and state dirs: what a SIGTERM stop must have kept (project edits, REA evidence).
   step "restart on the same state"
   # What a killed session leaves in /tmp; the supervisor sweeps it at start (test_restart.py).
-  mkdir -p /tmp/rea-ghidra-planted && echo x >/tmp/rea-ghidra-planted/target.bin
-  chown -R "$PUID:$PGID" /tmp/rea-ghidra-planted
+  planted=/tmp/rebox-rea-$PUID/rea-ghidra-planted  # in REA's TMPDIR, where its sessions put it
+  mkdir -p "$planted" && echo x >"$planted/target.bin"
+  chown -R "$PUID:$PGID" "$planted"
   start_services
   set +e
   (cd "$TESTS/e2e" && REBOX_INSTANCE="$REBOX_INSTANCE" REBOX_E2E_PHASE=restart as_puid "$PY" -m pytest -v -p no:cacheprovider -rA test_restart.py)

@@ -46,21 +46,27 @@ def _remove(entry: os.DirEntry) -> int:
     return size
 
 
-def sweep_tmp(root: str) -> tuple[int, int]:
-    """Remove what killed processes left in the temp dir: REA's rea-* runtime dirs and the attach
-    helper's lock files. Only these patterns; run before any session exists. Returns (removed, bytes)."""
-    removed = freed = 0
+def _entries(path: str) -> list[os.DirEntry]:
     try:
-        entries = list(os.scandir(root))
+        return list(os.scandir(path))
     except OSError:
-        return 0, 0
+        return []
+
+
+def sweep_tmp(root: str) -> tuple[int, int]:
+    """Remove what killed processes left in the temp dir: REA's rea-* runtime dirs, also inside REA's
+    TMPDIRs (rebox-rea-<uid>, any uid: the name follows PUID), and the attach helper's lock files.
+    Only these patterns; run before any session exists. Returns (removed, bytes)."""
+    removed = freed = 0
+    entries = _entries(root)
     todo = [e for e in entries if fnmatch.fnmatchcase(e.name, "rea-*")]
     for e in entries:
-        if e.name == "rebox-attach-locks" and e.is_dir(follow_symlinks=False):
-            try:
-                todo += [x for x in os.scandir(e.path) if x.name.endswith(".lock")]
-            except OSError:
-                pass
+        if not e.is_dir(follow_symlinks=False):
+            continue
+        if fnmatch.fnmatchcase(e.name, "rebox-rea-*"):
+            todo += [x for x in _entries(e.path) if fnmatch.fnmatchcase(x.name, "rea-*")]
+        elif e.name == "rebox-attach-locks":
+            todo += [x for x in _entries(e.path) if x.name.endswith(".lock")]
     for e in todo:
         try:
             freed += _remove(e)

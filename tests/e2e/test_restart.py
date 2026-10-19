@@ -23,7 +23,8 @@ def test_ghidra_rename_survived_restart(session):
 
 
 def test_leftover_tmp_swept_at_start():
-    assert not Path("/tmp/rea-ghidra-planted").exists(), "the supervisor did not sweep rea-* from /tmp at start"
+    planted = Path(f"/tmp/rebox-rea-{os.getuid()}/rea-ghidra-planted")  # tests/run-tests.sh
+    assert not planted.exists(), "the supervisor did not sweep rea-* from REA's TMPDIR at start"
 
 
 def test_rea_evidence_autosaved():
