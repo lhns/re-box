@@ -13,10 +13,12 @@ export REBOX_TOKEN="e2e-$(head -c24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 export REBOX_PORT=18443
 export REBOX_URL="http://127.0.0.1:$REBOX_PORT/mcp"
 export RE_WORKDIR=/tmp/rebox-e2e/work
+# REA's TMPDIR, the supervisor's per-uid default spelled out once: the e2e tests read it from here.
+export REBOX_REA_TMP=/tmp/rebox-rea-$PUID
 # Outside RE_WORKDIR on purpose: exercises the analyzeHeadless + --project path. The supervisor
 # (as PUID) creates it.
 export REBOX_STATE_DIR=/tmp/rebox-e2e/state
-# Short, so test_11 sees Ghidra stop; the other tests hold a session open (e2e/conftest.py keeper).
+# Short, so test_stop_when_idle sees Ghidra stop; the other tests hold a session open (e2e/conftest.py keeper).
 export REBOX_GHIDRA_IDLE_TIMEOUT=5
 LOG=/tmp/rebox-e2e/services.log
 MEM=/tmp/rebox-e2e/rss.log
@@ -108,7 +110,7 @@ if [ "$e2e" = 0 ]; then
   # Same work and state dirs: what a SIGTERM stop must have kept (project edits, REA evidence).
   step "restart on the same state"
   # What a killed session leaves in /tmp; the supervisor sweeps it at start (test_restart.py).
-  planted=/tmp/rebox-rea-$PUID/rea-ghidra-planted  # in REA's TMPDIR, where its sessions put it
+  planted=$REBOX_REA_TMP/rea-ghidra-planted  # in REA's TMPDIR, where its sessions put it
   mkdir -p "$planted" && echo x >"$planted/target.bin"
   chown -R "$PUID:$PGID" "$planted"
   start_services

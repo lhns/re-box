@@ -9,12 +9,11 @@ import os
 import signal
 import threading
 import time
-import urllib.request
 
 from conftest import record
-from mcpclient import McpError
-from reahelp import (copy_fixture, ghidra_mcp_jvm, helpers, jtext, ok, rea_jvms, rea_program_path,
+from helpers import (copy_fixture, ghidra_mcp_jvm, ghidra_post, helpers, jtext, ok, rea_jvms, rea_program_path,
                      sha256_of, wait_for)
+from mcpclient import McpError
 
 
 def test_attach_shares_the_jvm_and_project(session):
@@ -38,9 +37,6 @@ def test_attach_shares_the_jvm_and_project(session):
     assert len(ghidra_mcp_jvm()) == 1
     found = jtext(ok(s.tool("ghidra_find_functions", {"program": "one_debug", "name_pattern": "AttachCompute"})))
     assert found["functions"], "the REA rename is gone after close"
-
-
-# The raw-binary case (formerly a fallback to REA's own JVM) is test_rea_profiles.py's.
 
 
 def test_same_name_other_bytes_gets_its_own_folder(session):
@@ -67,8 +63,7 @@ def test_jvm_restart_while_rea_has_a_binary_open(session):
     ok(s.tool("rea_open_binary", {"path": target, "provider_id": "ghidra"}))
     ok(s.tool("rea_analyze_function", {"procedure": "compute"}))
     # Keep the other tests' project edits: the kill skips the shutdown save.
-    urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:8089/save_all_programs", data=b"",
-                                                  method="POST"), timeout=600).read()
+    ghidra_post("/save_all_programs")
     [jvm] = ghidra_mcp_jvm()
     os.kill(jvm, signal.SIGKILL)
     wait_for(lambda: not helpers(), 20, "the attach helper to notice the JVM is gone")

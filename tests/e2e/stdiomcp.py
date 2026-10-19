@@ -14,6 +14,7 @@ import subprocess
 import threading
 from typing import Any
 
+from helpers import ghidra_token
 from mcpclient import PROTOCOL_VERSION, Call, McpError
 
 
@@ -102,11 +103,15 @@ def start_rea(state_dir, extra_env: dict[str, str]) -> StdioSession:
         "XDG_STATE_HOME": str(home / ".local/state"),
         "XDG_CACHE_HOME": str(state_dir / "cache"),
         "REBOX_REA_ATTACH_HELPER": "/opt/rebox/rea-attach/helper.mjs",
-        # aggregator.toml's TMPDIR = "{REBOX_REA_TMP}": the supervisor's per-uid default, a
-        # ghidra-mcp file root, so the helper can import REA's snapshot from there.
-        "TMPDIR": os.environ.get("REBOX_REA_TMP") or f"/tmp/rebox-rea-{os.getuid()}",
+        # aggregator.toml's TMPDIR = "{REBOX_REA_TMP}": a ghidra-mcp file root, so the helper can
+        # import REA's snapshot from there.
+        "TMPDIR": os.environ["REBOX_REA_TMP"],
         **extra_env,
     })
+    # The supervisor's token for ghidra-mcp reaches REA's children by inheritance; REBOX_* was stripped above.
+    token = ghidra_token()
+    if token:
+        env["GHIDRA_MCP_AUTH_TOKEN"] = token
     s = StdioSession(["/usr/local/bin/rea", "mcp"], env)
     s.initialize()
     return s

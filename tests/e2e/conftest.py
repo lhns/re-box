@@ -1,12 +1,12 @@
 """Shared setup for the e2e suite. tests/run-tests.sh starts the container's services and sets:
 
 REBOX_URL, REBOX_TOKEN, RE_WORKDIR (fixtures copied in), REBOX_STATE_DIR, PUID, PGID,
-REBOX_INSTANCE, REBOX_E2E_PHASE (unset for the first run, `restart` for the run after a restart).
+REBOX_INSTANCE, REBOX_REA_TMP (REA's TMPDIR), REBOX_E2E_PHASE (unset for the first run, `restart`
+for the run after a restart).
 """
 from __future__ import annotations
 
 import os
-import time
 from pathlib import Path
 
 import pytest
@@ -42,7 +42,7 @@ _keeper: Session | None = None
 
 def keeper() -> Session:
     """One session held open (with a GET stream, so it is not an orphan) for the whole run, so Ghidra
-    stays up between tests despite REBOX_GHIDRA_IDLE_TIMEOUT=5. test_11 releases it."""
+    stays up between tests despite REBOX_GHIDRA_IDLE_TIMEOUT=5. test_stop_when_idle.py (the last file) releases it."""
     global _keeper
     if _keeper is None:
         _keeper = Session(URL, TOKEN, timeout=None)

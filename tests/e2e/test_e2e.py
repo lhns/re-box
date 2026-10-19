@@ -3,9 +3,7 @@ with the Bearer token, exactly as a harness connects. Numbers in the test names 
 """
 from __future__ import annotations
 
-import hashlib
 import json
-import os
 import re
 import shutil
 import threading
@@ -13,46 +11,12 @@ import time
 from pathlib import Path
 
 import httpx2 as httpx
-import pytest
 
-from conftest import (COMPUTE_MARKERS, COMPUTE_MULTIPLIER, INSTANCE, PROJECTS, STATE, TOKEN, URL, WORKDIR,
-                      fixture_path, keeper, record, release_keeper)
-from mcpclient import McpError, Session
+from conftest import COMPUTE_MARKERS, COMPUTE_MULTIPLIER, PROJECTS, STATE, TOKEN, URL, WORKDIR, fixture_path, keeper, record
+from helpers import jtext, processes_in_groups, session_processes, tag_of
+from mcpclient import PROTOCOL_VERSION, Session
 
 NAME_RE = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
-
-
-def session_processes(tag: str) -> dict[int, int]:
-    """pid -> pgid of every process carrying this session's tag (and this instance's id)."""
-    found = {}
-    want = {f"REBOX_SESSION={tag}".encode(), f"REBOX_INSTANCE={INSTANCE}".encode()}
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit():
-            continue
-        try:
-            env = set((proc / "environ").read_bytes().split(b"\0"))
-            if want <= env:
-                stat = (proc / "stat").read_text()
-                found[int(proc.name)] = int(stat.rsplit(")", 1)[1].split()[2])
-        except OSError:
-            continue
-    return found
-
-
-def processes_in_groups(pgids: set[int]) -> list[int]:
-    pids = []
-    for proc in Path("/proc").iterdir():
-        if proc.name.isdigit():
-            try:
-                if int((proc / "stat").read_text().rsplit(")", 1)[1].split()[2]) in pgids:
-                    pids.append(int(proc.name))
-            except OSError:
-                continue
-    return pids
-
-
-def tag_of(session_id: str) -> str:
-    return hashlib.sha256(session_id.encode()).hexdigest()[:16]
 
 
 # --- 1. catalog
@@ -121,39 +85,35 @@ def test_02_rea_flow(session):
 
 
 # --- 3. ghidra-mcp flow, with persistence in GHIDRA_PROJECTS_DIR
-def _json(call):
-    return json.loads(call.text())
-
-
 def test_03_ghidra_mcp_flow(session):
     s = session()
     imported = s.tool("ghidra_import_file", {"file_path": fixture_path("hello_stripped")})
     record("03_ghidra_mcp_flow", "ghidra_import_file + auto-analysis", imported.seconds)
-    info = _json(imported)
+    info = jtext(imported)
     assert info.get("success"), info
     program = info["name"]
 
-    functions = _json(s.tool("ghidra_find_functions", {"program": program, "name_pattern": "FUN_", "limit": 200}))["functions"]
+    functions = jtext(s.tool("ghidra_find_functions", {"program": program, "name_pattern": "FUN_", "limit": 200}))["functions"]
     assert functions
     compute = None
     for fn in functions:
-        code = _json(s.tool("ghidra_get_functions", {"program": program, "function": fn["address"],
+        code = jtext(s.tool("ghidra_get_functions", {"program": program, "function": fn["address"],
                                                       "fields": "decompiled_code"})).get("decompiled_code", "")
         if any(m in code for m in COMPUTE_MARKERS):
             compute = fn
             break
     assert compute, "no stripped function decompiles to compute()"
 
-    renamed = _json(s.tool("ghidra_rename_function", {"program": program, "old_name": compute["address"],
+    renamed = jtext(s.tool("ghidra_rename_function", {"program": program, "old_name": compute["address"],
                                                        "new_name": "ComputeFixtureValue", "strict_mode": "off"}))
     assert renamed.get("status") == "success" or renamed.get("success"), renamed
-    assert _json(s.tool("ghidra_save_program", {"program": program})).get("success")
-    assert _json(s.tool("ghidra_close_program", {"name": program, "save": True})).get("success", True)
+    assert jtext(s.tool("ghidra_save_program", {"program": program})).get("success")
+    assert jtext(s.tool("ghidra_close_program", {"name": program, "save": True})).get("success", True)
 
     # Reopen from the project database on disk.
-    reopened = _json(s.tool("ghidra_open_program", {"path": info["path"]}))
+    reopened = jtext(s.tool("ghidra_open_program", {"path": info["path"]}))
     assert reopened.get("success"), reopened
-    found = _json(s.tool("ghidra_find_functions", {"program": program, "name_pattern": "ComputeFixtureValue"}))
+    found = jtext(s.tool("ghidra_find_functions", {"program": program, "name_pattern": "ComputeFixtureValue"}))
     assert [f["address"] for f in found["functions"]] == [compute["address"]]
     assert (PROJECTS / "rebox.gpr").is_file() and (PROJECTS / "rebox.rep").is_dir()
 
@@ -165,52 +125,27 @@ def test_03b_delete_program(session):
     copy = WORKDIR / "hello_delete"
     shutil.copyfile(src, copy)
     s = session()
-    first = _json(s.tool("ghidra_import_file", {"file_path": str(copy)}))
+    first = jtext(s.tool("ghidra_import_file", {"file_path": str(copy)}))
     assert first.get("success"), first
     name = first["name"]
     assert name in s.tool("ghidra_list_open_programs", {}).text()
     assert name in s.tool("ghidra_list_project_files", {"folder": "/"}).text()
 
-    deleted = _json(s.tool("ghidra_delete_file", {"filePath": first["path"]}))
+    deleted = jtext(s.tool("ghidra_delete_file", {"filePath": first["path"]}))
     assert deleted.get("success") and deleted.get("deleted") is True, deleted
     assert copy.is_file(), "the source file must stay"
     assert name not in s.tool("ghidra_list_open_programs", {}).text()
     assert name not in s.tool("ghidra_list_project_files", {"folder": "/"}).text()
-    assert _json(s.tool("ghidra_delete_file", {"filePath": first["path"]})).get("deleted") is False
+    assert jtext(s.tool("ghidra_delete_file", {"filePath": first["path"]})).get("deleted") is False
 
-    again = _json(s.tool("ghidra_import_file", {"file_path": str(copy)}))
+    again = jtext(s.tool("ghidra_import_file", {"file_path": str(copy)}))
     assert again.get("success"), again
-    assert _json(s.tool("ghidra_delete_file", {"filePath": again["path"]})).get("deleted") is True
+    assert jtext(s.tool("ghidra_delete_file", {"filePath": again["path"]})).get("deleted") is True
 
 
 def test_03c_delete_project_is_hidden(session):
     s = session()
     assert "ghidra_delete_project" not in s.tool_names()
-
-
-# --- 4. lazy tool groups and list_changed. Lazy mode is opt-in now (the image sets GHIDRA_MCP_LAZY=0:
-# clients cannot be relied on to follow list_changed); run with GHIDRA_MCP_LAZY=1 to exercise it.
-@pytest.mark.skipif(os.environ.get("GHIDRA_MCP_LAZY") != "1", reason="lazy tool groups are off by default")
-def test_04_lazy_groups(session):
-    s = session(listen=True)
-    before = set(s.tool_names())
-    assert "ghidra_get_comment" not in before, "comment group already loaded; lazy mode off?"
-    load = s.tool("ghidra_load_tool_group", {"group": "comment"})
-    changed = [m for m in load.notifications if m.get("method") == "notifications/tools/list_changed"]
-    deadline = time.monotonic() + 10
-    while not changed and time.monotonic() < deadline:
-        try:
-            m = s.background.get(timeout=0.5)
-            if m.get("method") == "notifications/tools/list_changed":
-                changed.append(m)
-        except Exception:
-            pass
-    assert changed, "no notifications/tools/list_changed after ghidra_load_tool_group"
-    after = set(s.tool_names())
-    assert {"ghidra_get_comment", "ghidra_set_comment"} <= after - before
-    # Routed to the bridge (a tool-level error about the missing program is fine; unknown tool is not).
-    call = s.request("tools/call", {"name": "ghidra_get_comment", "arguments": {"program": "nonexistent", "address": "0x0"}})
-    assert call.error is None, call.error
 
 
 # --- 5. session isolation
@@ -280,7 +215,7 @@ def test_07_cancellation(session):
 # --- 8. auth
 def test_08_auth():
     init = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
-            "params": {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "x", "version": "1"}}}
+            "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "x", "version": "1"}}}
     headers = {"Accept": "application/json, text/event-stream"}
     with httpx.Client(timeout=30) as http:
         assert http.post(URL, json=init, headers=headers).status_code == 401
@@ -288,17 +223,6 @@ def test_08_auth():
         assert http.post(URL, json=init, headers={**headers, "Authorization": f"Bearer {TOKEN}x"}).status_code == 401
         health = http.get(URL.rsplit("/mcp", 1)[0] + "/healthz")
         assert health.status_code == 200
-
-
-# --- 9. ownership of everything the services wrote to the state dir
-def test_09_ownership():
-    """Runs in the PUID/PGID remap mode (container started as root). The uid-1000 mode is
-    covered by tests/smoke/image.sh: there no remap happens and files belong to the runtime uid."""
-    puid, pgid = int(os.environ["PUID"]), int(os.environ["PGID"])
-    files = [p for p in STATE.rglob("*")]
-    assert any(p.is_relative_to(PROJECTS) for p in files), "test_03 should have written the project"
-    wrong = [(str(p), p.lstat().st_uid, p.lstat().st_gid) for p in files if (p.lstat().st_uid, p.lstat().st_gid) != (puid, pgid)]
-    assert not wrong, wrong[:5]
 
 
 # --- 10. session cleanup
@@ -321,50 +245,3 @@ def test_10_session_cleanup():
     assert not processes_in_groups(pgids)
     s.session_id = None
     s.close()
-
-
-# --- 11. Ghidra stops when the last session is gone (REBOX_GHIDRA_IDLE_TIMEOUT=5) and comes back
-def ghidra_server_pids() -> list[int]:
-    found = []
-    for proc in Path("/proc").iterdir():
-        if not proc.name.isdigit():
-            continue
-        try:
-            if b"GhidraMCPHeadlessServer" in (proc / "cmdline").read_bytes() and \
-                    f"REBOX_INSTANCE={INSTANCE}".encode() in (proc / "environ").read_bytes().split(b"\0"):
-                found.append(int(proc.name))
-        except OSError:
-            continue
-    return found
-
-
-def test_11_idle_stop_and_restart():
-    assert ghidra_server_pids(), "the keeper session should have kept Ghidra running"
-    release_keeper()  # every other session of the run is closed already
-    t0 = time.monotonic()
-    deadline = t0 + 90
-    while ghidra_server_pids() and time.monotonic() < deadline:
-        time.sleep(0.5)
-    record("11_idle_stop", "Ghidra gone after the last session closed (idle timeout 5 s)", time.monotonic() - t0)
-    assert not ghidra_server_pids()
-    # The JVM leaves /proc a moment before the supervisor has reaped it and says "stopped"
-    # (measured 0.3 s on an idle machine).
-    with httpx.Client(timeout=30) as http:
-        for _ in range(40):
-            health = http.get(URL.rsplit("/mcp", 1)[0] + "/healthz")
-            if health.status_code != 200 or health.json()["ghidra"] != "stopping":
-                break
-            time.sleep(0.25)
-    assert health.status_code == 200 and health.json()["ghidra"] == "stopped", health.text
-
-    # A cold session: the catalog comes from the cache at once, and a ghidra_ call waits for Ghidra.
-    s = Session(URL, TOKEN)
-    try:
-        s.initialize()
-        assert "ghidra_get_metadata" in s.tool_names()
-        opened = s.tool("ghidra_open_program", {"path": "/hello_stripped"})  # imported and saved by test_03
-        record("11_idle_stop", "first ghidra_ call of a cold session (restart included)", opened.seconds)
-        assert _json(opened).get("success"), opened.text()[:500]
-        assert ghidra_server_pids()
-    finally:
-        s.close()

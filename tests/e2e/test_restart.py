@@ -9,21 +9,21 @@ from pathlib import Path
 import pytest
 
 from conftest import PHASE, STATE
-from test_e2e import _json
+from helpers import jtext
 
 pytestmark = pytest.mark.skipif(PHASE != "restart", reason="runs after the restart (REBOX_E2E_PHASE=restart)")
 
 
 def test_ghidra_rename_survived_restart(session):
     s = session()
-    opened = _json(s.tool("ghidra_open_program", {"path": "/hello_stripped"}))
+    opened = jtext(s.tool("ghidra_open_program", {"path": "/hello_stripped"}))
     assert opened.get("success"), opened
-    found = _json(s.tool("ghidra_find_functions", {"program": "hello_stripped", "name_pattern": "ComputeFixtureValue"}))
+    found = jtext(s.tool("ghidra_find_functions", {"program": "hello_stripped", "name_pattern": "ComputeFixtureValue"}))
     assert len(found["functions"]) == 1, found
 
 
 def test_leftover_tmp_swept_at_start():
-    planted = Path(f"/tmp/rebox-rea-{os.getuid()}/rea-ghidra-planted")  # tests/run-tests.sh
+    planted = Path(os.environ["REBOX_REA_TMP"]) / "rea-ghidra-planted"  # tests/run-tests.sh
     assert not planted.exists(), "the supervisor did not sweep rea-* from REA's TMPDIR at start"
 
 

@@ -15,10 +15,8 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 
-import pytest
-
 from conftest import STATE
-from reahelp import copy_fixture, helpers, ok, rea_jvms, rea_program_path, sha256_of
+from helpers import copy_fixture, helpers, ok, rea_jvms, rea_program_path, sha256_of
 from stdiomcp import start_rea
 
 
@@ -172,9 +170,3 @@ def test_mips_soft_float(session):
         assert set(find_values(overview, "mips_soft_float_storage")) == {"o32-soft-float-prototype-v1"}
         assert_in_shared_jvm(gh, target)
 
-
-@pytest.mark.skip(reason="REA's only Ghidra analysis extension is NativeAOT (REA_GHIDRA_NATIVEAOT_JAR, "
-                         "a third-party extension jar for x86-64 NativeAOT ELF/PE targets); neither the jar "
-                         "nor such a target is in the image")
-def test_analysis_extensions():
-    ...
