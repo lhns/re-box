@@ -4,8 +4,12 @@
 //
 //   REA_PACKAGE=/opt/rea/node_modules/rea-agents node --test helper.test.mjs
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { parseHeadless } from "./helper.mjs";
+import { lockName, parseHeadless, refusal } from "./helper.mjs";
 
 const pkg = process.env.REA_PACKAGE;
 const { ghidraHeadlessArguments } = await import(`${pkg}/dist/ghidra/GhidraLauncher.js`);
@@ -88,4 +92,36 @@ test("unknown options and a missing bridge are refused", () => {
 	const args = ghidraHeadlessArguments(base);
 	assert.throws(() => parseHeadless([...args.slice(0, 2), "-noanalysis", ...args.slice(2)]), /unsupported/u);
 	assert.throws(() => parseHeadless(args.slice(0, -3)), /final -postScript/u);
+});
+
+test("analysis extensions are refused, as is whitespace in the paths", () => {
+	const spec = { descriptor: "/tmp/r/session.json", scriptLog: "/tmp/r/script.log" };
+	assert.equal(refusal({}, spec), undefined);
+	assert.equal(refusal({ analysis_extensions: [] }, spec), undefined);
+	assert.match(refusal({ analysis_extensions: ["/x/NativeAot.jar"] }, spec), /analysis extensions/u);
+	assert.match(refusal({}, { ...spec, scriptLog: "/tmp/r s/script.log" }), /whitespace/u);
+});
+
+test("lockName: exclusive, released, and a dead holder's lock is taken over", async () => {
+	const dir = mkdtempSync(join(tmpdir(), "locks-"));
+	try {
+		const first = await lockName("/rea/x/prog", dir);
+		const lock = join(dir, `${encodeURIComponent("/rea/x/prog")}.lock`);
+		assert.ok(existsSync(lock));
+		let second = false;
+		const waiting = lockName("/rea/x/prog", dir).then((release) => { second = true; return release; });
+		await new Promise((r) => setTimeout(r, 600));
+		assert.equal(second, false, "a live holder's lock must hold");
+		first();
+		(await waiting)();
+		assert.ok(!existsSync(lock));
+
+		// A holder that died without releasing (SIGKILL): its pid is gone.
+		const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+		writeFileSync(lock, String(dead));
+		(await lockName("/rea/x/prog", dir))();
+		assert.ok(!existsSync(lock));
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
 });

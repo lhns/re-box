@@ -1,7 +1,8 @@
 # Draft: upstream PR to REA (not opened)
 
 If REA accepted this, `patch-rea.py` would shrink to nothing: re-box would set one environment
-variable and ship its helper and host script, with no per-release anchor maintenance.
+variable and ship its helper and host script, with no per-release anchor maintenance. (Beyond the
+launch seam it patches REA for a program that other tools edit; items 2 to 4 below.)
 
 ---
 
@@ -38,7 +39,17 @@ the only way is to patch the bundled launcher. The launcher already has `javaLau
      JVM) and report "not timed out"; the host is responsible for finishing analysis first.
    - `sessionDefaultAddressSpace`: per instance (or per serving thread) instead of `static`, so
      several bridges can serve in one JVM.
-3. Docs: the variable, the argument contract, and that `project_ephemeral` / "ephemeral" no
+3. A shared program is not REA's alone (re-box patches these three today):
+   - the analysis cache policy of a hosted session is `live`, not `snapshot` (REA's policy for IDA
+     and Kuna, which have the same issue), and the bridge drops its inventories whenever the
+     program's modification number moved since its last request;
+   - the bridge's edit methods (`annotate_native_function`, `set_address_name(s)`) run under a
+     lock the host passes in, and wait for a transaction of someone else to end instead of
+     joining it: Ghidra merges concurrent transactions, so one abort would discard the other's
+     work (re-box: `program_busy` after 60 s);
+   - with the command configured but unusable, the provider fails instead of falling back to its
+     own JVM.
+4. Docs: the variable, the argument contract, and that `project_ephemeral` / "ephemeral" no
    longer hold for such hosts (annotations persist wherever the host keeps the program).
 
 **Security**
@@ -50,7 +61,9 @@ refuses a program whose executable SHA-256 differs from the admitted target.
 **Not in scope**
 
 Choosing which target profiles a host can import (raw, DOS, PSP, seeds): the command sees the
-arguments and can delegate to `analyzeHeadless` itself.
+arguments and maps them itself. re-box's helper does: every REA profile becomes one
+`/import_file` call with the loader options and pre/post scripts, and refuses an argument it
+does not know.
 
 **Testing**
 

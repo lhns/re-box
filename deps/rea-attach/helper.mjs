@@ -5,21 +5,24 @@
 // ends the bridge (the host script's watchdog), and its exit tells REA the provider is gone.
 //
 // argv: --target <original path> <the AnalyzeHeadless arguments REA built>
-// env:  REBOX_GHIDRA_URL (default http://127.0.0.1:8089), REBOX_REA_GHIDRA_WAIT (seconds to wait
-//       for the JVM, default 600: the supervisor starts it with the session, and REA's own startup
-//       deadline, REA_GHIDRA_STARTUP_TIMEOUT_MS, bounds the whole open anyway),
-//       REBOX_REA_BRIDGE_DIR, REBOX_REA_IMPORT_SCRIPTS, REBOX_REA_ATTACH_SCRIPT
+// env:  GHIDRA_MCP_AUTH_TOKEN (the supervisor's, inherited): sent as a Bearer token to ghidra-mcp
+//       when set. The scripts it needs are installed beside this file.
 import { request } from "node:http";
 import { connect } from "node:net";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const base = new URL(process.env.REBOX_GHIDRA_URL ?? "http://127.0.0.1:8089");
-const bridgeDir = process.env.REBOX_REA_BRIDGE_DIR ?? "/opt/rebox/rea-attach/ghidra_scripts";
+const base = new URL("http://127.0.0.1:8089");
+const authToken = process.env.GHIDRA_MCP_AUTH_TOKEN;
+const here = dirname(fileURLToPath(import.meta.url));
+const bridgeDir = join(here, "ghidra_scripts");
 // REA's pre- and post-scripts: ghidra-mcp runs import scripts only from here (patch-rea.py).
-const importScripts = process.env.REBOX_REA_IMPORT_SCRIPTS ?? "/opt/rebox/rea-attach/import_scripts";
-const hostScript = process.env.REBOX_REA_ATTACH_SCRIPT ?? "ReboxReaAttach.java";
-const startWait = Number(process.env.REBOX_REA_GHIDRA_WAIT || 600);
+const importScripts = join(here, "import_scripts");
+const hostScript = "ReboxReaAttach.java";
+// The supervisor starts the JVM with the session; REA's own startup deadline
+// (REA_GHIDRA_STARTUP_TIMEOUT_MS) bounds the whole open anyway.
+const startWait = 600;
 const BRIDGE = "ReaGhidraBridge.java";
 
 const die = (msg) => {
@@ -75,13 +78,13 @@ const localScript = ({ path, args }) => {
 	return { path: local, args };
 };
 
-// A lock per program, shared by every helper of this container (same uid). TMPDIR is REA's
-// private per-session directory here, so the locks live at a fixed path. A lock whose holder died
-// is taken over.
-const LOCKS = "/tmp/rebox-attach-locks";
-const lockName = async (name) => {
-	mkdirSync(LOCKS, { recursive: true, mode: 0o700 });
-	const path = join(LOCKS, `${encodeURIComponent(name)}.lock`);
+// A lock per program, shared by every helper of this container. TMPDIR is REA's private
+// per-session directory, so the locks live at a fixed path, per uid (a PUID change must not meet
+// the old uid's 0700 directory on a persistent /tmp). A lock whose holder died is taken over.
+const LOCKS = `/tmp/rebox-attach-locks-${process.getuid()}`;
+export const lockName = async (name, dir = LOCKS) => {
+	mkdirSync(dir, { recursive: true, mode: 0o700 });
+	const path = join(dir, `${encodeURIComponent(name)}.lock`);
 	for (;;) {
 		try {
 			writeFileSync(path, String(process.pid), { flag: "wx" });
@@ -117,7 +120,10 @@ const call = (path, body) => new Promise((resolve, reject) => {
 	const data = body === undefined ? undefined : JSON.stringify(body);
 	const req = request(new URL(path, base), {
 		method: data === undefined ? "GET" : "POST",
-		headers: data === undefined ? {} : { "content-type": "application/json", "content-length": Buffer.byteLength(data) },
+		headers: {
+			...authToken ? { authorization: `Bearer ${authToken}` } : {},
+			...data === undefined ? {} : { "content-type": "application/json", "content-length": Buffer.byteLength(data) },
+		},
 	}, (res) => {
 		let text = "";
 		res.setEncoding("utf8");
@@ -134,6 +140,17 @@ const call = (path, body) => new Promise((resolve, reject) => {
 	req.end(data);
 });
 
+/** Why this session cannot attach, or undefined. */
+export const refusal = (descriptor, spec) => {
+	// REA's analysis extensions are jars the bridge loads; in the shared JVM they would run with
+	// every session's programs. Not supported attached.
+	if ((descriptor.analysis_extensions ?? []).length > 0)
+		return "REA analysis extensions (REA_GHIDRA_NATIVEAOT_JAR) are not supported in re-box's shared Ghidra";
+	// /run_ghidra_script splits its args on whitespace.
+	if (/\s/u.test(spec.descriptor + spec.scriptLog + bridgeDir))
+		return "the descriptor, script log and bridge paths must contain no whitespace";
+};
+
 const main = async () => {
 	const args = process.argv.slice(2);
 	if (args[0] !== "--target" || args.length < 4) die("usage: --target <path> <AnalyzeHeadless args>");
@@ -147,13 +164,8 @@ const main = async () => {
 		die(e.message);
 	}
 	const descriptor = JSON.parse(readFileSync(spec.descriptor, "utf8"));
-	// REA's analysis extensions are jars the bridge loads; in the shared JVM they would run with
-	// every session's programs. Not supported attached.
-	if ((descriptor.analysis_extensions ?? []).length > 0)
-		die("REA analysis extensions (REA_GHIDRA_NATIVEAOT_JAR) are not supported in re-box's shared Ghidra");
-	// /run_ghidra_script splits its args on whitespace.
-	if (/\s/u.test(spec.descriptor + spec.scriptLog + bridgeDir))
-		die("the descriptor, script log and bridge paths must contain no whitespace");
+	const refused = refusal(descriptor, spec);
+	if (refused) die(refused);
 
 	// With the on-demand lifecycle the JVM may still be starting: wait for it and its project.
 	const deadline = Date.now() + startWait * 1000;
