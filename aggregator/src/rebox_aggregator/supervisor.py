@@ -18,8 +18,8 @@ from anyio.streams.text import TextReceiveStream
 
 from . import catalogcache
 from .app import App, make_server
-from .children import kill_by_command, kill_leftovers
-from .config import ConfigError, child_env, harden, load_settings, read_token
+from .children import kill_leftovers
+from .config import ConfigError, child_environ, harden, load_settings, read_token
 from .evidence import prune_old
 from .housekeeping import dir_size, prune_rolled_logs, remove_partial_exports, sweep_tmp
 from .log import log
@@ -395,7 +395,7 @@ class Headless:
                 continue
             # A crash: the REA bridges it served are gone. Their helpers would notice within seconds;
             # killing them now makes REA report it at once (reopen the binary to attach again).
-            await anyio.to_thread.run_sync(kill_by_command, self.instance, ATTACH_HELPER)
+            await anyio.to_thread.run_sync(kill_leftovers, None, self.instance, ATTACH_HELPER)
             log("headless_exit", "error", exit_code=proc.returncode)
             if time.monotonic() - started > 60:
                 backoff = 5.0
@@ -552,10 +552,9 @@ async def warm_up(cfg: SupervisorConfig, app: App, headless: Headless) -> None:
         with anyio.fail_after(cfg.start_timeout + 60):
             while not headless.ready():
                 await anyio.sleep(0.5)
-            base = {k: v for k, v in os.environ.items() if not k.startswith("REBOX_")}
             for spec in todo:
-                env = {**base, **child_env(spec, os.environ), "REBOX_INSTANCE": app.instance, "REBOX_SESSION": "warmup"}
-                part = await catalogcache.fetch_catalog(spec, env)
+                env = child_environ(spec, app.instance, "warmup")
+                part = await catalogcache.fetch_catalog(spec, env, app.settings.child_grace)
                 await anyio.to_thread.run_sync(catalogcache.save, state, spec, part)
     except Exception as e:  # a background nicety: sessions fall back to holding their initialize
         log("catalog_warmup_failed", "warn", error=(str(e) or type(e).__name__)[:300])
@@ -565,7 +564,7 @@ async def warm_up(cfg: SupervisorConfig, app: App, headless: Headless) -> None:
 
 async def supervise(cfg: SupervisorConfig, app: App) -> int:
     headless = Headless(cfg, app.instance)
-    app.health = headless.health
+
     app.backend = headless
     headless.on_ready = app.backend_became_ready
     skip = anyio.Event()

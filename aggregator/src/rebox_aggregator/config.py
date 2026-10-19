@@ -36,6 +36,16 @@ def child_env(spec: ChildSpec, environ: Mapping[str, str]) -> dict[str, str]:
     return {k: _ENV_REF.sub(lambda m: environ.get(m.group(1), ""), v) for k, v in spec.env.items()}
 
 
+def service_env(environ: Mapping[str, str] = os.environ) -> dict[str, str]:
+    """What the processes we start inherit: everything but REBOX_* (the token stays with us)."""
+    return {k: v for k, v in environ.items() if not k.startswith("REBOX_")}
+
+
+def child_environ(spec: ChildSpec, instance: str, session: str, environ: Mapping[str, str] = os.environ) -> dict[str, str]:
+    """A child's whole environment: service_env, its [child.env], and the tags the leftover sweep finds it by."""
+    return {**service_env(environ), **child_env(spec, environ), "REBOX_INSTANCE": instance, "REBOX_SESSION": session}
+
+
 @dataclass(frozen=True)
 class CatalogCacheSpec:
     """Remember the child's full catalog under REBOX_STATE_DIR so a session can advertise it while the

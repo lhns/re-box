@@ -12,7 +12,9 @@ from conftest import (
     INIT, RAW_HEADERS, fake_spec, pid_alive, raw_call, raw_init, run_app, wait_until,
 )
 from rebox_aggregator import session as session_mod
-from rebox_aggregator.children import Child, ChildError
+from mcp.shared.exceptions import MCPError
+
+from rebox_aggregator.children import Child
 from rebox_aggregator.config import ChildSpec, ConfigError, read_token
 from rebox_aggregator.session import Session
 
@@ -38,10 +40,12 @@ async def test_hostile_ids_do_not_break_anything(running):
             "jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": [1]}})
         assert r.status_code == 202
         assert await tool_text(http, running.url, sid, "a_bad_msgs", rid=3) == "sent"  # child sends list ids/tokens
+        assert await tool_text(http, running.url, sid, "a_bad_msgs", {"hold": True}, rid=5) == "sent"  # during a refresh
         assert await tool_text(http, running.url, sid, "b_echo", {"text": "alive"}, rid=4) == "alive"
+        assert await tool_text(http, running.url, sid, "a_echo", {"text": "alive"}, rid=6) == "alive"
         assert await tool_text(http, running.url, other, "a_echo", {"text": "other"}, rid=3) == "other"
         await raw_init(http, running.url)  # new sessions still open
-    assert not running.logged("internal_error")
+    assert not running.logged("internal_error") and not running.logged("child_exit")
 
 
 async def test_unexpected_exception_closes_only_that_session(running, monkeypatch):
@@ -49,7 +53,7 @@ async def test_unexpected_exception_closes_only_that_session(running, monkeypatc
         other, _ = await raw_init(http, running.url)
         sid, _ = await raw_init(http, running.url)
 
-        async def boom(self, msg):
+        async def boom(self, method, params):
             raise RuntimeError("boom")
 
         monkeypatch.setattr(Session, "_handle_notification", boom)
@@ -102,8 +106,8 @@ def test_harden_drops_dumpable():
 
 async def test_child_stdin_writes_never_block():
     class Handler:
-        async def on_request(self, child, msg): ...
-        async def on_notification(self, child, msg): ...
+        async def on_request(self, child, ctx, method, params): ...
+        def on_notification(self, child, method, params): ...
         async def on_exit(self, child): ...
 
     spec = ChildSpec("sleeper", "s_", ("/bin/sleep", "30"))
@@ -118,13 +122,33 @@ async def test_child_stdin_writes_never_block():
     assert not pid_alive(child.pid)
 
 
+async def test_child_exit_is_seen_while_a_grandchild_holds_its_stdout():
+    exited = anyio.Event()
+
+    class Handler:
+        async def on_request(self, child, ctx, method, params): ...
+        def on_notification(self, child, method, params): ...
+        async def on_exit(self, child):
+            exited.set()
+
+    child = Child(ChildSpec("g", "g_", ("/bin/sh", "-c", "sleep 30 & exit 3")), "t", dict(os.environ), 1.0, Handler())
+    async with anyio.create_task_group() as tg:
+        await child.start(tg)
+        with anyio.fail_after(4):  # not the grandchild's 30 s
+            with pytest.raises(MCPError) as e:
+                await child.request("tools/list")
+            await exited.wait()
+        tg.cancel_scope.cancel()
+    assert child.returncode == 3 and "exited with code 3" in e.value.message
+
+
 async def test_notifications_dropped_when_backlog_is_large(running):
     s = Session("sid", object(), running.settings, "i", lambda s: None)  # type: ignore[arg-type]
     s._queued = session_mod.MAX_QUEUED_NOTIFICATIONS + 1
-    await s._notify_down("notifications/progress", {})
-    await s._notify_down("notifications/progress", {})
+    s._notify_down("notifications/progress", {})
+    s._notify_down("notifications/progress", {})
     assert s._queued == session_mod.MAX_QUEUED_NOTIFICATIONS + 1  # dropped
-    await s._notify_down("notifications/tools/list_changed", None, droppable=False)
+    s._notify_down("notifications/tools/list_changed", None, droppable=False)
     assert s._queued == session_mod.MAX_QUEUED_NOTIFICATIONS + 2  # list_changed is kept
     assert len(running.logged("downstream_backpressure")) == 1
 
@@ -193,7 +217,7 @@ async def test_closed_child_refuses_to_spawn(tmp_path):
     child = Child(spec, "t", dict(os.environ), 1.0, object())  # type: ignore[arg-type]
     await child.close()  # session started closing before this child was spawned
     async with anyio.create_task_group() as tg:
-        with pytest.raises(ChildError):
+        with pytest.raises(MCPError):
             await child.start(tg)
     await anyio.sleep(0.3)
     assert child.proc is None and not marker.exists()
