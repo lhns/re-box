@@ -17,8 +17,10 @@ git clone https://github.com/lhns/re-box && cd re-box     # for compose.yaml and
 cp .env.example .env                                      # set RE_WORKDIR, PUID, PGID
 openssl rand -hex 32 > rebox_token && chmod 600 rebox_token
 docker compose up -d
-docker compose ps                                         # healthy after 1-2 min
+docker compose ps                                         # healthy within seconds; Ghidra starts with the first session
 ```
+
+Create the work directory first (`mkdir -p "$RE_WORKDIR"`), or Docker creates it as root.
 
 Or without compose (runs as uid 1000; the work dir must be writable by it):
 
@@ -32,6 +34,34 @@ docker run -d --name re-box --stop-timeout 120 --memory 16g \
 Mount the work dir at the **same absolute path** inside and out: tool arguments are container
 paths, so the paths your agent already uses stay valid, and so do the paths re-box writes back.
 Pulling needs `docker login ghcr.io` while the package is private.
+
+Ghidra runs only while a session is open: the first session starts it (about 40 s; the `gh_` tools
+appear when it is ready) and it stops 5 minutes after the last session closed
+(`REBOX_GHIDRA_IDLE_TIMEOUT`), so an idle container runs no Java.
+
+### Windows
+
+Run docker from Git Bash with the work dir in its `/c/...` form on **both** sides of `-v`, and
+turn off Git Bash's path rewriting so docker sees it unchanged:
+
+```sh
+export MSYS_NO_PATHCONV=1
+mkdir -p /c/Users/you/re
+docker run -d --name re-box --stop-timeout 120 --memory 6g \
+  -e REBOX_TOKEN_FILE=/run/secrets/rebox_token -v "$PWD/rebox_token:/run/secrets/rebox_token:ro" \
+  -e RE_WORKDIR=/c/Users/you/re -v /c/Users/you/re:/c/Users/you/re \
+  -p 127.0.0.1:8443:8443 ghcr.io/lhns/re-box:latest
+```
+
+Tell the agent to use paths like `/c/Users/you/re/x.exe` (the `initialize` instructions do); a
+`C:\...` path does not exist in the container. Docker Desktop with WSL2 also works from a WSL shell
+with a native Linux path.
+
+### Laptop
+
+Docker Desktop's VM must hold the container limit (Settings, Resources, or `memory=` in
+`.wslconfig`). For 8 GB: `-e REBOX_MAX_SESSIONS=2 -e JAVA_OPTS="-Xmx3g -XX:+UseG1GC"
+-e GHIDRA_HEADLESS_MAXMEM=1g --memory 6g`. Sizing: [docs/OPERATIONS.md](docs/OPERATIONS.md), "Memory".
 
 ## Connect a client
 
@@ -51,7 +81,8 @@ Claude Code, `.mcp.json` in the project (token from the environment, so it never
 ```
 
 ```sh
-export REBOX_TOKEN=$(cat rebox_token)
+export REBOX_TOKEN=$(cat rebox_token)       # PowerShell: $env:REBOX_TOKEN = (Get-Content rebox_token)
+export CLAUDE_CODE_MCP_TOOL_IDLE_TIMEOUT=1800000   # long imports; re-box also sends keepalive progress
 claude
 ```
 

@@ -19,7 +19,12 @@ services:
       PUID: ${PUID:-1000}
       PGID: ${PGID:-1000}
     secrets: [rebox_token]
+    # Targets run inside this container (docs/OPERATIONS.md, Security). To cut their egress, put the
+    # service on an `internal` network (below) and reach it through a proxy on that network, since
+    # an internal network cannot publish ports to the host; offline, symbol downloads stop.
+    # networks: [analysis]
     volumes:
+      # Create RE_WORKDIR on the host first (mkdir -p), or Docker creates it as root.
       # Same absolute path inside as outside: paths a client sends are valid here as they are,
       # and paths re-box writes are valid on the host.
       - ${RE_WORKDIR}:${RE_WORKDIR}
@@ -40,7 +45,8 @@ services:
       test: ["CMD", "/usr/local/bin/re-box-healthcheck"]
       interval: 30s
       timeout: 10s
-      start_period: 5m
+      # The aggregator answers at once; Ghidra starts with the first session and is not needed for 200.
+      start_period: 30s
       retries: 3
     restart: unless-stopped
     # Shutdown saves every Ghidra program and exports each REA session's evidence; Docker's
@@ -51,3 +57,6 @@ secrets:
     file: ./rebox_token
 volumes:
   rebox-tmp:
+# networks:
+#   analysis:
+#     internal: true

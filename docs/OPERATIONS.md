@@ -5,8 +5,10 @@
 `tini` (PID 1) → `re-box-entrypoint` (optional uid remap, then drops root) → `rebox-supervisor`:
 
 - the ghidra-mcp headless server: one JVM, `127.0.0.1:8089` only, shared by all sessions, owns
-  the Ghidra project in `GHIDRA_PROJECTS_DIR`;
-- the aggregator on `REBOX_PORT` (`/mcp`, `/healthz`), the only listening port;
+  the Ghidra project in `GHIDRA_PROJECTS_DIR`. **On demand:** it starts with the first session
+  (about 40 s until ready) and stops `REBOX_GHIDRA_IDLE_TIMEOUT` seconds after the last one
+  closed, so an idle container runs no Java at all;
+- the aggregator on `REBOX_PORT` (`/mcp`, `/healthz`), the only listening port, up at once;
 - per MCP session: `rea mcp` and `bridge-mcp-ghidra`, each in its own process group; REA starts
   its own short-lived Ghidra JVM per session when a call needs one.
 
@@ -21,11 +23,16 @@ Design: `aggregator/README.md`; why: `docs/DECISIONS.md`.
 | `REBOX_BIND` | `0.0.0.0` | aggregator bind address |
 | `REBOX_TLS_CERT` / `REBOX_TLS_KEY` | unset | both set: serve HTTPS; else plain HTTP (expected behind a reverse proxy) |
 | `REBOX_MAX_SESSIONS` | `4` | concurrent MCP sessions; one more `initialize` gets HTTP 503 with a JSON-RPC error saying so |
-| `REBOX_SESSION_IDLE_TIMEOUT` | `1800` | seconds without a request before a session and its processes are closed; a session with a request still running is closed after 4x this without any client message |
+| `REBOX_SESSION_IDLE_TIMEOUT` | `1800` | seconds without a request before a session and its processes are closed; a session with a request still running is closed after 4x this without any client message. Applies to sessions whose client holds its GET notification stream open (interactive agents) |
+| `REBOX_SESSION_ORPHAN_TIMEOUT` | `300` | the same, for a session with **no** open GET stream (`claude -p` that exited, a dead client), so its REA JVM does not linger; `0` = use the idle timeout for all |
+| `REBOX_SESSION_EVICT_MIN_IDLE` | `120` | at `REBOX_MAX_SESSIONS`, a new `initialize` evicts the longest-idle session with nothing in flight if it has been idle at least this long (its work is saved first; its client re-initializes on 404); 503 only when none qualifies |
+| `REBOX_PROGRESS_KEEPALIVE_INTERVAL` | `30` | seconds of silence after which a request carrying a `progressToken` gets a synthetic `notifications/progress`, so a client's no-progress abort does not kill a long import; `0` = off |
+| `REBOX_GHIDRA_IDLE_TIMEOUT` | `300` | seconds with no session before the ghidra-mcp server is saved and stopped; `0` = never stop (also for clients that ignore `tools/list_changed`, docs/CLIENTS.md) |
+| `REBOX_EVIDENCE_RETENTION_DAYS` | `30` | REA evidence bundles older than this are deleted at start and daily; `0` = keep. Bundles with no records and no unknowns are deleted right after export |
 | `REBOX_INIT_TIMEOUT` | `120` | seconds a child may take to start and initialize at session open |
 | `REBOX_MAX_BODY_BYTES` | `16777216` | largest accepted POST body (413 above); a session also accepts at most 64 concurrent requests |
 | `REBOX_CHILD_GRACE` | `5` | seconds between SIGTERM and SIGKILL when closing a session |
-| `REBOX_HEADLESS_START_TIMEOUT` | `300` | seconds the headless server may take to answer |
+| `REBOX_HEADLESS_START_TIMEOUT` | `300` | seconds the headless server may take to answer; `/healthz` is 503 once a start takes longer |
 | `REBOX_CONFIG` | `/etc/rebox/aggregator.toml` | the children of each session |
 | `RE_WORKDIR` | `/work` | bind-mount point; must equal the path the harness uses. `GHIDRA_MCP_FILE_ROOT` is forced to it, so ghidra-mcp imports only from here. |
 | `REBOX_STATE_DIR` | `$RE_WORKDIR/re-box-state` | everything worth keeping that the services write: Ghidra project, settings, caches, REA evidence (docs/PERSISTENCE.md). Empty means the default. Must be writable by the service user; no path element may start with `.` |
@@ -33,7 +40,7 @@ Design: `aggregator/README.md`; why: `docs/DECISIONS.md`.
 | `REBOX_AUTOSAVE_INTERVAL` | `300` | seconds between saves of changed ghidra-mcp programs, and between evidence exports of REA sessions with new calls; `0` disables both periodic saves (shutdown and session-end saves stay) |
 | `REBOX_AUTOSAVE_TIMEOUT` | `20` | seconds a REA evidence export may take at session end before the session is closed anyway |
 | `PUID` / `PGID` | `1000` | owner of files written to `RE_WORKDIR`; only applied when the container starts as root (below) |
-| `JAVA_OPTS` | `-Xmx4g -XX:+UseG1GC` | headless server JVM |
+| `JAVA_OPTS` | `-Xmx4g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30` | headless server JVM; the G1 flags return heap to the OS after a burst (REA's own JVMs reject JVM option overrides and keep the defaults) |
 | `GHIDRA_HEADLESS_MAXMEM` | `1536m` | heap of each REA Ghidra JVM (REA's own variable; upstream default 2G) |
 | `REA_JADX_HEAP_MIB` | `2048` | heap of REA's JADX JVM for Android work |
 | `GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS` | `1`, forced | every program-scoped ghidra-mcp call must name its program; the project is shared |
@@ -74,7 +81,8 @@ macOS-only features.
 
 - Mount the work directory at the **same absolute path** inside and out and set `RE_WORKDIR` to
   it: `-v /home/you/re:/home/you/re -e RE_WORKDIR=/home/you/re`. Paths from the harness then
-  work unchanged. Nothing derives from `/work` except the default.
+  work unchanged. Nothing derives from `/work` except the default. On Windows use the Git Bash
+  form, `/c/Users/you/re` on both sides (README, "Windows").
 - State (Ghidra project, settings, caches, REA evidence) goes to `REBOX_STATE_DIR`, by default
   inside the work dir; mount a separate one the same way. Layout, save points and what survives a
   stop, kill or OOM kill: docs/PERSISTENCE.md. Only one container may use a state dir at a time
@@ -109,25 +117,39 @@ limit ≥ (JAVA_OPTS -Xmx + 1 GiB)                                headless serve
 ```
 
 Defaults: (4 + 1) + 4 × (1.5 + 1) + 1 = 16 GiB, the compose example's limit. A REA session with
-no Ghidra call yet costs about 0.2 GiB. To fit less memory lower `REBOX_MAX_SESSIONS` first; to
+no Ghidra call yet costs about 0.2 GiB; the headless server idles at about 130 MB RSS (measured)
+and is gone entirely `REBOX_GHIDRA_IDLE_TIMEOUT` after the last session.
+
+**Laptop profile** (Docker Desktop / WSL2, 8 GB for the VM): `REBOX_MAX_SESSIONS=2`,
+`JAVA_OPTS="-Xmx3g -XX:+UseG1GC"` (+ the G1 flags above), `GHIDRA_HEADLESS_MAXMEM=1g`, container
+limit 6g: (3 + 1) + 2 × (1 + 1) + 1 = 9 GiB worst case, less in practice because the headless
+server and the REA JVMs are rarely at their ceilings together. Docker Desktop's VM limit (Settings,
+Resources, or `.wslconfig` `memory=`) must be at least the container limit. To fit less memory lower `REBOX_MAX_SESSIONS` first; to
 analyse very large binaries raise `GHIDRA_HEADLESS_MAXMEM` and `JAVA_OPTS` and the limit with
 them. Measured on the test fixtures: see docs/BUILDING.md.
 
 ## Health, logs, shutdown
 
-- `HEALTHCHECK` runs `re-box-healthcheck` → `/healthz`, 200 only while the headless server answers
-  and its project is open (start period 5 min).
+- `HEALTHCHECK` runs `re-box-healthcheck` → `/healthz` (start period 30 s, the aggregator is up at
+  once). 200 with `"ghidra": "stopped" | "starting" | "ready"`; 503 when the Ghidra server
+  `failed` (crashed, backing off), is shutting down, or has been starting longer than
+  `REBOX_HEADLESS_START_TIMEOUT`. An idle container is healthy with no JVM running.
 - Logs are JSON lines on stdout: `session_open`, `session_close` (with reason), `tool_call` (tool,
   duration, outcome, error code), `autosave` (REA evidence export or Ghidra save), `child_exit`,
-  `headless_log`, `child_stderr`, ... Tool arguments and results are never logged.
+  `headless_state`, `headless_log`, `child_stderr`, ... Tool arguments and results are never
+  logged. Readable with `docker logs re-box | jq -r 'select(.level != "info") | [.event, .error // .reason // ""] | @tsv'`
+  (drop the `select` for everything; `docker compose logs --no-log-prefix re-box` for compose).
 - SIGTERM: new sessions are refused, the headless server starts saving all programs, each session
   exports its REA evidence and is closed, then the headless server saves again and exits. Give it
   time: `stop_grace_period: 120s` / `docker run --stop-timeout 120`; Docker's default is 10 s
   (docs/PERSISTENCE.md). A crashed headless server is restarted with
-  backoff; sessions survive, `gh_` calls fail until it is back.
+  backoff while sessions exist; they survive, `gh_` calls fail until it is back.
 - Clients that exit without ending their session (Claude Code `-p` does not send DELETE) keep it,
-  and its REA Ghidra JVM, until `REBOX_SESSION_IDLE_TIMEOUT`; they also count against
-  `REBOX_MAX_SESSIONS`. For many short-lived clients lower the idle timeout (e.g. 300).
+  and its REA Ghidra JVM, until `REBOX_SESSION_ORPHAN_TIMEOUT` (300 s; sessions with an open GET
+  stream get the full `REBOX_SESSION_IDLE_TIMEOUT`); they count against `REBOX_MAX_SESSIONS` until
+  then, unless idle long enough to be evicted for a new session (`REBOX_SESSION_EVICT_MIN_IDLE`).
+- A session is closed as soon as one of its backends (`rea mcp`, the bridge) dies; the client's next
+  request gets 404 and re-initializes.
 
 ## Security
 
@@ -136,14 +158,29 @@ them. Measured on the test fixtures: see docs/BUILDING.md.
   a tool call's response stream can stay silent for minutes.
 - **The container is the sandbox.** Several REA features execute the target (process capture,
   gdb, browser scenarios). Run re-box on an egress-restricted network and treat what it analyses
-  as hostile. Defaults: non-root, all capabilities dropped (compose.yaml adds back only what the
+  as hostile (compose.yaml has a commented `internal` network for this). Offline, what stops:
+  debug-symbol downloads (Ghidra's symbol servers; local symbol files still work) and anything a
+  target or tool fetches from the internet. Analysis of local files is unaffected. Defaults: non-root, all capabilities dropped (compose.yaml adds back only what the
   uid remap needs), `no-new-privileges`, headless server on loopback, scripts off, the file root
   guard on `RE_WORKDIR`, the token stripped from every child's environment.
 - Executed targets run as the same uid as the services, so they could reach the loopback headless
   server or read a mounted token file; the network policy above is what contains them. The
   supervisor marks itself non-dumpable so its own environment is not readable through `/proc`.
 
-## Upgrades
+## Upgrading a running deployment
+
+```sh
+docker compose stop                                   # stop_grace_period 120s: saves Ghidra, exports REA evidence
+cp -a "$RE_WORKDIR/re-box-state" "$RE_WORKDIR/re-box-state.bak"   # or your REBOX_STATE_DIR; stopped, so consistent
+docker compose pull && docker compose up -d
+docker create --name rebox-skill ghcr.io/lhns/re-box:latest \
+  && docker cp rebox-skill:/opt/rebox/skills/. ~/.claude/skills/ && docker rm rebox-skill   # REA's skill, re-extracted
+```
+
+Open sessions end with the stop; clients re-initialize on their next request. `mkdir` the work dir
+before the first `compose up`, or Docker creates it as root.
+
+## Upgrades (building)
 
 All pins are in `versions.env` (plus the lockfiles it names). After changing a version run
 `python3 scripts/check-pins.py --update`, then `docker build --target test .`. Renovate does the

@@ -34,9 +34,11 @@ docker run -d --name re-box --stop-timeout 120 --memory 16g \
 deleted with the agent session takes the Ghidra project with it; for long projects use a stable
 directory and give the agent read access to it.
 
-"Same path" needs a Linux host (or a path inside the Docker Desktop / WSL2 VM): a Windows or
-macOS host path cannot exist under the same name in a Linux container. Ghidra's project locks on
-Docker Desktop's host-directory mounts are untested; prefer a named volume or a WSL2 path there.
+"Same path" works on Linux and macOS: `/Users/you/re` is a valid Linux path too (Docker Desktop
+shares `/Users` with its VM), so `-v /Users/you/re:/Users/you/re` is fine. Only native Windows
+paths (`C:\...`) cannot exist in a Linux container; use the Git Bash form `/c/Users/you/re` on both
+sides of `-v` (README, "Windows"). Ghidra's project locks on Docker Desktop's or remote-docker's
+host-directory mounts are untested; prefer a named volume or a WSL2 path there.
 
 ## What is in it
 
@@ -48,7 +50,14 @@ Docker Desktop's host-directory mounts are untested; prefer a named volume or a 
 | `home/ghidra_scripts/` | user Ghidra scripts (only with `GHIDRA_MCP_ALLOW_SCRIPTS=1`) | scripts an agent wrote | small |
 | `home/.config`, `home/.local`, `home/.cache` | other tools' user state when run directly: rizin, gdb/pwndbg history and config, adb keys (`.android/`), Chrome profile, NSS db | device pairings, histories | small |
 | `cache/` (`XDG_CACHE_HOME`) | Ghidra's cache (`rebox-ghidramcp/`: `fscache2`, `packed-db-cache`, `debuginfo-cache` with downloaded debug symbols), pwndbg, fontconfig, Chrome | faster opens, no repeated symbol downloads. **Safe to delete** while the container is stopped | 100s of MB, grows with symbol downloads |
-| `rea/evidence/<session>.json` | REA evidence bundles, one per MCP session: every Evidence record and unknown the session produced, written by the aggregator ("When things are saved") | REA's in-session analysis is discarded when its session ends; this is what is left. Restore with `rea_import_evidence_bundle {"path": ...}` | KBs to tens of MB per session; delete old ones by hand |
+| `rea/evidence/<session>.json` | REA evidence bundles, one per MCP session: every Evidence record and unknown the session produced, written by the aggregator ("When things are saved") | REA's in-session analysis is discarded when its session ends; this is what is left. Restore with `rea_import_evidence_bundle {"path": ...}` | KBs to tens of MB per session; pruned automatically (below) |
+| `.gitignore` | `*`, written once at start | the default state dir sits inside the work dir, which is often a git repo | bytes |
+
+**Pruning.** An export with no records and no unknowns is deleted right after it is written
+(nothing to restore). Bundles not modified for `REBOX_EVIDENCE_RETENTION_DAYS` (default 30; `0`
+keeps everything) are deleted at start and daily. Bundles are only data for REA's evidence views
+(no renames are re-applied), so age-based pruning loses little; annotations that must last belong
+in the `gh_` project.
 
 Suggested places for an agent's own REA exports (not created automatically): `rea/exports/` for
 `rea_export_evidence_bundle`, `rea/snapshots/` for `rea_close_binary {"snapshot_path": ...}`.
@@ -73,6 +82,8 @@ The work dir holds only the targets and what tools or agents write there explici
   evicted from ghidra-mcp's open-program cache;
 - every `REBOX_AUTOSAVE_INTERVAL` seconds (default 300; `0` disables): the supervisor saves every
   changed program (after waiting for running auto-analysis, as ghidra-mcp's save does);
+- idle stop: when no session has existed for `REBOX_GHIDRA_IDLE_TIMEOUT` seconds the supervisor
+  saves, then sends `exit_ghidra` (the next session starts a fresh JVM that reopens the project);
 - shutdown: on SIGTERM the supervisor starts a save at once (waiting up to 30 s for it), then sends
   `exit_ghidra`, which saves again and stops the JVM; the JVM's shutdown hook saves too if it gets a bare SIGTERM.
 
@@ -80,8 +91,9 @@ The work dir holds only the targets and what tools or agents write there explici
 `export_evidence_bundle` to `rea/evidence/<session>.json` (overwritten each time, written
 atomically) when:
 
-- the session ends: DELETE from the client, idle timeout (`REBOX_SESSION_IDLE_TIMEOUT`), or
-  container shutdown; bounded by `REBOX_AUTOSAVE_TIMEOUT` (20 s);
+- the session ends: DELETE from the client, idle or orphan timeout
+  (`REBOX_SESSION_IDLE_TIMEOUT`, `REBOX_SESSION_ORPHAN_TIMEOUT`), eviction at the session cap, a
+  dead backend, or container shutdown; bounded by `REBOX_AUTOSAVE_TIMEOUT` (20 s);
 - every `REBOX_AUTOSAVE_INTERVAL` seconds while the session has made REA calls since the last
   export and has none running.
 
@@ -92,7 +104,7 @@ Sessions without REA calls write nothing. `<session>` is the session tag the con
 
 | event | ghidra-mcp project | REA in-session analysis | REA evidence | settings, caches |
 | --- | --- | --- | --- | --- |
-| client ends the session, or it idles out | kept (the headless server and its project outlive sessions) | gone, by design | exported at session end | kept |
+| client ends the session, or it idles out | kept (saved, and the headless server stops `REBOX_GHIDRA_IDLE_TIMEOUT` after the last session: it saves again and exits) | gone, by design | exported at session end | kept |
 | `docker stop` with enough grace (`stop_grace_period: 120s`, `--stop-timeout 120`) | **everything saved** | gone | **exported** for every session | kept |
 | `docker stop` with Docker's default 10 s | saved: the save starts at SIGTERM (measured: done 1.6 s after it, 145 ms for the save). Only a save that must first wait for long-running auto-analysis can be cut off (the shutdown waits at most 30 s for it before `exit_ghidra`); then edits since the last save are lost | gone | exported unless a session's export is still running at the SIGKILL | kept |
 | `docker kill`, host crash, power loss | edits since the last save (at most one `REBOX_AUTOSAVE_INTERVAL`) lost; imported programs survive (an import saves). The project opens at its last save; the stale lock is taken over on the next start (verified) | gone | changes since the last periodic export lost | kept |
