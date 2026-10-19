@@ -309,7 +309,12 @@ Rejected:
 - ghidra-mcp runs with scripts enabled; `run_ghidra_script`/`run_script_inline` (and
   `delete_project`, which would drop the shared project) are denied in the aggregator (8089
   stays loopback-only), and import scripts must lie in
-  `/opt/rebox/rea-attach/ghidra_scripts`. The supervisor copies the host script into
+  `/opt/rebox/rea-attach/import_scripts`: REA's six pre- and post-scripts, nothing else. Any client
+  can name those through `ghidra_import_file`, so the bridge lives elsewhere: run as an import
+  post-script with a descriptor a client wrote, it would load the jars the descriptor names
+  (`analysis_extensions`). patch-rea.py classifies every file REA ships and fails on a new one.
+  `GHIDRA_MCP_IMPORT_SCRIPT_ROOTS` set but naming no directory refuses all import scripts. The
+  supervisor copies the host script into
   `$REBOX_STATE_DIR/home/ghidra_scripts` at every JVM start: `/run_ghidra_script` runs scripts
   only from there. That script must stay free of compile-time references to
   `ghidra.app.plugin.core.osgi` and ghidra-mcp's classes (bnd then imports the osgi package
@@ -324,8 +329,9 @@ Rejected:
   work (measured; ghidra-mcp's `WriteTx` even joins an open transaction on purpose). With patch
   0001 every ghidra_ write holds the server's write lock; the bridge holds the same lock around its
   edits and starts one only when no other transaction is open (it releases the lock while it
-  waits, at most 60 s). Transactions that take no lock remain (auto-analysis, script runs): a
-  REA edit waits for them rather than joining.
+  waits, at most 60 s, then fails the request as `program_busy` rather than joining). Import
+  post-scripts and analysis options run under the lock too. Transactions that take no lock remain
+  (auto-analysis, script runs): a REA edit waits for them rather than joining.
 - REA assumes nobody else edits its program: the bridge keeps name, procedure and string
   inventories until its own edit invalidates them, and REA's node side replays analysis results
   per target ("snapshot" cache policy). Attached, both would hide edits made by ghidra_ tools or other
@@ -341,8 +347,16 @@ Rejected:
 - `import_file` checked for an existing program, then imported: two sessions opening the same
   new file at once both imported it, and Ghidra saved the second as `<name>.0`, a separate
   program (found in CI: one session's rename landed in the copy). Patch 0002 serializes imports
-  per destination; the helpers also lock per program and fail loudly if an import comes back
-  under another name.
+  per destination, through analysis and post-scripts (a `wait=false` import's worker holds it
+  until done); the helpers also lock per program and fail loudly if an import comes back under
+  another name.
+- An import that fails after its program was saved (analysis options, auto-analysis, a
+  post-script) removes the program again, and one that never finished (the JVM died during
+  analysis) carries a pending flag in its program info: the next import of that destination
+  deletes it and starts over instead of reusing a program that never got its analysis or REA's
+  scripts.
+- REA's analysis extensions (`REA_GHIDRA_NATIVEAOT_JAR`) are refused: the bridge would load their
+  jars into the shared JVM.
 - Memory: REA's programs live in the shared heap (`JAVA_OPTS`, `-Xmx8g`); a session costs about
   0.5 GiB outside it (rea node, helper, bridge).
 - PSP targets need Ghidra's Allegrex extension, which the image does not ship (unchanged).
@@ -351,8 +365,9 @@ Rejected:
   pinned REA, and recompiles the patched bridge; a mismatch fails the build and is re-fitted by
   hand (typically a moved anchor or a new option). Per ghidra-mcp release: the patches must
   apply (or are dropped once upstream; the build says which).
-- Kill switch for debugging: remove `REBOX_REA_ATTACH_HELPER` from the rea child's `[child.env]`
-  and REA runs its own JVMs again (heap `GHIDRA_HEADLESS_MAXMEM`, REA's default 2G).
+- Kill switch for debugging: `REBOX_REA_ATTACH = "0"` in the rea child's `[child.env]` and REA
+  runs its own JVMs again (heap `GHIDRA_HEADLESS_MAXMEM`, REA's default 2G). Without it, a missing
+  `REBOX_REA_ATTACH_HELPER` makes REA's Ghidra provider fail rather than quietly start a JVM.
 - Upstream: an opt-in external launcher command in REA would remove the REA patch
   (`deps/rea-attach/UPSTREAM.md`); the ghidra-mcp patches are prepared as issues and PRs.
 

@@ -122,4 +122,19 @@ def test_rea_sees_a_gh_rename_without_reopening(session):
                                      "new_name": "GhRenamedCompute", "strict_mode": "off"}))
     assert "GhRenamedCompute" in ok(s.tool("rea_list_procedures", {})).text()
     ok(s.tool("rea_analyze_function", {"procedure": "GhRenamedCompute"}))
+    # A REA edit does not wait out a transaction of its own bridge (it would stall 60 s).
+    edit = ok(s.tool("rea_annotate_native_function", {"procedure": "GhRenamedCompute", "comment": "timed"}))
+    assert edit.seconds < 30, edit.seconds
     ok(s.tool("rea_close_binary", {}))
+
+
+def test_clients_cannot_run_reas_bridge_as_an_import_script(session):
+    """The bridge loads jars its descriptor names: it must not be reachable through an import."""
+    target = copy_fixture("hello_debug", "attach/import_script_probe")
+    s = session()
+    for path in ("/opt/rebox/rea-attach/ghidra_scripts/ReaGhidraBridge.java",
+                 "/opt/rebox/rea-attach/ReboxReaAttach.java"):
+        call = s.tool("ghidra_import_file", {"file_path": target, "project_folder": "/probe",
+                                             "post_scripts": [{"path": path, "args": [target]}]})
+        assert call.result.get("isError") or "error" in call.text(), call.text()[:500]
+        assert "IMPORT_SCRIPT_ROOTS" in call.text(), call.text()[:500]

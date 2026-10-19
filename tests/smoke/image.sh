@@ -52,7 +52,11 @@ done
 grep -q '^REBOX_REA_ATTACH_HELPER = "/opt/rebox/rea-attach/helper.mjs"' /etc/rebox/aggregator.toml \
   || fail "REA attach helper not configured"
 [ -f /opt/rebox/rea-attach/helper.mjs ] && [ -f /opt/rebox/rea-attach/ReboxReaAttach.java ] \
-  && [ -f /opt/rebox/rea-attach/ghidra_scripts/ReaGhidraBridge.java ] || fail "REA attach files missing"
+  && [ -f /opt/rebox/rea-attach/ghidra_scripts/ReaGhidraBridge.java ] \
+  && [ -f /opt/rebox/rea-attach/import_scripts/ReaGhidraNoReturnFix.java ] || fail "REA attach files missing"
+# Import scripts are runnable by any client (ghidra_import_file): never the bridge or its jar loader.
+! ls /opt/rebox/rea-attach/import_scripts | grep -q 'ReaGhidraBridge\|ReaGhidraExtensions' \
+  || fail "REA's bridge is reachable as an import script"
 grep -q 're-box: attach to ghidra-mcp' /opt/rea/node_modules/rea-agents/dist/mcp/main-*.js || fail "REA not patched"
 grep -q 'GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS = "1"' /etc/rebox/aggregator.toml || fail "program selectors not forced"
 

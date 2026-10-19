@@ -56,6 +56,24 @@ class AnchorLogic(unittest.TestCase):
             with self.assertRaises(pr.PatchError):
                 pr.patch_bridge_text(broken)
 
+    def test_attach_fails_closed(self):
+        """Without the helper REA must not quietly start its own JVM; REBOX_REA_ATTACH=0 is explicit."""
+        probe = pr.JS_TAIL + """
+const target = { path: "/work/x" };
+try {
+    const r = __reboxAttach(target);
+    console.log(typeof r.javaLaunch === "function" ? "helper" : "own-jvm");
+} catch (e) { console.log("error"); }
+"""
+
+        def run(env):
+            return subprocess.run(["node", "-e", probe], env={"PATH": os.environ["PATH"], **env},
+                                  capture_output=True, text=True, check=True).stdout.strip()
+
+        self.assertEqual(run({"REBOX_REA_ATTACH_HELPER": "/h.mjs"}), "helper")
+        self.assertEqual(run({}), "error")
+        self.assertEqual(run({"REBOX_REA_ATTACH": "0"}), "own-jvm")
+
     def test_refuses_to_patch_twice(self):
         with self.assertRaises(pr.PatchError):
             pr.patch_js_text(pr.patch_js_text(JS))
@@ -73,12 +91,13 @@ class PinnedRea(unittest.TestCase):
         for part in ("dist/mcp", "bridge/ghidra"):
             shutil.copytree(Path(PACKAGE) / part, self.pkg / part)
         self.out = self.tmp / "ghidra_scripts"
+        self.imports = self.tmp / "import_scripts"
 
     def tearDown(self):
         shutil.rmtree(self.tmp)
 
     def test_patch_applies(self):
-        chunk, bridge = pr.patch(self.pkg, self.out)
+        chunk, bridge, imports = pr.patch(self.pkg, self.out, self.imports)
         js = chunk.read_text()
         self.assertEqual(js.count(pr.MARK), 1)
         self.assertEqual(js.count(pr.JS_SITE_NEW), 1)
@@ -87,15 +106,32 @@ class PinnedRea(unittest.TestCase):
         java = bridge.read_text()
         self.assertNotIn("sessionDefaultAddressSpace", java)
         self.assertEqual(java.count(pr.DISPATCH_NEW), 1)
-        self.assertEqual(sorted(p.name for p in self.out.glob("*.java")),
-                         sorted(p.name for p in (Path(PACKAGE) / "bridge/ghidra").glob("*.java")))
-        # REA's own bridge stays as shipped, for the fallback JVM.
+        self.assertEqual({p.name for p in self.out.glob("*.java")}, pr.BRIDGE_FILES)
+        self.assertEqual({p.name for p in imports.glob("*.java")}, pr.IMPORT_SCRIPTS)
+        # Import scripts are runnable by any client: never the bridge or its extension loader.
+        self.assertFalse({pr.BRIDGE, "ReaGhidraExtensions.java"} & {p.name for p in imports.glob("*")})
+        # REA's own bridge stays as shipped.
         self.assertNotIn("re-box", (self.pkg / "bridge/ghidra" / pr.BRIDGE).read_text())
 
     def test_patch_twice_fails(self):
-        pr.patch(self.pkg, self.out)
+        pr.patch(self.pkg, self.out, self.imports)
         with self.assertRaises(pr.PatchError):
-            pr.patch(self.pkg, self.tmp / "again")
+            pr.patch(self.pkg, self.tmp / "again", self.tmp / "again-imports")
+
+    def test_unclassified_or_headless_scripts_fail(self):
+        (self.pkg / "bridge/ghidra/ReaGhidraNew.java").write_text("class ReaGhidraNew {}")
+        with self.assertRaises(pr.PatchError):
+            pr.patch(self.pkg, self.out, self.imports)
+        (self.pkg / "bridge/ghidra/ReaGhidraNew.java").unlink()
+        seeds = self.pkg / "bridge/ghidra/ReaGhidraApplySeeds.java"
+        seeds.write_text(seeds.read_text() + "\n// isImporting() would need a HeadlessAnalyzer\n")
+        with self.assertRaises(pr.PatchError):
+            pr.patch(self.pkg, self.out, self.imports)
+
+    def test_launcher_constructed_elsewhere_fails(self):
+        (self.pkg / "dist/mcp/other-x.js").write_text("const c = { " + pr.JS_SITE + " } });")
+        with self.assertRaises(pr.PatchError):
+            pr.patch(self.pkg, self.out, self.imports)
 
 
 if __name__ == "__main__":

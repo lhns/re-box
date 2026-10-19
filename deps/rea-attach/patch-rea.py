@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """Patch an installed rea-agents package so its Ghidra sessions attach to the ghidra-mcp JVM.
 
-    patch-rea.py <rea-agents package root> <output dir for the attach bridge scripts>
+    patch-rea.py <rea-agents package root> <bridge output dir> <import scripts output dir>
 
 1. JS: the `rea mcp` bundle chunk (dist/mcp/main-*.js) that constructs GhidraHeadlessLauncher
-   gets a `javaLaunch` override: with REBOX_REA_ATTACH_HELPER set, REA spawns that helper instead
-   of its own JVM, with the AnalyzeHeadless arguments it would have used (the helper maps them to
-   ghidra-mcp's import, or refuses one it does not know). REA's descriptor, process ownership,
-   handshake and cleanup are unchanged.
-2. Java: bridge/ghidra/*.java is copied to the output dir (the helper's import runs REA's pre-
-   and post-scripts from there) and ReaGhidraBridge.java patched to run without a
-   HeadlessAnalyzer, keep its default address space per session thread, and hold ghidra-mcp's
-   write lock around its edits. REA's own copy stays as shipped.
+   gets a `javaLaunch` override: REA spawns REBOX_REA_ATTACH_HELPER instead of its own JVM, with
+   the AnalyzeHeadless arguments it would have used (the helper maps them to ghidra-mcp's import,
+   or refuses one it does not know). REA's descriptor, process ownership, handshake and cleanup
+   are unchanged. Without the helper REA fails rather than quietly starting its own JVM;
+   REBOX_REA_ATTACH=0 is the explicit way back to that, for debugging.
+2. Java, from bridge/ghidra/: the bridge (patched to run without a HeadlessAnalyzer, keep its
+   default address space per session thread, and edit under ghidra-mcp's write lock) and its
+   extensions go to the bridge dir, which only the attach host script loads; REA's pre- and
+   post-scripts go to the import scripts dir, the only one ghidra-mcp's import may run scripts
+   from. Keeping the bridge out of it matters: run as an import post-script with a descriptor a
+   client wrote, it would load the client's jars. REA's own copy stays as shipped.
 
 Every anchor must match exactly as expected, or this fails: REA ships often, and a silent
 mismatch would ship a REA that quietly runs its own JVM again or a bridge that doesn't compile.
@@ -29,7 +32,7 @@ MARK = "/* re-box: attach to ghidra-mcp */"
 JS_SITE = "launcher: new GhidraHeadlessLauncher({"
 JS_SITE_NEW = JS_SITE + " ...__reboxAttach(target),"
 JS_CACHE = ': { cachePolicy: "snapshot" },'
-JS_CACHE_NEW = ': { cachePolicy: process.env.REBOX_REA_ATTACH_HELPER ? "live" : "snapshot" },'
+JS_CACHE_NEW = ': { cachePolicy: process.env.REBOX_REA_ATTACH === "0" ? "snapshot" : "live" },'
 # What the appended function relies on; checked so a rename fails the build.
 JS_NEEDS = (
     "this.options.javaLaunch ?? ghidraJavaLaunch",
@@ -37,8 +40,11 @@ JS_NEEDS = (
 )
 JS_TAIL = MARK + r"""
 function __reboxAttach(target) {
+	if (process.env.REBOX_REA_ATTACH === "0") return {};  // debugging: REA's own JVM
 	const helper = process.env.REBOX_REA_ATTACH_HELPER;
-	if (!helper || process.platform === "win32" || typeof target?.path !== "string") return {};
+	if (!helper || process.platform === "win32" || typeof target?.path !== "string")
+		throw new Error("re-box: REA's Ghidra provider must attach to the shared ghidra-mcp JVM, but " +
+			"REBOX_REA_ATTACH_HELPER is not set or the target has no path (REBOX_REA_ATTACH=0 for REA's own JVM)");
 	return { javaLaunch: async (options) => {
 		const environment = { ...options.environment };
 		for (const [key, value] of Object.entries(process.env))
@@ -79,16 +85,20 @@ CLASS_DECL_NEW = CLASS_DECL + """
         if (!REBOX_EDITS.contains(request.method)) return handleRequest(request, descriptor);
         // Writers that don't take the lock (analysis, scripts): wait for their transaction to end
         // rather than join it, but never while holding the lock, which every ghidra_ call needs.
+        // Never join one either: an abort on either side would discard the other's work.
         long deadline = System.nanoTime() + 60_000_000_000L;
         while (true) {
             if (reboxWriteLock != null) reboxWriteLock.lockInterruptibly();
             try {
-                if (currentProgram.getCurrentTransactionInfo() == null || System.nanoTime() > deadline)
+                if (currentProgram.getCurrentTransactionInfo() == null)
                     return handleRequest(request, descriptor);
             }
             finally {
                 if (reboxWriteLock != null) reboxWriteLock.unlock();
             }
+            if (System.nanoTime() > deadline)
+                throw new RequestFailure("program_busy",
+                    "The shared Ghidra program stayed busy (analysis or a script) for 60 s; retry later");
             Thread.sleep(20);
         }
     }
@@ -105,7 +115,13 @@ HEADLESS_ONLY = re.compile(
 # Members reboxHandle uses; a rename upstream must fail here, not at bridge compile time.
 BRIDGE_NEEDS = ("private JsonElement handleRequest(Request request, SessionDescriptor descriptor)",
                 "private record Request(int id, String method,", "import java.util.Set;", "import com.google.gson.JsonElement;",
-                "private void invalidateAnalysisCaches()")
+                "private void invalidateAnalysisCaches()", "RequestFailure(String code, String message)")
+# Where each of REA's bridge/ghidra/*.java goes. A file REA adds fails the patch until someone
+# decides: anything in IMPORT_SCRIPTS can be run by any client through ghidra_import_file.
+BRIDGE_FILES = {"ReaGhidraBridge.java", "ReaGhidraExtensions.java", "ReaGhidraBundleActivator.java"}
+IMPORT_SCRIPTS = {"ReaGhidraPrepareRaw.java", "ReaGhidraPrepareCom.java", "ReaGhidraApplySeeds.java",
+                  "ReaGhidraAnalysisOptions.java", "ReaGhidraNoReturnFix.java", "ReaGhidraMipsSoftFloat.java",
+                  "ReaGhidraBundleActivator.java"}
 
 
 class PatchError(Exception):
@@ -152,28 +168,38 @@ def patch_bridge_text(text: str) -> str:
     return text
 
 
-def patch(pkg: Path, out: Path) -> list[Path]:
-    """Patch the package in place and write the attach bridge scripts to `out`."""
-    chunks = [Path(p) for p in glob.glob(str(pkg / "dist/mcp/main-*.js"))]
+def patch(pkg: Path, bridge_out: Path, import_out: Path) -> list[Path]:
+    """Patch the package in place; write the bridge to `bridge_out`, the import scripts to `import_out`."""
+    # `rea mcp` must construct its launcher in exactly one place, the chunk patched here.
+    chunks = [Path(p) for p in glob.glob(str(pkg / "dist/mcp/*.js"))]
     sites = [c for c in chunks if JS_SITE in c.read_text(encoding="utf-8")]
-    if len(sites) != 1:
-        raise PatchError(f"expected 1 dist/mcp/main-*.js chunk constructing GhidraHeadlessLauncher, found {len(sites)}")
+    if len(sites) != 1 or not sites[0].name.startswith("main-"):
+        raise PatchError(f"expected GhidraHeadlessLauncher constructed only in dist/mcp/main-*.js, found {sites}")
     src = pkg / "bridge/ghidra"
+    shipped = {f.name for f in src.glob("*.java")}
+    if shipped - BRIDGE_FILES - IMPORT_SCRIPTS or (BRIDGE_FILES | IMPORT_SCRIPTS) - shipped:
+        raise PatchError(f"bridge/ghidra changed: new {sorted(shipped - BRIDGE_FILES - IMPORT_SCRIPTS)}, "
+                         f"gone {sorted((BRIDGE_FILES | IMPORT_SCRIPTS) - shipped)}; classify them in patch-rea.py")
+    # Every one of them runs in the shared JVM, where there is no HeadlessAnalyzer.
+    for name in sorted(shipped):
+        if HEADLESS_ONLY.search((src / name).read_text(encoding="utf-8")):
+            raise PatchError(f"{name}: uses HeadlessAnalyzer-only API that attach mode does not provide")
     bridge = patch_bridge_text((src / BRIDGE).read_text(encoding="utf-8"))
     chunk = patch_js_text(sites[0].read_text(encoding="utf-8"), str(sites[0]))
-    out.mkdir(parents=True, exist_ok=True)
-    for f in src.glob("*.java"):
-        shutil.copy2(f, out / f.name)
-    (out / BRIDGE).write_text(bridge, encoding="utf-8")
+    for out, names in ((bridge_out, BRIDGE_FILES), (import_out, IMPORT_SCRIPTS)):
+        out.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            shutil.copy2(src / name, out / name)
+    (bridge_out / BRIDGE).write_text(bridge, encoding="utf-8")
     sites[0].write_text(chunk, encoding="utf-8")
-    return [sites[0], out / BRIDGE]
+    return [sites[0], bridge_out / BRIDGE, import_out]
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
-        sys.exit("usage: patch-rea.py <rea-agents root> <bridge output dir>")
+    if len(sys.argv) != 4:
+        sys.exit("usage: patch-rea.py <rea-agents root> <bridge output dir> <import scripts output dir>")
     try:
-        for path in patch(Path(sys.argv[1]), Path(sys.argv[2])):
+        for path in patch(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3])):
             print(f"patch-rea: patched {path}")
     except PatchError as e:
         sys.exit(f"patch-rea: {e} -- REA changed; re-check the attach patch (deps/rea-attach)")

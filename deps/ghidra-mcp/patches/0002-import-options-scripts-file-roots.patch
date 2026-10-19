@@ -5,6 +5,16 @@ re-box patch 0002: /import_file takes AnalyzeHeadless's import options; one writ
   gated by GHIDRA_MCP_ALLOW_SCRIPTS and GHIDRA_MCP_IMPORT_SCRIPT_ROOTS), if_exists
   (reuse only the same bytes / error / unique), wait (false: analysis and post-scripts in the
   background, reported by /analysis_status). ProgramLoader replaces AutoImporter.
+- Imports are serialized per destination through analysis and post-scripts (a wait=false worker
+  holds the destination until done). A failed import (options, analysis, post-script) removes its
+  program; one that never finished (a "ghidra-mcp import pending" flag in its program info) is
+  deleted and redone by the next import instead of being reused. Reuse compares the stored
+  executable hash without opening the program. Input errors are Refusals. Post-scripts and
+  analysis options run under the write lock. Name lookups also match the project file name
+  (program_name names the file; Ghidra keeps the source's name inside).
+- GHIDRA_MCP_IMPORT_SCRIPT_ROOTS set but naming no directory refuses all import scripts.
+- /run_ghidra_script executes the instance it loaded (runScript(name) loaded it again, outside
+  the script-load lock).
 - GHIDRA_MCP_FILE_ROOT takes several roots (path-separator list).
 - Script loads are serialized JVM-wide (ImportScripts.LOAD_LOCK): Ghidra's bundle-build file lock
   throws OverlappingFileLockException for two threads of one JVM.
@@ -17,7 +27,7 @@ Upstream versions, split by concern and against dev: deps/ghidra-mcp/upstream/.
 diff -ruN a/src/main/java/com/xebyte/core/ImportRequest.java b/src/main/java/com/xebyte/core/ImportRequest.java
 --- a/src/main/java/com/xebyte/core/ImportRequest.java
 +++ b/src/main/java/com/xebyte/core/ImportRequest.java
-@@ -0,0 +1,80 @@
+@@ -0,0 +1,88 @@
 +package com.xebyte.core;
 +
 +import java.io.File;
@@ -58,6 +68,9 @@ diff -ruN a/src/main/java/com/xebyte/core/ImportRequest.java b/src/main/java/com
 +
 +    public ImportRequest {
 +        folder = folder == null || folder.isBlank() ? "/" : folder.trim();
++        while (folder.length() > 1 && folder.endsWith("/")) {
++            folder = folder.substring(0, folder.length() - 1);
++        }
 +        programName = programName == null || programName.isBlank() ? file.getName() : programName.trim();
 +        loader = loader == null ? "" : loader.trim();
 +        loaderArgs = loaderArgs == null ? Map.of() : normalizeLoaderArgs(loaderArgs);
@@ -65,12 +78,17 @@ diff -ruN a/src/main/java/com/xebyte/core/ImportRequest.java b/src/main/java/com
 +        compilerSpecId = compilerSpecId == null ? "" : compilerSpecId.trim();
 +        ifExists = ifExists == null || ifExists.isBlank() ? REUSE : ifExists.trim().toLowerCase(Locale.ROOT);
 +        if (!List.of(REUSE, ERROR, UNIQUE).contains(ifExists)) {
-+            throw new IllegalArgumentException("if_exists must be reuse, error or unique");
++            throw new Refusal("if_exists must be reuse, error or unique");
 +        }
 +        if (programName.contains("/")) {
-+            throw new IllegalArgumentException("program_name must not contain '/'");
++            throw new Refusal("program_name must not contain '/'");
 +        }
 +        preScripts = preScripts == null ? List.of() : List.copyOf(preScripts);
++    }
++
++    /** The project path the import writes to, the key that serializes imports. */
++    public String destination() {
++        return (folder.equals("/") ? "" : folder) + "/" + programName;
 +    }
 +
 +    /** The original four-argument import: auto-detect, or BinaryLoader with a language. */
@@ -84,7 +102,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ImportRequest.java b/src/main/java/com
 +        for (Map.Entry<String, ?> e : raw.entrySet()) {
 +            String key = e.getKey() == null ? "" : e.getKey().trim();
 +            if (key.isEmpty()) {
-+                throw new IllegalArgumentException("loader_args has an empty name");
++                throw new Refusal("loader_args has an empty name");
 +            }
 +            out.put(key.startsWith("-loader-") ? key : "-loader-" + key,
 +                e.getValue() == null ? "" : String.valueOf(e.getValue()));
@@ -145,7 +163,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ImportScripts.java b/src/main/java/com
 +    public record Call(String path, List<String> args) {
 +        public Call {
 +            if (path == null || path.isBlank()) {
-+                throw new IllegalArgumentException("a script needs a path");
++                throw new Refusal("a script needs a path");
 +            }
 +            args = args == null ? List.of() : List.copyOf(args);
 +        }
@@ -162,12 +180,12 @@ diff -ruN a/src/main/java/com/xebyte/core/ImportScripts.java b/src/main/java/com
 +            return List.of();
 +        }
 +        if (!(raw instanceof List<?> list)) {
-+            throw new IllegalArgumentException(what + " must be a list of {path, args}");
++            throw new Refusal(what + " must be a list of {path, args}");
 +        }
 +        List<Call> calls = new ArrayList<>();
 +        for (Object item : list) {
 +            if (!(item instanceof Map<?, ?> map) || map.get("path") == null) {
-+                throw new IllegalArgumentException(what + " entries need a path");
++                throw new Refusal(what + " entries need a path");
 +            }
 +            Object rawArgs = map.get("args");
 +            List<String> args = new ArrayList<>();
@@ -190,16 +208,16 @@ diff -ruN a/src/main/java/com/xebyte/core/ImportScripts.java b/src/main/java/com
 +        }
 +        SecurityConfig security = SecurityConfig.getInstance();
 +        if (!security.areScriptsAllowed()) {
-+            throw new IOException("Import scripts need GHIDRA_MCP_ALLOW_SCRIPTS=1");
++            throw new Refusal("Import scripts need GHIDRA_MCP_ALLOW_SCRIPTS=1");
 +        }
 +        for (Call call : calls) {
 +            File file = new File(call.path());
 +            if (!file.isAbsolute() || !file.isFile() || !file.getName().endsWith(".java")) {
-+                throw new IOException("Import script is not an absolute path to a .java file: " + call.path());
++                throw new Refusal("Import script is not an absolute path to a .java file: " + call.path());
 +            }
 +            Path canonical = file.getCanonicalFile().toPath();
 +            if (!security.isImportScriptAllowed(canonical)) {
-+                throw new IOException("Import script outside GHIDRA_MCP_IMPORT_SCRIPT_ROOTS: " + call.path());
++                throw new Refusal("Import script outside GHIDRA_MCP_IMPORT_SCRIPT_ROOTS: " + call.path());
 +            }
 +        }
 +    }
@@ -286,49 +304,36 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
  
          if (filePath == null || filePath.trim().isEmpty()) {
              return Response.err("file_path is required");
-@@ -2018,10 +2030,39 @@
+@@ -2018,10 +2030,25 @@
              return Response.err("This server cannot import programs");
          }
  
-+        StringWriter scriptLog = new StringWriter();
-+        PrintWriter scriptOut = new PrintWriter(scriptLog, true);
-         try {
+-        try {
 -            ProjectProgramProvider.Imported imported =
 -                provider.importFile(file, projectFolder, languageId, compilerSpecId);
++        StringWriter scriptLog = new StringWriter();
++        PrintWriter scriptOut = new PrintWriter(scriptLog, true);
++        String destination = null;
++        boolean handedOff = false;
++        try {
 +            List<ImportScripts.Call> pre = ImportScripts.parse(preScripts, "pre_scripts");
 +            List<ImportScripts.Call> post = ImportScripts.parse(postScripts, "post_scripts");
 +            ImportScripts.check(post);
 +            ImportRequest request = new ImportRequest(file, projectFolder, programName, loader,
 +                loaderArgs, languageId, compilerSpecId, ifExists, pre);
-+            // One import per destination at a time, through analysis and post-scripts: the
-+            // existence check and the import are not atomic, and Ghidra saves a second import of
-+            // the same name as "<name>.0", a separate program. A waiting caller then reuses the
-+            // finished program.
-+            Object destination = IMPORT_LOCKS.computeIfAbsent(
-+                request.folder() + "\0" + request.programName(), k -> new Object());
-+            synchronized (destination) {
-+                return importLocked(provider, request, scriptOut, scriptLog, autoAnalyze,
-+                    analysisOptions, post, waitForAnalysis);
-+            }
-+        } catch (Exception e) {
-+            return importFailure(e, scriptLog);
-+        }
-+    }
-+
-+    private static final Map<String, Object> IMPORT_LOCKS = new java.util.concurrent.ConcurrentHashMap<>();
-+
-+    private Response importLocked(ProjectProgramProvider provider, ImportRequest request,
-+            PrintWriter scriptOut, StringWriter scriptLog, boolean autoAnalyze,
-+            Map<String, String> analysisOptions, List<ImportScripts.Call> post,
-+            boolean waitForAnalysis) throws Exception {
-+        {
++            // One import per destination at a time, through analysis and post-scripts (a
++            // wait=false import hands the lock to its worker): the existence check and the
++            // import are not atomic, and Ghidra saves a second import of the same name as
++            // "<name>.0", a separate program. A waiting caller then reuses the finished program.
++            destination = request.destination();
++            IMPORTS_IN_PROGRESS.acquire(destination);
 +            ProjectProgramProvider.Imported imported = provider.importFile(request, scriptOut);
              Program program = imported.program();
 +            String path = ProjectProgramProvider.keyFor(program);
  
              // NOTE: do NOT call markProgramNotToAskToAnalyze here, ahead of the
              // branches below. It mutates the program DB, and AutoAnalysisManager's
-@@ -2038,46 +2079,137 @@
+@@ -2038,46 +2065,192 @@
              // analyzed:true and no error anywhere. Both branches below already set
              // this flag themselves, inside their own transaction, so the call here
              // was pure redundant risk with no benefit.
@@ -342,7 +347,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
 -            } else {
 +            Map<String, Object> out = new LinkedHashMap<>();
 +            out.put("success", true);
-+            out.put("name", program.getName());
++            out.put("name", program.getDomainFile() != null ? program.getDomainFile().getName() : program.getName());
 +            out.put("path", path);
 +            out.put("language", program.getLanguageID().getIdAsString());
 +            out.put("reused_existing", imported.reusedExisting());
@@ -359,6 +364,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
 +            } else {
 +                IMPORT_FAILURES.remove(path);
 +                PENDING_IMPORTS.add(path);
++                String held = destination;
 +                Thread worker = new Thread(() -> {
 +                    try {
 +                        finishImport(provider, program, autoAnalyze, analysisOptions, post, scriptOut);
@@ -367,10 +373,12 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
 +                        Msg.error(this, "Background import of " + path + " failed", e);
 +                    } finally {
 +                        PENDING_IMPORTS.remove(path);
++                        IMPORTS_IN_PROGRESS.release(held);
 +                    }
 +                }, "import-" + program.getName());
 +                worker.setDaemon(true);
 +                worker.start();
++                handedOff = true;
 +                out.put("analyzing", true);
              }
 -
@@ -392,15 +400,40 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
                  out.put("codebrowser", shown);
              }
              return Response.ok(out);
--        } catch (Exception e) {
+         } catch (Exception e) {
 -            String msg = e.getMessage();
 -            if (msg == null || msg.isEmpty()) {
 -                msg = e.getClass().getName();
 -                if (e.getCause() != null) {
 -                    msg += ": " + (e.getCause().getMessage() != null
 -                        ? e.getCause().getMessage() : e.getCause().getClass().getName());
+-                }
++            return importFailure(e, scriptLog);
++        } finally {
++            if (destination != null && !handedOff) {
++                IMPORTS_IN_PROGRESS.release(destination);
++            }
 +        }
 +    }
++
++    /** Destinations (folder + name) an import is working on; a second import of one waits. */
++    private static final class Destinations {
++        private final Set<String> busy = new HashSet<>();
++
++        synchronized void acquire(String key) throws InterruptedException {
++            while (busy.contains(key)) {
++                wait();
+             }
++            busy.add(key);
++        }
++
++        synchronized void release(String key) {
++            busy.remove(key);
++            notifyAll();
++        }
++    }
++
++    private static final Destinations IMPORTS_IN_PROGRESS = new Destinations();
 +
 +    private Response importFailure(Exception e, StringWriter scriptLog) {
 +        String msg = e.getMessage();
@@ -411,7 +444,10 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
 +                    ? e.getCause().getMessage() : e.getCause().getClass().getName());
 +            }
 +        }
-+        Msg.error(this, "Import failed", e);
++        if (!Refusal.is(e)) {
+             Msg.error(this, "Import failed", e);
+-            return Response.err("Import failed: " + msg);
+         }
 +        String scripts = scriptLog.toString();
 +        return Response.err("Import failed: " + msg
 +            + (scripts.isEmpty() ? "" : "\n--- script output ---\n" + boundTail(scripts, MAX_BUILD_OUTPUT_CHARS)));
@@ -426,43 +462,57 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
 +
 +    /** Programs a wait=false import is still finishing, and why one failed (see /analysis_status). */
 +    private static final Set<String> PENDING_IMPORTS = java.util.concurrent.ConcurrentHashMap.newKeySet();
-+    private static final Map<String, String> IMPORT_FAILURES = new java.util.concurrent.ConcurrentHashMap<>();
++    private static final int MAX_IMPORT_FAILURES = 64;
++    private static final Map<String, String> IMPORT_FAILURES = Collections.synchronizedMap(
++        new LinkedHashMap<String, String>() {
++            @Override
++            protected boolean removeEldestEntry(Map.Entry<String, String> eldest) {
++                return size() > MAX_IMPORT_FAILURES;
++            }
++        });
 +
 +    /**
-+     * After a fresh import: analysis options, auto-analysis, post-scripts, save. A failed
-+     * post-script removes the import, so a retry starts from the file again.
++     * After a fresh import: analysis options, auto-analysis, post-scripts, save. Any failure
++     * removes the import, so a retry starts from the file again instead of reusing a program
++     * that never got its analysis or scripts.
 +     */
 +    private boolean finishImport(ProjectProgramProvider provider, Program program, boolean autoAnalyze,
 +            Map<String, String> analysisOptions, List<ImportScripts.Call> post, PrintWriter scriptOut)
 +            throws Exception {
-+        if (analysisOptions != null && !analysisOptions.isEmpty()) {
-+            applyAnalysisOptions(program, analysisOptions);
-+        }
-+        boolean analyzed = false;
-+        if (autoAnalyze) {
-+            analyzed = runAutoAnalysisAndPersistFlags(program, true);
-+        } else {
-+            suppressAnalysisPrompt(program);
-+        }
-+        if (!post.isEmpty()) {
-+            try {
++        try {
++            if (analysisOptions != null && !analysisOptions.isEmpty()) {
++                applyAnalysisOptions(program, analysisOptions);
++            }
++            boolean analyzed = false;
++            if (autoAnalyze) {
++                analyzed = runAutoAnalysisAndPersistFlags(program, true);
++                if (!analyzed) {
++                    throw new IOException("auto-analysis failed (see the server log)");
++                }
++            } else {
++                suppressAnalysisPrompt(program);
++            }
++            // The program is in the project now, visible to every client: like every other
++            // write, the scripts run under the server's write lock.
++            threadingStrategy.executeWrite(program, "Import post-scripts", () -> {
 +                ImportScripts.run(post, program, programProvider.getProject(), scriptOut,
 +                    new ConsoleTaskMonitor());
-+                persistProgram(program, "Import post-scripts");
-+            } catch (Exception e) {
-+                ghidra.framework.model.DomainFile df = program.getDomainFile();
-+                provider.closeProgramByPath(df.getPathname());
-+                try {
-+                    df.delete();
-+                } catch (Exception deleteFailure) {
-+                    e.addSuppressed(deleteFailure);
-                 }
-+                throw new IOException("post-script failed, import removed: " + e, e);
-             }
--            Msg.error(this, "Import failed", e);
--            return Response.err("Import failed: " + msg);
-         }
-+        return analyzed;
++                ProjectProgramProvider.markImportFinished(program);
++                return null;
++            });
++            persistProgram(program, "Import finished");
++            return analyzed;
++        } catch (Exception e) {
++            try {
++                provider.discardImport(program);
++            } catch (Exception deleteFailure) {
++                e.addSuppressed(deleteFailure);
++            }
++            if (Refusal.is(e)) {
++                throw new Refusal(e.getMessage() + "; import removed");
++            }
++            throw new IOException("import removed: " + e, e);
++        }
 +    }
 +
 +    /** Set analyzer options by name; an unknown name or an unsupported option type is refused. */
@@ -474,17 +524,26 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
 +                String name = e.getKey();
 +                String value = String.valueOf(e.getValue());
 +                if (!options.contains(name)) {
-+                    throw new IllegalArgumentException("Unknown analysis option: " + name);
++                    throw new Refusal("Unknown analysis option: " + name);
 +                }
 +                OptionType type = options.getType(name);
-+                switch (type) {
-+                    case BOOLEAN_TYPE -> options.setBoolean(name, Boolean.parseBoolean(value));
-+                    case INT_TYPE -> options.setInt(name, Integer.parseInt(value));
-+                    case LONG_TYPE -> options.setLong(name, Long.parseLong(value));
-+                    case DOUBLE_TYPE -> options.setDouble(name, Double.parseDouble(value));
-+                    case STRING_TYPE -> options.setString(name, value);
-+                    default -> throw new IllegalArgumentException(
-+                        "Analysis option " + name + " has type " + type + ", which import cannot set");
++                try {
++                    switch (type) {
++                        case BOOLEAN_TYPE -> {
++                            if (!value.equalsIgnoreCase("true") && !value.equalsIgnoreCase("false")) {
++                                throw new NumberFormatException(value);
++                            }
++                            options.setBoolean(name, Boolean.parseBoolean(value));
++                        }
++                        case INT_TYPE -> options.setInt(name, Integer.parseInt(value));
++                        case LONG_TYPE -> options.setLong(name, Long.parseLong(value));
++                        case DOUBLE_TYPE -> options.setDouble(name, Double.parseDouble(value));
++                        case STRING_TYPE -> options.setString(name, value);
++                        default -> throw new Refusal(
++                            "Analysis option " + name + " has type " + type + ", which import cannot set");
++                    }
++                } catch (NumberFormatException bad) {
++                    throw new Refusal("Analysis option " + name + " (" + type + ") cannot be " + value);
 +                }
 +            }
 +            return null;
@@ -492,7 +551,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
      }
  
      @McpTool(path = "/get_project_info",
-@@ -2164,6 +2296,10 @@
+@@ -2164,6 +2337,10 @@
                  return Response.err(e.getMessage());
              }
              if (only == null) {
@@ -503,7 +562,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
                  return Response.err("Program not open: " + programName);
              }
          }
-@@ -2184,13 +2320,19 @@
+@@ -2184,13 +2361,19 @@
              } catch (Exception e) {
                  // May not have an analysis manager in headless mode
              }
@@ -525,7 +584,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
          }
  
          if (programName != null && !programName.isEmpty() && results.isEmpty()) {
-@@ -2363,7 +2505,11 @@
+@@ -2363,7 +2546,11 @@
                      scriptWriterHolder[0] = scriptWriter;
                      scriptPrintWriterHolder[0] = scriptPrintWriter;
  
@@ -538,7 +597,7 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
                      if (script == null) {
                          resultMsg.append("ERROR: Failed to create script instance\n");
                          return;
-@@ -2398,8 +2544,10 @@
+@@ -2398,8 +2585,10 @@
  
                      resultMsg.append("\n--- SCRIPT OUTPUT ---\n");
  
@@ -554,7 +613,33 @@ diff -ruN a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/j
 diff -ruN a/src/main/java/com/xebyte/core/ProjectProgramProvider.java b/src/main/java/com/xebyte/core/ProjectProgramProvider.java
 --- a/src/main/java/com/xebyte/core/ProjectProgramProvider.java
 +++ b/src/main/java/com/xebyte/core/ProjectProgramProvider.java
-@@ -482,40 +482,89 @@
+@@ -191,7 +191,14 @@
+             }
+             return null;
+         }
+-        return unique(programs, s, p -> p.getName().equalsIgnoreCase(s));
++        return unique(programs, s, p -> p.getName().equalsIgnoreCase(s) || fileName(p).equalsIgnoreCase(s));
++    }
++
++    /** The project file's name, which import_file's program_name sets; Ghidra keeps the source's name inside. */
++    private static String fileName(Program p) {
++        DomainFile df = p.getDomainFile();
++        String name = df != null ? df.getName() : null;
++        return name != null ? name : "";
+     }
+ 
+     private static Program matchSubstring(Collection<Program> programs, String wanted) {
+@@ -199,7 +206,8 @@
+             return null;
+         }
+         String lower = wanted.trim().toLowerCase();
+-        return unique(programs, wanted.trim(), p -> p.getName().toLowerCase().contains(lower));
++        return unique(programs, wanted.trim(),
++            p -> p.getName().toLowerCase().contains(lower) || fileName(p).toLowerCase().contains(lower));
+     }
+ 
+     private static Program unique(Collection<Program> programs, String wanted,
+@@ -482,40 +490,109 @@
       */
      public Imported importFile(java.io.File file, String folder, String languageId,
              String compilerSpecId) throws Exception {
@@ -583,36 +668,37 @@ diff -ruN a/src/main/java/com/xebyte/core/ProjectProgramProvider.java b/src/main
              ghidra.framework.model.DomainFolder target = project.getProjectData().getFolder(dest);
 -            DomainFile existing = target != null ? target.getFile(file.getName()) : null;
 +            DomainFile existing = target != null ? target.getFile(name) : null;
++            if (existing != null && importUnfinished(existing)) {
++                // An import that died before it finished (the JVM went away during analysis):
++                // its program never got its analysis or post-scripts. The caller holds the
++                // destination's import lock, so nobody is still working on it.
++                closeProgramByPath(existing.getPathname());
++                existing.delete();
++                existing = null;
++            }
              if (existing != null) {
 -                return new Imported(openDomainFile(existing), true);
 +                switch (request.ifExists()) {
 +                    case ImportRequest.ERROR ->
-+                        throw new java.io.IOException(dest + " already holds " + name);
++                        throw new Refusal(dest + " already holds " + name);
 +                    case ImportRequest.UNIQUE -> name = uniqueName(target, name);
 +                    default -> {
-+                        Program program = openDomainFile(existing);
-+                        String held = program.getExecutableSHA256();
++                        // The hash the loader stored; a program without one is reused as before.
++                        Object held = existing.getMetadata().get(EXECUTABLE_SHA256);
 +                        String sha = held == null ? null : sha256(file);
-+                        if (held != null && !held.equalsIgnoreCase(sha)) {
-+                            throw new java.io.IOException(existing.getPathname()
++                        if (held != null && !String.valueOf(held).equalsIgnoreCase(sha)) {
++                            throw new Refusal(existing.getPathname()
 +                                + " was imported from other bytes (sha256 " + held + ", this file "
 +                                + sha + "); import with if_exists=unique, another program_name or "
 +                                + "another project_folder");
 +                        }
-+                        return new Imported(program, true);
++                        return new Imported(openDomainFile(existing), true);
 +                    }
 +                }
              }
          }
  
          ghidra.app.util.importer.MessageLog log = new ghidra.app.util.importer.MessageLog();
--        ghidra.app.util.opinion.LoadResults<Program> results;
--        if (language.isEmpty()) {
--            results = ghidra.app.util.importer.AutoImporter.importByUsingBestGuess(
--                file, project, dest, consumer, log, monitor);
--            if (results == null) {
--                throw new java.io.IOException("no loader recognised " + file.getName()
--                    + "; for a raw binary pass a language (e.g. 'ARM:LE:32:Cortex'). " + log);
 +        ghidra.app.util.importer.ProgramLoader.Builder builder = ghidra.app.util.importer.ProgramLoader.builder()
 +            .source(file)
 +            .project(project)
@@ -626,13 +712,26 @@ diff -ruN a/src/main/java/com/xebyte/core/ProjectProgramProvider.java b/src/main
 +            loader = "BinaryLoader";  // the original meaning of a bare language: a raw binary
 +        }
 +        if (!loader.isEmpty() && !loader.equalsIgnoreCase("auto")) {
-+            builder.loaders(loader);
++            try {
++                builder.loaders(loader);
++            } catch (ghidra.util.exception.InvalidInputException e) {
++                throw new Refusal(e.getMessage());
++            }
 +        }
 +        if (!language.isEmpty()) {
 +            builder.language(language);
 +            if (!compiler.isEmpty()) {
 +                builder.compiler(compiler);
-             }
++            }
++        }
+         ghidra.app.util.opinion.LoadResults<Program> results;
+-        if (language.isEmpty()) {
+-            results = ghidra.app.util.importer.AutoImporter.importByUsingBestGuess(
+-                file, project, dest, consumer, log, monitor);
+-            if (results == null) {
+-                throw new java.io.IOException("no loader recognised " + file.getName()
+-                    + "; for a raw binary pass a language (e.g. 'ARM:LE:32:Cortex'). " + log);
+-            }
 -        } else {
 -            ghidra.program.model.lang.Language lang = ghidra.program.util.DefaultLanguageService
 -                .getLanguageService().getLanguage(new ghidra.program.model.lang.LanguageID(language));
@@ -643,34 +742,64 @@ diff -ruN a/src/main/java/com/xebyte/core/ProjectProgramProvider.java b/src/main
 -                .importAsBinary(file, project, dest, lang, spec, consumer, log, monitor);
 -            if (loaded == null) {
 -                throw new java.io.IOException("import as " + language + " produced nothing. " + log);
-+        }
-+        ghidra.app.util.opinion.LoadResults<Program> results;
 +        try {
 +            results = builder.load();
++        } catch (ghidra.program.model.lang.LanguageNotFoundException e) {
++            throw new Refusal("cannot import " + file.getName() + ": " + e.getMessage());
 +        } catch (ghidra.app.util.opinion.LoadException e) {
-+            throw new java.io.IOException((loader.isEmpty()
++            throw new Refusal((loader.isEmpty()
 +                ? "no loader recognised " + file.getName() + "; for a raw binary pass a language (e.g. 'ARM:LE:32:Cortex')"
-+                : "loader " + loader + " could not load " + file.getName()) + ": " + e.getMessage() + " " + log, e);
++                : "loader " + loader + " could not load " + file.getName()) + ": " + e.getMessage() + " " + log);
 +        }
 +
-+        if (!request.preScripts().isEmpty()) {
-+            Program loaded = results.getPrimaryDomainObject(consumer);
++        Program loaded = results.getPrimaryDomainObject(consumer);
++        try {
++            ImportScripts.run(request.preScripts(), loaded, project, scriptOut, monitor);
++            // Cleared once analysis and post-scripts are done (markImportFinished); a program
++            // saved with it set is an import that died half way.
++            int tx = loaded.startTransaction("Import pending");
 +            try {
-+                ImportScripts.run(request.preScripts(), loaded, project, scriptOut, monitor);
-+            } catch (Exception e) {
-+                results.close();
-+                throw new java.io.IOException("pre-script failed, nothing imported: " + e, e);
++                loaded.getOptions(Program.PROGRAM_INFO).setBoolean(IMPORT_PENDING, true);
 +            } finally {
-+                loaded.release(consumer);
++                loaded.endTransaction(tx, true);
              }
 -            results = new ghidra.app.util.opinion.LoadResults<>(loaded);
++        } catch (Exception e) {
++            results.close();
++            throw new java.io.IOException("pre-script failed, nothing imported: " + e, e);
++        } finally {
++            loaded.release(consumer);
          }
  
          if (project == null) {
-@@ -536,6 +585,29 @@
+@@ -536,6 +613,53 @@
          return new Imported(openDomainFile(saved), false);
      }
  
++    /** Program-info key of the executable's SHA-256 (ProgramDB's own constant is private). */
++    static final String EXECUTABLE_SHA256 = "Executable SHA256";
++    /** Program-info flag set while an import has not finished; see {@link #markImportFinished}. */
++    public static final String IMPORT_PENDING = "ghidra-mcp import pending";
++
++    static boolean importUnfinished(DomainFile df) {
++        return "true".equalsIgnoreCase(String.valueOf(df.getMetadata().get(IMPORT_PENDING)));
++    }
++
++    /** Clear the pending flag once an import's analysis and post-scripts are done. */
++    public static void markImportFinished(Program program) {
++        ghidra.framework.options.Options info = program.getOptions(Program.PROGRAM_INFO);
++        if (info.contains(IMPORT_PENDING)) {
++            info.removeOption(IMPORT_PENDING);
++        }
++    }
++
++    /** Remove an import that failed after it was saved, so a retry starts from the file again. */
++    public void discardImport(Program program) throws java.io.IOException {
++        DomainFile df = program.getDomainFile();
++        closeProgramByPath(df.getPathname());
++        df.delete();
++    }
++
 +    /** {@code name}, or the first of {@code name.1}, {@code name.2}, ... the folder does not hold. */
 +    public static String uniqueName(ghidra.framework.model.DomainFolder folder, String name) {
 +        for (int i = 1; ; i++) {
@@ -730,17 +859,18 @@ diff -ruN a/src/main/java/com/xebyte/core/SecurityConfig.java b/src/main/java/co
   * </ul>
   *
   * Also enforces a bind-hardening rule at headless startup:
-@@ -79,7 +86,8 @@
+@@ -79,7 +86,9 @@
      private final byte[] tokenBytes;     // null if auth disabled
      private final boolean scriptsAllowed;
      private final String fileRoot;       // null if disabled
 -    private final Path fileRootCanonical;
 +    private final List<Path> fileRootsCanonical; // empty if disabled
-+    private final List<Path> importScriptRoots;  // empty: no restriction
++    private final List<Path> importScriptRoots;
++    private final boolean importScriptRootsSet;  // the variable is set: only its roots, none if it names none
      private final String projectFolderScope; // null = no enforcement (default)
  
      private SecurityConfig() {
-@@ -95,19 +103,9 @@
+@@ -95,19 +104,11 @@
                      || rawScripts.equalsIgnoreCase("yes"));
  
          String rawRoot = System.getenv("GHIDRA_MCP_FILE_ROOT");
@@ -759,11 +889,13 @@ diff -ruN a/src/main/java/com/xebyte/core/SecurityConfig.java b/src/main/java/co
 -        }
 +        this.fileRootsCanonical = canonicalRoots(rawRoot);
 +        this.fileRoot = fileRootsCanonical.isEmpty() ? null : rawRoot;
-+        this.importScriptRoots = canonicalRoots(System.getenv("GHIDRA_MCP_IMPORT_SCRIPT_ROOTS"));
++        String rawScriptRoots = System.getenv("GHIDRA_MCP_IMPORT_SCRIPT_ROOTS");
++        this.importScriptRootsSet = rawScriptRoots != null;
++        this.importScriptRoots = canonicalRoots(rawScriptRoots);
  
          // Project-folder scope guard. When set, FrontEndProgramProvider
          // refuses to return Programs whose DomainFile path falls outside
-@@ -230,16 +228,44 @@
+@@ -230,16 +231,49 @@
       */
      public Path resolveWithinFileRoot(String userPath) {
          if (userPath == null) return null;
@@ -777,7 +909,12 @@ diff -ruN a/src/main/java/com/xebyte/core/SecurityConfig.java b/src/main/java/co
 +
 +    /** Whether an import script at {@code canonicalPath} may run (see GHIDRA_MCP_IMPORT_SCRIPT_ROOTS). */
 +    public boolean isImportScriptAllowed(Path canonicalPath) {
-+        return importScriptRoots.isEmpty() || underAny(canonicalPath, importScriptRoots);
++        return importScriptAllowed(canonicalPath, importScriptRootsSet, importScriptRoots);
++    }
++
++    /** Unset: any script. Set: only under its roots; set but naming none (" ", ":"): none. */
++    public static boolean importScriptAllowed(Path canonicalPath, boolean rootsSet, List<Path> roots) {
++        return !rootsSet || underAny(canonicalPath, roots);
 +    }
 +
 +    /** Canonical forms of a path-separator list; blank entries are skipped. */
@@ -841,83 +978,16 @@ diff -ruN a/src/main/java/com/xebyte/headless/DirectThreadingStrategy.java b/src
  
      @Override
      public <T> T executeRead(Callable<T> action) throws Exception {
-@@ -53,38 +67,38 @@
-         }
- 
-         globalLock.lock();
--        // The unlock has a finally of its own. It used to sit after tx.end and the event
--        // flush in one finally block, so an exception from ending the transaction skipped
--        // it: the lock stayed held by a pool thread that had already returned, and every
--        // later write on this server waited for it forever (found on a live headless
--        // instance: renames timing out while comments, saves and check-ins still worked).
-+        // The unlock has a finally of its own. It used to sit after tx.end and the event
-+        // flush in one finally block, so an exception from ending the transaction skipped
-+        // it: the lock stayed held by a pool thread that had already returned, and every
-+        // later write on this server waited for it forever (found on a live headless
-+        // instance: renames timing out while comments, saves and check-ins still worked).
-         try {
--            WriteTx tx = null;
--            boolean success = false;
--            try {
--                tx = WriteTx.begin(program, txName);
--                T result = action.call();
--                success = true;
--                return result;
--            } catch (Exception e) {
--                if (!com.xebyte.core.Refusal.is(e)) {
--                    Msg.error(this, "Error during transaction '" + txName + "'", e);
--                }
--                throw e;
--            } finally {
--                if (tx != null) {
--                    tx.end(success);
--                }
--                // Force event processing in headless mode
--                if (success) {
--                    try {
--                        program.flushEvents();
--                    } catch (Exception e) {
--                        Msg.warn(this, "Error flushing events: " + e.getMessage());
--                    }
-+            WriteTx tx = null;
-+            boolean success = false;
-+            try {
-+                tx = WriteTx.begin(program, txName);
-+                T result = action.call();
-+                success = true;
-+                return result;
-+            } catch (Exception e) {
-+                if (!com.xebyte.core.Refusal.is(e)) {
-+                    Msg.error(this, "Error during transaction '" + txName + "'", e);
-+                }
-+                throw e;
-+            } finally {
-+                if (tx != null) {
-+                    tx.end(success);
-+                }
-+                // Force event processing in headless mode
-+                if (success) {
-+                    try {
-+                        program.flushEvents();
-+                    } catch (Exception e) {
-+                        Msg.warn(this, "Error flushing events: " + e.getMessage());
-+                    }
-                 }
-             }
--        } finally {
-+        } finally {
-             globalLock.unlock();
-         }
-     }
 diff -ruN a/src/test/java/com/xebyte/offline/ImportExtensionTest.java b/src/test/java/com/xebyte/offline/ImportExtensionTest.java
 --- a/src/test/java/com/xebyte/offline/ImportExtensionTest.java
 +++ b/src/test/java/com/xebyte/offline/ImportExtensionTest.java
-@@ -0,0 +1,82 @@
+@@ -0,0 +1,102 @@
 +package com.xebyte.offline;
 +
 +import com.xebyte.core.ImportRequest;
 +import com.xebyte.core.ImportScripts;
 +import com.xebyte.core.ProjectProgramProvider;
++import com.xebyte.core.Refusal;
 +import com.xebyte.core.SecurityConfig;
 +import com.xebyte.headless.DirectThreadingStrategy;
 +import ghidra.framework.model.DomainFile;
@@ -952,9 +1022,9 @@ diff -ruN a/src/test/java/com/xebyte/offline/ImportExtensionTest.java b/src/test
 +        assertEquals("fw.bin", r.programName());
 +        assertEquals(ImportRequest.REUSE, r.ifExists());
 +        assertTrue(r.preScripts().isEmpty());
-+        assertThrows(IllegalArgumentException.class, () ->
++        assertThrows(Refusal.class, () ->
 +            new ImportRequest(new File("/w/x"), "/", null, "", null, "", "", "replace", null));
-+        assertThrows(IllegalArgumentException.class, () ->
++        assertThrows(Refusal.class, () ->
 +            new ImportRequest(new File("/w/x"), "/", "a/b", "", null, "", "", null, null));
 +    }
 +
@@ -966,8 +1036,8 @@ diff -ruN a/src/test/java/com/xebyte/offline/ImportExtensionTest.java b/src/test
 +        assertEquals(2, calls.size());
 +        assertEquals(List.of("x86:LE:16:Real Mode", "1000:0100"), calls.get(0).args());
 +        assertEquals(List.of(), calls.get(1).args());
-+        assertThrows(IllegalArgumentException.class, () -> ImportScripts.parse("x", "pre_scripts"));
-+        assertThrows(IllegalArgumentException.class, () ->
++        assertThrows(Refusal.class, () -> ImportScripts.parse("x", "pre_scripts"));
++        assertThrows(Refusal.class, () ->
 +            ImportScripts.parse(List.of(Map.of("args", List.of())), "pre_scripts"));
 +    }
 +
@@ -979,6 +1049,25 @@ diff -ruN a/src/test/java/com/xebyte/offline/ImportExtensionTest.java b/src/test
 +        assertTrue(SecurityConfig.underAny(Path.of("/work/a"), roots));
 +        assertFalse(SecurityConfig.underAny(Path.of("/workshop/a"), roots));
 +        assertTrue(SecurityConfig.canonicalRoots(null).isEmpty());
++    }
++
++    @Test
++    public void importScriptRootsFailClosed() {
++        Path script = Path.of("/opt/scripts/Prepare.java");
++        assertTrue(SecurityConfig.importScriptAllowed(script, false, List.of()));  // unset: any
++        assertFalse(SecurityConfig.importScriptAllowed(script, true,
++            SecurityConfig.canonicalRoots(" " + File.pathSeparator)));  // set, names none: none
++        assertTrue(SecurityConfig.importScriptAllowed(script, true, SecurityConfig.canonicalRoots("/opt/scripts")));
++        assertFalse(SecurityConfig.importScriptAllowed(Path.of("/opt/other/Bridge.java"), true,
++            SecurityConfig.canonicalRoots("/opt/scripts")));
++    }
++
++    @Test
++    public void destinationsAreNormalized() {
++        File f = new File("/w/fw.bin");
++        assertEquals("/rea/x/fw.bin", new ImportRequest(f, "/rea/x/", null, null, null, null, null, null, null).destination());
++        assertEquals("/rea/x/fw.bin", new ImportRequest(f, "/rea/x", null, null, null, null, null, null, null).destination());
++        assertEquals("/fw.bin", new ImportRequest(f, "/", null, null, null, null, null, null, null).destination());
 +    }
 +
 +    @Test
@@ -1011,339 +1100,15 @@ Binary files a/python/bridge_mcp_ghidra/__pycache__/validation.cpython-312.pyc a
 diff -ruN a/python/bridge_mcp_ghidra/config.py b/python/bridge_mcp_ghidra/config.py
 --- a/python/bridge_mcp_ghidra/config.py
 +++ b/python/bridge_mcp_ghidra/config.py
-@@ -1,166 +1,166 @@
--"""Configuration constants, timeouts, environment, and logging for the bridge."""
--
--import logging
--import os
--
--from mcp.types import ToolAnnotations
--
--# ==========================================================================
--# MCP tool annotations
--# ==========================================================================
--# The hints clients act on. Claude Code derives read-only-ness solely from
--# readOnlyHint (absent ⇒ false) and, in plan mode, forces a permission prompt
--# for every MCP tool that is not read-only — a prompt no allow-rule can
--# suppress. It gates parallel execution on the same flag. Every statically
--# defined tool therefore declares one of these three.
--#
--# openWorldHint is left unset throughout: it would be false for nearly every
--# tool but not all of them, and no client gates behaviour on it.
--READ_ONLY_TOOL = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
--WRITE_TOOL = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
--DESTRUCTIVE_TOOL = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
--
--# ==========================================================================
--# Request timeouts
--# ==========================================================================
--
--# Per-endpoint timeout overrides for expensive operations
--ENDPOINT_TIMEOUTS = {
--    "rename_variables": 120,
--    "batch_rename_variables": 120,
--    "batch_set_comments": 120,
--    "analyze_function_complete": 120,
--    "batch_rename_function_components": 120,
--    "set_variables": 90,
--    "analyze_data_region": 90,
--    "create_label": 60,
--    "delete_label": 60,
--    "disassemble_bytes": 120,
--    "bulk_fuzzy_match": 180,
--    "find_similar_functions_fuzzy": 60,
+@@ -38,7 +38,7 @@
+     "disassemble_bytes": 120,
+     "bulk_fuzzy_match": 180,
+     "find_similar_functions_fuzzy": 60,
 -    "import_file": 300,
--    "run_ghidra_script": 1800,
--    "run_script_inline": 1800,
--    # Ghidra's default decompile cap is 60s. The bridge must outlive it so the
--    # plugin can return a structured timeout instead of writing into a closed
--    # socket after the client has already gone away.
--    "get_functions": 75,
--    "set_function_prototype": 45,
--    "rename_function": 45,
--    "consolidate_duplicate_types": 60,
--    "analyze_function_completeness": 120,
--    "apply_documentation": 90,
--    # get_timeout() keys on the LAST path segment, so "/debugger/launch"
--    # looks up "launch" here, not "debugger_launch" -- easy to miss when
--    # adding overrides for nested debugger/* routes.
--    "launch": 120,
--    "default": 30,
--}
--
--REQUEST_TIMEOUT_GRACE_SECONDS = 15
--# Long-running endpoints may legitimately ask Ghidra to spend 1800 seconds on
--# work (for example run_script_inline/run_ghidra_script or a user-raised
--# decompile timeout). Keep the transport alive slightly longer so the bridge can
--# receive and forward Ghidra's final status instead of closing first.
--MAX_REQUEST_TIMEOUT_SECONDS = 1815
--
--try:
--    MAX_CONCURRENT_GHIDRA_REQUESTS = max(1, int(os.getenv("GHIDRA_MCP_MAX_CONCURRENT_REQUESTS", "4")))
--except ValueError:
--    MAX_CONCURRENT_GHIDRA_REQUESTS = 4
--
--DEFAULT_TCP_URL = "http://127.0.0.1:8089"
--DEFAULT_TCP_PORT = 8089
--# When set, forwarded to the Ghidra server as `Authorization: Bearer <token>`.
--# Same env var the plugin/headless server enforces (v5.4.1+); unset = no header.
--AUTH_TOKEN = (os.getenv("GHIDRA_MCP_AUTH_TOKEN") or "").strip()
--# Bridge-side TCP port scan range. Mirrors the plugin's
--# TCP_PORT_FALLBACK_RANGE so a TCP-only multi-instance setup (e.g. Windows
--# 10 pre-1803 where AF_UNIX is unavailable) can still be discovered without
--# having to set GHIDRA_MCP_URL per instance. See issue #175 + Copilot review.
--TCP_PORT_SCAN_RANGE = 16
--
--# Debugger proxy target: an external dbgeng (WinDbg engine) debugger server,
--# not part of this repo. DEBUGGER_URL_EXPLICIT records whether the operator
--# actually set GHIDRA_DEBUGGER_URL: the 22 debugger proxy tools are off by
--# default and only register when it is set (or GHIDRA_DEBUGGER_TOOLS is truthy).
--# The fallback URL below is a default port, not evidence that a server exists.
--# A blank value counts as unset.
--_DEBUGGER_URL_ENV = (os.getenv("GHIDRA_DEBUGGER_URL") or "").strip()
--DEBUGGER_URL_EXPLICIT = bool(_DEBUGGER_URL_ENV)
--DEBUGGER_URL = _DEBUGGER_URL_ENV or "http://127.0.0.1:8099"
--
--# ==========================================================================
--# Logging
--# ==========================================================================
--
--LOG_LEVEL = os.getenv("GHIDRA_MCP_LOG_LEVEL", "INFO")
--logging.basicConfig(
--    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
--    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
--)
--logger = logging.getLogger("bridge_mcp_ghidra")
--
--# ==========================================================================
--# Tool-group / static-tool catalog constants
--# ==========================================================================
--
--MANAGEMENT_TOOL_NAMES = {
--    "list_instances",
--    "connect_instance",
--    "list_tool_groups",
--    "load_tool_group",
--    "unload_tool_group",
--    "check_tools",
--    "search_tools",
--    "import_file",
--}
--
--# WinDbg debugger proxy tools. They forward to an external dbgeng debugger
--# server (not part of this repo) and are OFF BY DEFAULT: registered only when
--# GHIDRA_DEBUGGER_URL is set or GHIDRA_DEBUGGER_TOOLS is truthy; see
--# debugger._debugger_enabled(). The names are always listed in
--# _ALL_STATIC_TOOL_NAMES (validated at import, counted by the catalog tests);
--# collision handling uses the ACTIVE set (STATIC_TOOL_NAMES): while the proxies
--# are off, Ghidra's own TraceRmi /debugger/status registers as debugger_status;
--# when they are on, the proxy holds that name and the TraceRmi tool registers as
--# debugger_status_2 (its raw name "debugger/status" is not an exact match, so
--# schema._normalize_tool_def_names allocates a suffix instead of skipping it).
--DEBUGGER_TOOL_NAMES = {
--    "debugger_attach",
--    "debugger_detach",
--    "debugger_status",
--    "debugger_modules",
--    "debugger_resolve_ordinal",
--    "debugger_set_breakpoint",
--    "debugger_remove_breakpoint",
--    "debugger_list_breakpoints",
--    "debugger_continue",
--    "debugger_step_into",
--    "debugger_step_over",
--    "debugger_registers",
--    "debugger_read_memory",
--    "debugger_stack_trace",
--    "debugger_read_args",
--    "debugger_trace_function",
--    "debugger_trace_stop",
--    "debugger_trace_log",
--    "debugger_trace_list",
--    "debugger_watch_memory",
--    "debugger_watch_stop",
--    "debugger_watch_log",
--}
--
--# Full structural set: every tool name the bridge may define. Used for
--# name validation and the catalog tests; collision detection uses STATIC_TOOL_NAMES.
--_ALL_STATIC_TOOL_NAMES = MANAGEMENT_TOOL_NAMES | DEBUGGER_TOOL_NAMES
--
--# Active set: static tools actually registered with this process. Debugger names
--# are added by bridge_mcp_ghidra.debugger only when the debugger proxy is
--# enabled (see debugger._debugger_enabled()). Used for runtime availability
--# reporting (check_tools etc.). Mutated in place (|=), never rebound, so modules
--# that imported this name earlier still see the update.
--STATIC_TOOL_NAMES = set(MANAGEMENT_TOOL_NAMES)
--
--# Core groups always loaded on connect (essential for basic RE workflow)
--CORE_GROUPS = {"listing", "function", "program"}
-+"""Configuration constants, timeouts, environment, and logging for the bridge."""
-+
-+import logging
-+import os
-+
-+from mcp.types import ToolAnnotations
-+
-+# ==========================================================================
-+# MCP tool annotations
-+# ==========================================================================
-+# The hints clients act on. Claude Code derives read-only-ness solely from
-+# readOnlyHint (absent ⇒ false) and, in plan mode, forces a permission prompt
-+# for every MCP tool that is not read-only — a prompt no allow-rule can
-+# suppress. It gates parallel execution on the same flag. Every statically
-+# defined tool therefore declares one of these three.
-+#
-+# openWorldHint is left unset throughout: it would be false for nearly every
-+# tool but not all of them, and no client gates behaviour on it.
-+READ_ONLY_TOOL = ToolAnnotations(readOnlyHint=True, destructiveHint=False)
-+WRITE_TOOL = ToolAnnotations(readOnlyHint=False, destructiveHint=False)
-+DESTRUCTIVE_TOOL = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
-+
-+# ==========================================================================
-+# Request timeouts
-+# ==========================================================================
-+
-+# Per-endpoint timeout overrides for expensive operations
-+ENDPOINT_TIMEOUTS = {
-+    "rename_variables": 120,
-+    "batch_rename_variables": 120,
-+    "batch_set_comments": 120,
-+    "analyze_function_complete": 120,
-+    "batch_rename_function_components": 120,
-+    "set_variables": 90,
-+    "analyze_data_region": 90,
-+    "create_label": 60,
-+    "delete_label": 60,
-+    "disassemble_bytes": 120,
-+    "bulk_fuzzy_match": 180,
-+    "find_similar_functions_fuzzy": 60,
 +    "import_file": 1800,  # waits for auto-analysis and the import's scripts
-+    "run_ghidra_script": 1800,
-+    "run_script_inline": 1800,
-+    # Ghidra's default decompile cap is 60s. The bridge must outlive it so the
-+    # plugin can return a structured timeout instead of writing into a closed
-+    # socket after the client has already gone away.
-+    "get_functions": 75,
-+    "set_function_prototype": 45,
-+    "rename_function": 45,
-+    "consolidate_duplicate_types": 60,
-+    "analyze_function_completeness": 120,
-+    "apply_documentation": 90,
-+    # get_timeout() keys on the LAST path segment, so "/debugger/launch"
-+    # looks up "launch" here, not "debugger_launch" -- easy to miss when
-+    # adding overrides for nested debugger/* routes.
-+    "launch": 120,
-+    "default": 30,
-+}
-+
-+REQUEST_TIMEOUT_GRACE_SECONDS = 15
-+# Long-running endpoints may legitimately ask Ghidra to spend 1800 seconds on
-+# work (for example run_script_inline/run_ghidra_script or a user-raised
-+# decompile timeout). Keep the transport alive slightly longer so the bridge can
-+# receive and forward Ghidra's final status instead of closing first.
-+MAX_REQUEST_TIMEOUT_SECONDS = 1815
-+
-+try:
-+    MAX_CONCURRENT_GHIDRA_REQUESTS = max(1, int(os.getenv("GHIDRA_MCP_MAX_CONCURRENT_REQUESTS", "4")))
-+except ValueError:
-+    MAX_CONCURRENT_GHIDRA_REQUESTS = 4
-+
-+DEFAULT_TCP_URL = "http://127.0.0.1:8089"
-+DEFAULT_TCP_PORT = 8089
-+# When set, forwarded to the Ghidra server as `Authorization: Bearer <token>`.
-+# Same env var the plugin/headless server enforces (v5.4.1+); unset = no header.
-+AUTH_TOKEN = (os.getenv("GHIDRA_MCP_AUTH_TOKEN") or "").strip()
-+# Bridge-side TCP port scan range. Mirrors the plugin's
-+# TCP_PORT_FALLBACK_RANGE so a TCP-only multi-instance setup (e.g. Windows
-+# 10 pre-1803 where AF_UNIX is unavailable) can still be discovered without
-+# having to set GHIDRA_MCP_URL per instance. See issue #175 + Copilot review.
-+TCP_PORT_SCAN_RANGE = 16
-+
-+# Debugger proxy target: an external dbgeng (WinDbg engine) debugger server,
-+# not part of this repo. DEBUGGER_URL_EXPLICIT records whether the operator
-+# actually set GHIDRA_DEBUGGER_URL: the 22 debugger proxy tools are off by
-+# default and only register when it is set (or GHIDRA_DEBUGGER_TOOLS is truthy).
-+# The fallback URL below is a default port, not evidence that a server exists.
-+# A blank value counts as unset.
-+_DEBUGGER_URL_ENV = (os.getenv("GHIDRA_DEBUGGER_URL") or "").strip()
-+DEBUGGER_URL_EXPLICIT = bool(_DEBUGGER_URL_ENV)
-+DEBUGGER_URL = _DEBUGGER_URL_ENV or "http://127.0.0.1:8099"
-+
-+# ==========================================================================
-+# Logging
-+# ==========================================================================
-+
-+LOG_LEVEL = os.getenv("GHIDRA_MCP_LOG_LEVEL", "INFO")
-+logging.basicConfig(
-+    level=getattr(logging, LOG_LEVEL.upper(), logging.INFO),
-+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-+)
-+logger = logging.getLogger("bridge_mcp_ghidra")
-+
-+# ==========================================================================
-+# Tool-group / static-tool catalog constants
-+# ==========================================================================
-+
-+MANAGEMENT_TOOL_NAMES = {
-+    "list_instances",
-+    "connect_instance",
-+    "list_tool_groups",
-+    "load_tool_group",
-+    "unload_tool_group",
-+    "check_tools",
-+    "search_tools",
-+    "import_file",
-+}
-+
-+# WinDbg debugger proxy tools. They forward to an external dbgeng debugger
-+# server (not part of this repo) and are OFF BY DEFAULT: registered only when
-+# GHIDRA_DEBUGGER_URL is set or GHIDRA_DEBUGGER_TOOLS is truthy; see
-+# debugger._debugger_enabled(). The names are always listed in
-+# _ALL_STATIC_TOOL_NAMES (validated at import, counted by the catalog tests);
-+# collision handling uses the ACTIVE set (STATIC_TOOL_NAMES): while the proxies
-+# are off, Ghidra's own TraceRmi /debugger/status registers as debugger_status;
-+# when they are on, the proxy holds that name and the TraceRmi tool registers as
-+# debugger_status_2 (its raw name "debugger/status" is not an exact match, so
-+# schema._normalize_tool_def_names allocates a suffix instead of skipping it).
-+DEBUGGER_TOOL_NAMES = {
-+    "debugger_attach",
-+    "debugger_detach",
-+    "debugger_status",
-+    "debugger_modules",
-+    "debugger_resolve_ordinal",
-+    "debugger_set_breakpoint",
-+    "debugger_remove_breakpoint",
-+    "debugger_list_breakpoints",
-+    "debugger_continue",
-+    "debugger_step_into",
-+    "debugger_step_over",
-+    "debugger_registers",
-+    "debugger_read_memory",
-+    "debugger_stack_trace",
-+    "debugger_read_args",
-+    "debugger_trace_function",
-+    "debugger_trace_stop",
-+    "debugger_trace_log",
-+    "debugger_trace_list",
-+    "debugger_watch_memory",
-+    "debugger_watch_stop",
-+    "debugger_watch_log",
-+}
-+
-+# Full structural set: every tool name the bridge may define. Used for
-+# name validation and the catalog tests; collision detection uses STATIC_TOOL_NAMES.
-+_ALL_STATIC_TOOL_NAMES = MANAGEMENT_TOOL_NAMES | DEBUGGER_TOOL_NAMES
-+
-+# Active set: static tools actually registered with this process. Debugger names
-+# are added by bridge_mcp_ghidra.debugger only when the debugger proxy is
-+# enabled (see debugger._debugger_enabled()). Used for runtime availability
-+# reporting (check_tools etc.). Mutated in place (|=), never rebound, so modules
-+# that imported this name earlier still see the update.
-+STATIC_TOOL_NAMES = set(MANAGEMENT_TOOL_NAMES)
-+
-+# Core groups always loaded on connect (essential for basic RE workflow)
-+CORE_GROUPS = {"listing", "function", "program"}
+     "run_ghidra_script": 1800,
+     "run_script_inline": 1800,
+     # Ghidra's default decompile cap is 60s. The bridge must outlive it so the
 diff -ruN a/python/bridge_mcp_ghidra/static_tools.py b/python/bridge_mcp_ghidra/static_tools.py
 --- a/python/bridge_mcp_ghidra/static_tools.py
 +++ b/python/bridge_mcp_ghidra/static_tools.py

@@ -6,7 +6,8 @@ name = "rea"
 prefix = "rea_"
 command = ["/usr/local/bin/rea", "mcp"]
 # REA's Ghidra sessions run in the ghidra-mcp JVM on the shared project (deps/rea-attach): REA's
-# patched launcher starts this helper instead of its own JVM. Unset it to give REA its own JVMs back.
+# patched launcher starts this helper instead of its own JVM. To debug with REA's own JVMs, add
+# REBOX_REA_ATTACH = "0" (without either, REA's Ghidra provider refuses to start).
 [child.env]
 REBOX_REA_ATTACH_HELPER = "/opt/rebox/rea-attach/helper.mjs"
 # REA keeps its runtime roots (and the target snapshot the helper imports) under TMPDIR; the

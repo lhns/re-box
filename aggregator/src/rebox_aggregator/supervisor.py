@@ -359,8 +359,9 @@ class Headless:
                 return
             env = {k: v for k, v in os.environ.items() if not k.startswith("REBOX_")}
             env["GHIDRA_MCP_FILE_ROOT"] = f"{self.cfg.workdir}:{REA_TMP}"
-            # Only REA's own scripts may run as part of an import (the attach helper's).
-            env["GHIDRA_MCP_IMPORT_SCRIPT_ROOTS"] = str(self.cfg.rea_attach_dir / "ghidra_scripts")
+            # Only REA's pre- and post-scripts may run as part of an import (any client can import):
+            # their own directory, without REA's bridge, which would load jars a descriptor names.
+            env["GHIDRA_MCP_IMPORT_SCRIPT_ROOTS"] = str(self.cfg.rea_attach_dir / "import_scripts")
             env["REBOX_INSTANCE"] = self.instance  # lets the shutdown sweep find a stuck JVM too
             started = time.monotonic()
             self._fail = ""

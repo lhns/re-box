@@ -8,14 +8,16 @@
 // env:  REBOX_GHIDRA_URL (default http://127.0.0.1:8089), REBOX_REA_GHIDRA_WAIT (seconds to wait
 //       for the JVM, default 600: the supervisor starts it with the session, and REA's own startup
 //       deadline, REA_GHIDRA_STARTUP_TIMEOUT_MS, bounds the whole open anyway),
-//       REBOX_REA_BRIDGE_DIR, REBOX_REA_ATTACH_SCRIPT
+//       REBOX_REA_BRIDGE_DIR, REBOX_REA_IMPORT_SCRIPTS, REBOX_REA_ATTACH_SCRIPT
 import { request } from "node:http";
 import { connect } from "node:net";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 const base = new URL(process.env.REBOX_GHIDRA_URL ?? "http://127.0.0.1:8089");
 const bridgeDir = process.env.REBOX_REA_BRIDGE_DIR ?? "/opt/rebox/rea-attach/ghidra_scripts";
+// REA's pre- and post-scripts: ghidra-mcp runs import scripts only from here (patch-rea.py).
+const importScripts = process.env.REBOX_REA_IMPORT_SCRIPTS ?? "/opt/rebox/rea-attach/import_scripts";
 const hostScript = process.env.REBOX_REA_ATTACH_SCRIPT ?? "ReboxReaAttach.java";
 const startWait = Number(process.env.REBOX_REA_GHIDRA_WAIT || 600);
 const BRIDGE = "ReaGhidraBridge.java";
@@ -66,10 +68,10 @@ export const parseHeadless = (argv) => {
 	return spec;
 };
 
-/** REA's scripts by name from the attach copy of its bridge directory (patch-rea.py). */
+/** REA's import scripts by name, from re-box's copy (patch-rea.py). */
 const localScript = ({ path, args }) => {
-	const local = join(bridgeDir, basename(path));
-	if (!existsSync(local)) throw new Error(`no ${basename(path)} in ${bridgeDir}`);
+	const local = join(importScripts, basename(path));
+	if (!existsSync(local)) throw new Error(`no ${basename(path)} in ${importScripts}`);
 	return { path: local, args };
 };
 
@@ -87,12 +89,23 @@ const lockName = async (name) => {
 		} catch (e) {
 			if (e.code !== "EEXIST") throw e;
 		}
-		const holder = Number(readFileSync(path, { encoding: "utf8", flag: "a+" }));
-		let alive = false;
+		let holder, age;
 		try {
-			process.kill(holder, 0);
-			alive = holder > 0;
-		} catch { /* gone */ }
+			holder = Number(readFileSync(path, "utf8"));
+			age = Date.now() - statSync(path).mtimeMs;
+		} catch {
+			continue;  // released meanwhile
+		}
+		let alive = true;
+		if (holder > 0) {
+			try {
+				process.kill(holder, 0);
+			} catch {
+				alive = false;
+			}
+		} else {
+			alive = age < 10_000;  // created, its pid not written yet (or a holder that died then)
+		}
 		if (!alive) rmSync(path, { force: true });
 		else await sleep(250);
 	}
@@ -134,6 +147,10 @@ const main = async () => {
 		die(e.message);
 	}
 	const descriptor = JSON.parse(readFileSync(spec.descriptor, "utf8"));
+	// REA's analysis extensions are jars the bridge loads; in the shared JVM they would run with
+	// every session's programs. Not supported attached.
+	if ((descriptor.analysis_extensions ?? []).length > 0)
+		die("REA analysis extensions (REA_GHIDRA_NATIVEAOT_JAR) are not supported in re-box's shared Ghidra");
 	// /run_ghidra_script splits its args on whitespace.
 	if (/\s/u.test(spec.descriptor + spec.scriptLog + bridgeDir))
 		die("the descriptor, script log and bridge paths must contain no whitespace");

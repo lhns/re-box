@@ -151,7 +151,7 @@ set -eu
 cd /src/rea-attach
 REA_PACKAGE=/opt/rea/node_modules/rea-agents python3 -B -m unittest -q test_patch_rea
 REA_PACKAGE=/opt/rea/node_modules/rea-agents node --test helper.test.mjs
-python3 -B patch-rea.py /opt/rea/node_modules/rea-agents /opt/rebox/rea-attach/ghidra_scripts
+python3 -B patch-rea.py /opt/rea/node_modules/rea-agents /opt/rebox/rea-attach/ghidra_scripts /opt/rebox/rea-attach/import_scripts
 install -m 0644 ReboxReaAttach.java helper.mjs /opt/rebox/rea-attach/
 EOS
 
