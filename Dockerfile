@@ -158,7 +158,7 @@ EOS
 # --- fixtures: test binaries (spec 8.2).
 FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS fixtures
 RUN apt-get update \
- && apt-get install -y --no-install-recommends gcc libc6-dev gcc-mingw-w64-x86-64 binutils \
+ && apt-get install -y --no-install-recommends gcc libc6-dev gcc-mingw-w64-x86-64 gcc-mipsel-linux-gnu binutils \
  && rm -rf /var/lib/apt/lists/*
 COPY tests/fixtures/src /src
 RUN <<'EOS'
@@ -170,6 +170,22 @@ x86_64-w64-mingw32-gcc -O2 -o /fixtures/hello.exe /src/hello.c
 # Same code, different bytes: a second target for the session-isolation test.
 cp /fixtures/hello_debug /fixtures/other_debug
 printf rebox >> /fixtures/other_debug
+# Targets REA runs with special Ghidra profiles (e2e/test_rea_profiles.py).
+# Freestanding x86_64 ELF at 0x401000 (the seeds target) and the same code as a raw blob: _start
+# is first in .text, so the blob's entry is offset 0 (loaded at address 0).
+free="-O1 -fno-pic -fno-stack-protector -ffreestanding -nostdlib -static -Wl,--build-id=none -Wl,-e,_start"
+gcc $free -no-pie -Wl,-Ttext=0x401000 -o /tmp/freestanding_x86_64 /src/freestanding.c
+gcc $free -no-pie -Wl,-Ttext=0 -o /tmp/blob.elf /src/freestanding.c
+objcopy -O binary -j .text /tmp/blob.elf /fixtures/blob_x86_64.bin
+# Seeds (REA_GHIDRA_SEED_FILE, rea-ghidra-seeds-v1): address<TAB>kind[<TAB>name]. The ELF is
+# stripped, so nothing but the seed makes the unreferenced function show up.
+strip -o /fixtures/freestanding_x86_64 /tmp/freestanding_x86_64
+addr=$(nm /tmp/freestanding_x86_64 | awk '$3 == "hidden_seed_target" { print $1 }')
+printf '# re-box fixture\n0x%s\tfunction\trebox_seeded\n' "$addr" > /fixtures/seeds.tsv
+# MIPS32r2 little-endian o32 soft-float executable (freestanding.c needs no libgcc helpers).
+mipsel-linux-gnu-gcc $free -march=mips32r2 -mabi=32 -msoft-float -mno-abicalls -mnan=legacy \
+    -Wl,-Ttext=0x401000 -o /fixtures/mips_softfloat /src/freestanding.c
+sh /src/make-dos.sh /fixtures
 EOS
 
 # --- runtime-core: Ghidra, ghidra-mcp and REA, before the extra tools and the aggregator.
