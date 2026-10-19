@@ -1,0 +1,8 @@
+{
+  "name": "rebox-rea",
+  "private": true,
+  "description": "Locks rea-agents and its dependency tree; the version must equal REA_VERSION in versions.env.",
+  "dependencies": {
+    "rea-agents": "6.7.0"
+  }
+}
