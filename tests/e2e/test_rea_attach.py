@@ -161,10 +161,10 @@ def test_concurrent_rea_sessions_share_one_program(session):
     assert not errors, errors
     assert len(helpers()) == 2 and len(ghidra_mcp_jvm()) == 1 and not rea_jvms()
     ok(a.tool("rea_annotate_native_function", {"procedure": "compute", "name": "SharedCompute"}))
-    # Same program for both: b sees a's rename once it reopens (an open REA session caches its
-    # inventories; DECISIONS.md).
-    ok(b.tool("rea_close_binary", {}))
-    ok(b.tool("rea_open_binary", {"path": target, "provider_id": "ghidra"}))
-    ok(b.tool("rea_analyze_function", {"procedure": "SharedCompute"}))
-    for s in (a, b):
+    # Same program for all: a new session sees a's rename. (b does not, even after reopening: REA
+    # caches what it read for the life of its process; DECISIONS.md.)
+    c = session()
+    ok(c.tool("rea_open_binary", {"path": target, "provider_id": "ghidra"}))
+    ok(c.tool("rea_analyze_function", {"procedure": "SharedCompute"}))
+    for s in (a, b, c):
         ok(s.tool("rea_close_binary", {}))
