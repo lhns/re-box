@@ -8,11 +8,12 @@ docker build --target final -t re-box .      # the release image
 ```
 
 `final` copies `/opt/rebox/tests-passed`, which only a passing `test` stage writes, so building
-`final` always runs the suite first (docs/DECISIONS.md, "Supervision"). Stages:
-`pins`; `ubuntu -> base -> tools, build-backends, ghidra, ghidra-mcp, rea, fixtures`;
-`tools + ghidra + ghidra-mcp + rea -> runtime -> test -> final`. `tools` (the analysis tools) comes
-before the others are copied in, so a change to ghidra-mcp, its patches or REA does not reinstall
-them. All downloads are pinned in `versions.env` and checked against their sha256; after a version
+`final` always runs the suite first (docs/DECISIONS.md, "Other departures", Supervision). Stages:
+`pins`; `ubuntu -> base -> tools, build-backends, ghidra, rea, fixtures`; `ghidra ->
+ghidra-mcp-src -> ghidra-mcp` (and `ghidra-mcp-test`), `rea -> rea-attach`; `tools -> runtime`
+(copies ghidra, ghidra-mcp, rea and rea-attach in) `-> test -> final`. `tools` (the analysis
+tools) is the runtime's base, so a change to ghidra-mcp, its patches or REA does not reinstall
+them (docs/DECISIONS.md, "Build"). All downloads are pinned in `versions.env` and checked against their sha256; after a version
 change run `python3 scripts/check-pins.py --update` (docs/OPERATIONS.md, "Upgrades"). apt reads a
 dated Ubuntu snapshot (`APT_SNAPSHOT` in `versions.env`; move it by hand to a recent date and run
 the test stage). Python build backends and the tools' lockfiles are hash-locked: regenerate with
@@ -56,7 +57,7 @@ To move it, set repository variables (Settings -> Secrets and variables -> Actio
 | variable | example | effect |
 | --- | --- | --- |
 | `REBOX_RUNNER` | `"re-box"` or `["self-hosted","linux","x64"]` | JSON for `runs-on` of the `image` job |
-| `REBOX_BUILD_TIMEOUT` | `600` | job timeout in minutes (hosted jobs stop at 360 regardless) |
+| `REBOX_BUILD_TIMEOUT` | `600` | job timeout in minutes (default 330; hosted jobs stop at 360 regardless) |
 
 A self-hosted runner needs a Docker daemon with buildx (the job uses the `docker-container`
 driver), ~60 GB of disk for the daemon, and memory for BuildKit plus the suite (8 GB is enough;
@@ -68,13 +69,14 @@ remote-docker workspace.
 
 ## Measured locally
 
-Docker Desktop, 20 CPUs, 64 GB, BuildKit, empty build cache (2026-10-19):
+Docker Desktop, 20 CPUs, 64 GB, BuildKit (2026-10-19, empty build cache):
 
 | | |
 | --- | --- |
-| cold build of `test` (all stages, incl. the suite) | 37 min (`install-tools.sh` 15 min, the suite 9-11 min) |
+| cold build of `test` (all stages, incl. the suite) | 37 min (the tools stage 15 min, the suite 9-11 min) |
 | cold build of `final` | 40 min |
-| test stage, peak RSS of the services | 2.5-2.7 GiB (headless JVM + one REA Ghidra JVM at a time) |
+| rebuild after a change to ghidra-mcp patch 0002 | 1669 s with the tools stage after Ghidra, 684 s since it comes first |
+| test stage, peak RSS of the services | 2.5-2.7 GiB (the headless JVM plus one REA Ghidra JVM at a time, as REA still ran its own then; not re-measured since the attach route) |
 | `final` image | 3.66 GB uncompressed |
 
 The RSS figure sums per-process RSS of the services during the suite (shared pages counted twice)

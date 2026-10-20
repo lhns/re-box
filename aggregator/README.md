@@ -29,19 +29,19 @@ headless server; used by unit tests and for development).
 
 ## Configuration
 
-Env (container): `REBOX_TOKEN_FILE` (path to a file holding the token, trailing whitespace stripped;
-preferred, because a process's environment is readable through `/proc/<pid>/environ` by other
-processes of the same uid) or `REBOX_TOKEN` (the file wins; refuse to start with neither or an empty
-token), `REBOX_INIT_TIMEOUT` (120 s, per child, covers spawn + `initialize` + listing; a child that
-exceeds it is killed and counts as failed), `REBOX_MAX_BODY_BYTES` (16 MiB; larger POSTs get HTTP 413), `REBOX_PORT` (8443),
-`REBOX_BIND` (0.0.0.0), `REBOX_TLS_CERT`/`REBOX_TLS_KEY` (both or neither), `REBOX_MAX_SESSIONS`
-(4), `REBOX_SESSION_IDLE_TIMEOUT` (1800 s), `REBOX_CHILD_GRACE` (5 s), `REBOX_CONFIG`
-(`/etc/rebox/aggregator.toml`), `REBOX_STATE_DIR` (the supervisor exports the resolved path; empty
-disables autosave), `REBOX_AUTOSAVE_INTERVAL` (300 s, 0 = only on close), `REBOX_AUTOSAVE_TIMEOUT` (20 s),
-`REBOX_SESSION_ORPHAN_TIMEOUT` (300 s: idle limit of a session with no open GET stream; 0 = same as the idle
-timeout), `REBOX_SESSION_EVICT_MIN_IDLE` (120 s), `REBOX_PROGRESS_KEEPALIVE_INTERVAL` (30 s, 0 = off),
-`REBOX_HEADLESS_START_TIMEOUT` (300 s; also how long a session waits for Ghidra, below).
-Supervisor only: `REBOX_GHIDRA_IDLE_TIMEOUT` (300 s, 0 = never stop), `REBOX_EVIDENCE_RETENTION_DAYS` (30, 0 = keep).
+Env: every variable, default and meaning is in docs/OPERATIONS.md, "Environment". Notes that
+belong to the code:
+
+- `REBOX_TOKEN_FILE` is preferred over `REBOX_TOKEN` because a process's environment is readable
+  through `/proc/<pid>/environ` by other processes of the same uid; the file wins, and neither (or
+  an empty token) refuses to start.
+- `REBOX_INIT_TIMEOUT` is per child and covers spawn, `initialize` and listing; a child that
+  exceeds it is killed and counts as failed.
+- `REBOX_CHILD_GRACE` is the wait between SIGTERM and SIGKILL of a child's process group.
+- `REBOX_STATE_DIR` is resolved and exported by the supervisor. Empty in the bare `rebox-aggregator`
+  (unit tests, development) it disables autosave and the catalog cache; the container always
+  defaults it.
+- `REBOX_HEADLESS_START_TIMEOUT` is also how long a session waits for Ghidra (below).
 
 Children and session texts (TOML), generic so more servers can be added without code changes:
 
@@ -68,7 +68,7 @@ before_tools = ["close_binary"]  # optional: the child's tools that drop its wor
 tool = "connect_instance"
 arguments = { project = "rebox" }
 [child.catalog_cache]        # optional: remember the child's full catalog, advertise it while the backend starts
-key = "{file:/opt/ghidra-mcp/VERSION}-lazy{GHIDRA_MCP_LAZY}"   # {NAME}: env var, {file:/path}: file content
+key = "{file:/opt/ghidra-mcp/VERSION}-lazy{GHIDRA_MCP_LAZY}-scripts{GHIDRA_MCP_ALLOW_SCRIPTS}"   # {NAME}: env var, {file:/path}: file content
 ```
 
 **Deny list:** `deny` names tools by the child's own (unprefixed) names. They are dropped from
@@ -116,8 +116,8 @@ supervisor's random instance id) and `REBOX_SESSION` (the session tag, below).
 ## Session lifecycle
 
 - **Session tag** = first 16 hex chars of `sha256(Mcp-Session-Id)`. Logs carry the tag, never
-  the id. Every child gets it as `REBOX_SESSION`, inherited by its descendants (REA's Ghidra
-  JVMs), which is how cleanup and the e2e test find a session's processes without PID-namespace
+  the id. Every child gets it as `REBOX_SESSION`, inherited by its descendants (REA's tools, attach helper
+  and bridge), which is how cleanup and the e2e test find a session's processes without PID-namespace
   isolation.
 - **Open:** a POST without `Mcp-Session-Id` whose single JSON-RPC message is `initialize`.
   At the cap, the session idle longest with nothing in flight and idle at least
@@ -153,7 +153,7 @@ supervisor's random instance id) and `REBOX_SESSION` (the session tag, below).
   quiet; a client silent for 4x is gone). A session whose client holds its standalone GET stream
   open (the MCP SDKs open it after `notifications/initialized`) keeps the full timeout; one with no
   open GET stream is probably gone (`claude -p` exited without DELETE) and uses
-  `REBOX_SESSION_ORPHAN_TIMEOUT` instead (close reason `orphaned`), so its REA JVM does not linger.
+  `REBOX_SESSION_ORPHAN_TIMEOUT` instead (close reason `orphaned`), so its REA process, helper and bridge do not linger.
   The app counts open GET streams per session and logs `get_stream_open` / `get_stream_closed`
   (level `debug`, with the number open). `Session.idle_timeout()` is the one place that decides.
 - **Keepalive progress:** for an in-flight request with a `progressToken` the child has not
@@ -216,7 +216,8 @@ notification handler it closes the session (`internal_error`).
   previous catalog stays.
 - **Child crash:** its in-flight requests fail with `-32603`, then the session is closed
   (`child_exited`, above).
-- **No timeouts** on forwarded requests; cold Ghidra starts take minutes.
+- **No timeouts** on forwarded requests: a call may legitimately run for minutes (an import with
+  analysis).
 
 ## Names
 
@@ -230,11 +231,14 @@ logs `catalog_rejected`. Never truncate or rename silently.
 JSON lines on stdout, one object per line, always `ts`, `level`, `event`:
 `session_open` (session tag, children with pid), `session_close` (reason, duration, leftovers
 killed), `session_refused` (reason), `session_evicted`, `get_stream_open` / `get_stream_closed`,
-`on_ready`, `headless_state` (state, reason), `headless_idle_stop`, `evidence_dropped`,
+`on_ready`, `autosave` (session or `component: ghidra`, reason, outcome, duration_ms), `headless_state` (state, reason), `headless_idle_stop`, `evidence_dropped`,
 `evidence_pruned`, `evidence_partial_removed`, `tmp_swept`, `ghidra_logs_pruned`, `project_size` (bytes, files; at each Ghidra start), `child_exit`, `tool_call` (session, tool, duration_ms,
 outcome `ok` / `tool_error` / `rpc_error` / `cancelled`, error code), `catalog_rejected`,
-`child_stderr` (session, child, line truncated to 2000 chars), `child_bad_line`, `refresh_failed`,
-`catalog_cold`, `internal_error`, `library_log` (a warning of the mcp library: logger, message,
+`child_stderr` (session, child, line truncated to 2000 chars), `child_bad_line`, `child_line_too_long`,
+`child_init_failed`, `refresh_failed`, `catalog_warmup` / `catalog_warmup_failed` (container-start
+fill of a missing cache), `catalog_cold` (no cache, and the session could not get a complete listing; with the reason), `catalog_cache_written` / `catalog_cache_kept` / `catalog_cache_failed`,
+`downstream_backpressure`, `transport_error`, `headless_exit` / `headless_start_timeout` /
+`project_failed` / `rea_attach_install`, `internal_error`, `library_log` (a warning of the mcp library: logger, message,
 exception type). **Never tool arguments or results.**
 
 ## Supervisor
@@ -268,7 +272,9 @@ exception type). **Never tool arguments or results.**
    `GHIDRA_MCP_IMPORT_SCRIPT_ROOTS=<REBOX_REA_ATTACH_DIR>/import_scripts` forced; REA's attach script is copied to
    `$STATE/home/ghidra_scripts` at every start; if `rebox.gpr` is missing it is first created with
    `analyzeHeadless <dir> rebox -preScript ReboxNoop.java` (the HTTP API cannot create projects
-   outside the file root); its output relayed as `headless_log` lines.
+   outside the file root); its output relayed as `headless_log` lines. When the JVM crashes, the supervisor also kills the
+   attach helpers of the instance (processes running `rea-attach/helper.mjs` that carry its `REBOX_INSTANCE`), so
+   REA reports the lost provider at once.
 4. Wait for `GET http://127.0.0.1:8089/check_connection` to answer `{"status":"ok",...}`
    (`REBOX_HEADLESS_START_TIMEOUT`, 300 s). Then check the project (and log its size on disk as `project_size`): `GET /get_project_info`;
    if `has_project` is false (works only inside the file root), `POST /open_project {"path": "<dir>/rebox.gpr"}` (JSON body).
@@ -294,4 +300,5 @@ exception type). **Never tool arguments or results.**
 9. SIGTERM/SIGINT: at once `POST /save_all_programs` (concurrently with closing the sessions, so a
    short `docker stop` grace cannot lose it; waited for at most 30 s), refuse new sessions, close all sessions, `POST /exit_ghidra` (saves all
    programs), wait up to 60 s for the JVM, then SIGTERM/SIGKILL its group, then SIGKILL anything
-   left with this `REBOX_INSTANCE`; exit 0. A second signal skips the waits.
+   left with this `REBOX_INSTANCE`; exit 0. A second signal skips the waits. The sequence needs
+   `docker stop` to allow 120 s (docs/OPERATIONS.md).

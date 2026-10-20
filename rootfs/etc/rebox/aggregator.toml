@@ -29,9 +29,9 @@ REBOX_REA_ATTACH_HELPER = "/opt/rebox/rea-attach/helper.mjs"
 # {NAME} is filled in from the supervisor's environment.
 TMPDIR = "{REBOX_REA_TMP}"
 # REA's session state (its evidence ledger, findings) is private to the process and ends with it;
-# its annotations persist in the shared project. The evidence bundle keeps what it found. Run on session close and periodically when REBOX_STATE_DIR is
-# set; {state_dir} and {session} are substituted. prune_empty deletes the file again when the
-# bundle holds nothing.
+# its annotations persist in the shared project. The evidence bundle keeps what it found. Run on
+# session close and periodically when REBOX_STATE_DIR is set; {state_dir} and {session} are
+# substituted. prune_empty deletes the file again when the bundle holds nothing.
 [child.autosave]
 tool = "export_evidence_bundle"
 arguments = { path = "{state_dir}/rea/evidence/{session}.json", overwrite = true }
