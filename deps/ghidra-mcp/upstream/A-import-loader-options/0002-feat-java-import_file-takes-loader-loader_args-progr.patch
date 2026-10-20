@@ -1,4 +1,4 @@
-From 9e6430aaf3225d6e16ec4dbad20f4cdc3d0f8a01 Mon Sep 17 00:00:00 2001
+From 47c404102ae371c59ca7ea1c93dd91bc4596e7e8 Mon Sep 17 00:00:00 2001
 From: Pierre Kisters <pierrekisters@gmail.com>
 Date: Mon, 19 Oct 2026 18:39:39 +0000
 Subject: [PATCH 2/2] feat(java): import_file takes loader, loader_args,
@@ -17,47 +17,58 @@ takes.
   analyzing and import_error). ProgramLoader replaces AutoImporter; the
   destination still goes through ProjectPaths.
 - if_exists: reuse (default), error or unique. A same-named program is
-  now reused only when its recorded SHA-256 matches the file's; opening
-  another binary under the requested name answered every later question
-  about the wrong program.
-- Imports are serialized per destination folder and name. Two clients
-  importing one new file at once left a second program called <name>.0.
-- A program imported under another name is found by that name.
+  now reused only when its recorded SHA-256 matches the file's, read from
+  the project file without opening the program; opening another binary
+  under the requested name answered every later question about the wrong
+  program.
+- Imports are serialized per destination folder and name, through
+  analysis: a wait=false import hands its destination to the worker,
+  which leaves it when done. Two clients importing one new file at once
+  left a second program called <name>.0.
+- A failed import (analysis options, analysis) removes its program. A
+  program saved by an import that has not finished carries a "ghidra-mcp
+  import pending" flag in its program info, cleared once analysis is
+  done; the next import of that name deletes and redoes such a program
+  instead of reusing it, whatever if_exists says.
+- A program imported under another name is found by that name, or by a
+  part of it.
 - Bridge: import_file exposes the parameters and waits up to 1800 s (was
   300) for the analysis a wait=true import covers.
 
-Tests: ImportRequestTest, three ProjectProgramProviderTest cases for the
-reuse rule, ProgramImportGhidraTest (real loaders: BinaryLoader at
-1000:0100, same bytes, unique, analysis options, wait=false, four
-concurrent imports) and the bridge's payload and poll tests.
+Tests: ImportRequestTest, ProjectProgramProviderTest cases for the reuse
+rule and the file-name match, ProgramImportGhidraTest (real loaders:
+BinaryLoader at 1000:0100, same bytes, unique, analysis options,
+wait=false, an unfinished import redone under every if_exists, no pending
+flag after a finished import, a second import waiting for a wait=false
+one, four concurrent imports) and the bridge's payload and poll tests.
 tests/endpoints.json edited by hand (no Maven here); the generators
 report nothing to change.
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
 ---
- CHANGELOG.md                                  |  33 ++
+ CHANGELOG.md                                  |  38 ++
  README.md                                     |   6 +
  python/bridge_mcp_ghidra/config.py            |   2 +-
  python/bridge_mcp_ghidra/import_tool.py       |  86 ++++-
- .../java/com/xebyte/core/ImportRequest.java   |  82 +++++
- .../com/xebyte/core/ProgramScriptService.java | 287 +++++++++++++----
- .../xebyte/core/ProjectProgramProvider.java   | 144 +++++++--
- .../xebyte/core/ProgramImportGhidraTest.java  | 294 ++++++++++++++++++
+ .../java/com/xebyte/core/ImportRequest.java   |  82 ++++
+ .../com/xebyte/core/ProgramScriptService.java | 319 ++++++++++++---
+ .../xebyte/core/ProjectProgramProvider.java   | 206 ++++++++--
+ .../xebyte/core/ProgramImportGhidraTest.java  | 362 ++++++++++++++++++
  .../com/xebyte/offline/ImportRequestTest.java |  68 ++++
  .../ProgramScriptServiceValidationTest.java   |   2 +-
- .../offline/ProjectProgramProviderTest.java   |  77 +++++
+ .../offline/ProjectProgramProviderTest.java   |  86 +++++
  tests/endpoints.json                          |   8 +-
- tests/unit/test_static_tools.py               |  95 ++++++
- 13 files changed, 1093 insertions(+), 91 deletions(-)
+ tests/unit/test_static_tools.py               |  95 +++++
+ 13 files changed, 1268 insertions(+), 92 deletions(-)
  create mode 100644 src/main/java/com/xebyte/core/ImportRequest.java
  create mode 100644 src/test/java/com/xebyte/core/ProgramImportGhidraTest.java
  create mode 100644 src/test/java/com/xebyte/offline/ImportRequestTest.java
 
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 841a9fb..1edc843 100644
+index 841a9fb..10ec141 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -8,6 +8,39 @@ Complete version history for the Ghidra MCP Server project.
+@@ -8,6 +8,44 @@ Complete version history for the Ghidra MCP Server project.
  
  Changes on `dev` after 7.0.0.
  
@@ -80,8 +91,13 @@ index 841a9fb..1edc843 100644
 +- `wait`: `false` returns once the program is imported and saved; analysis continues in the
 +  background, `/analysis_status` reports `analyzing` and, if it did not finish, `import_error`.
 +
-+Imports are serialized per destination folder and name: two clients importing one new file at
-+once used to leave a second program called `<name>.0`; the second now reuses the first's. The
++Imports are serialized per destination folder and name, through analysis (a `wait=false` import
++holds its destination until its worker is done): two clients importing one new file at once used
++to leave a second program called `<name>.0`; the second now reuses the first's. A failed import
++(analysis options, analysis) removes its program, so a retry starts from the file. A program
++saved by an import that has not finished carries a `ghidra-mcp import pending` flag in its
++program info, cleared once its analysis is done; if the server died in between, the next import
++of that name deletes the program and imports again instead of reusing a half-made one. The
 +bridge's `import_file` tool exposes the new parameters (sending only those that differ from the
 +defaults) and waits up to 1800 s (was 300) for the analysis a `wait=true` import covers.
 +
@@ -348,10 +364,18 @@ index 0000000..fd59588
 +    }
 +}
 diff --git a/src/main/java/com/xebyte/core/ProgramScriptService.java b/src/main/java/com/xebyte/core/ProgramScriptService.java
-index c3b0411..89d5859 100644
+index c3b0411..6993e9c 100644
 --- a/src/main/java/com/xebyte/core/ProgramScriptService.java
 +++ b/src/main/java/com/xebyte/core/ProgramScriptService.java
-@@ -1796,16 +1796,24 @@ if (map instanceof ObjectPropertyMap) {
+@@ -28,6 +28,7 @@ import ghidra.util.task.TimeoutTaskMonitor;
+ import java.io.*;
+ import java.util.*;
+ import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicBoolean;
+ 
+ /**
+  * Service for program management, script execution, memory, and bookmark operations.
+@@ -1796,16 +1797,24 @@ if (map instanceof ObjectPropertyMap) {
  
      @McpTool(path = "/import_file", dryRun = false, method = "POST",
              description = "Import a binary file from disk into the open project and open it. If the "
@@ -381,11 +405,12 @@ index c3b0411..89d5859 100644
  
          if (filePath == null || filePath.trim().isEmpty()) {
              return Response.err("file_path is required");
-@@ -1830,54 +1838,19 @@ if (map instanceof ObjectPropertyMap) {
+@@ -1830,54 +1839,21 @@ if (map instanceof ObjectPropertyMap) {
              return Response.err("This server cannot import programs");
          }
  
 +        String entered = null;
++        AtomicBoolean handedOff = new AtomicBoolean();
          try {
 -            ProjectProgramProvider.Imported imported =
 -                provider.importFile(file, projectFolder, languageId, compilerSpecId);
@@ -444,22 +469,28 @@ index c3b0411..89d5859 100644
 +            String destination = ProjectPaths.normalize(request.folder()) + "\0" + request.programName();
 +            enterImport(destination);
 +            entered = destination;
-+            return importLocked(provider, request, autoAnalyze, options, waitForAnalysis);
++            return importLocked(provider, request, autoAnalyze, options, waitForAnalysis, destination,
++                handedOff);
          } catch (Refusal r) {
              return Response.err(r.getMessage());
          } catch (Exception e) {
-@@ -1891,9 +1864,209 @@ if (map instanceof ObjectPropertyMap) {
+@@ -1891,7 +1867,236 @@ if (map instanceof ObjectPropertyMap) {
              }
              Msg.error(this, "Import failed", e);
              return Response.err("Import failed: " + msg);
 +        } finally {
-+            if (entered != null) {
++            if (entered != null && !handedOff.get()) {
 +                leaveImport(entered);
 +            }
 +        }
 +    }
 +
-+    /** Destinations (folder + name) an import is running for; see {@link #enterImport}. */
++    /**
++     * Destinations (folder + name) an import is running for, through its analysis: a
++     * {@code wait=false} import hands its destination to the worker thread, which leaves it when
++     * done. Another import of the same destination then finds the finished program (an unfinished
++     * one is deleted and redone, so nobody may start before the worker is done).
++     */
 +    private final Set<String> importsRunning = new HashSet<>();
 +    /** Programs a wait=false import is still analyzing, and why one did not finish (see /analysis_status). */
 +    private final Set<String> pendingImports = java.util.concurrent.ConcurrentHashMap.newKeySet();
@@ -489,12 +520,12 @@ index c3b0411..89d5859 100644
 +        synchronized (importsRunning) {
 +            importsRunning.remove(destination);
 +            importsRunning.notifyAll();
-         }
-     }
- 
++        }
++    }
++
 +    private Response importLocked(ProjectProgramProvider provider, ImportRequest request,
-+            boolean autoAnalyze, Map<String, String> analysisOptions, boolean waitForAnalysis)
-+            throws Exception {
++            boolean autoAnalyze, Map<String, String> analysisOptions, boolean waitForAnalysis,
++            String destination, AtomicBoolean handedOff) throws Exception {
 +        ProjectProgramProvider.Imported imported = provider.importFile(request);
 +        Program program = imported.program();
 +        String path = ProjectProgramProvider.keyFor(program);
@@ -544,24 +575,24 @@ index c3b0411..89d5859 100644
 +                throw e;
 +            }
 +            if (waitForAnalysis) {
-+                out.put("auto_analyzed", analyzeImported(program, autoAnalyze));
++                out.put("auto_analyzed", finishImport(provider, program, autoAnalyze));
 +            } else {
 +                importFailures.remove(path);
 +                pendingImports.add(path);
 +                Thread worker = new Thread(() -> {
 +                    try {
-+                        if (!analyzeImported(program, autoAnalyze) && autoAnalyze) {
-+                            importFailures.put(path, "auto-analysis did not complete; see the server log");
-+                        }
++                        finishImport(provider, program, autoAnalyze);
 +                    } catch (Exception e) {
 +                        importFailures.put(path, e.getMessage() != null ? e.getMessage() : e.toString());
 +                        Msg.error(this, "Background import of " + path + " failed", e);
 +                    } finally {
 +                        pendingImports.remove(path);
++                        leaveImport(destination);
 +                    }
 +                }, "import-" + program.getName());
 +                worker.setDaemon(true);
 +                worker.start();
++                handedOff.set(true);
 +                out.put("analyzing", true);
 +            }
 +        }
@@ -571,6 +602,30 @@ index c3b0411..89d5859 100644
 +            out.put("codebrowser", shown);
 +        }
 +        return Response.ok(out);
++    }
++
++    /**
++     * After a fresh import: auto-analysis, then the end of the import (the pending flag is
++     * cleared and the program saved). Any failure removes the import, so a retry starts from the
++     * file again instead of reusing a program that never got its analysis.
++     */
++    private boolean finishImport(ProjectProgramProvider provider, Program program, boolean autoAnalyze)
++            throws Exception {
++        try {
++            boolean analyzed = analyzeImported(program, autoAnalyze);
++            if (autoAnalyze && !analyzed) {
++                throw new IOException("auto-analysis failed (see the server log)");
++            }
++            threadingStrategy.executeWrite(program, "Import finished", () -> {
++                ProjectProgramProvider.markImportFinished(program);
++                return null;
++            });
++            persistProgram(program, "Import finished");
++            return analyzed;
++        } catch (Exception e) {
++            discardImport(provider, program, e);
++            throw new IOException("import removed: " + (e.getMessage() != null ? e.getMessage() : e), e);
++        }
 +    }
 +
 +    /** Auto-analysis of a fresh import, or just the prompt flag when it is not wanted. */
@@ -588,8 +643,8 @@ index c3b0411..89d5859 100644
 +
 +    /**
 +     * Remove an import that could not be finished as asked (an analysis option that does not
-+     * exist), so a retry starts from the file instead of reusing a program that lacks what the
-+     * caller asked for.
++     * exist, an analysis that failed), so a retry starts from the file instead of reusing a
++     * program that lacks what the caller asked for.
 +     */
 +    private void discardImport(ProjectProgramProvider provider, Program program, Exception cause) {
 +        ghidra.framework.model.DomainFile df = program.getDomainFile();
@@ -607,7 +662,7 @@ index c3b0411..89d5859 100644
 +        Map<String, String> out = new LinkedHashMap<>();
 +        if (raw != null) {
 +            raw.forEach((k, v) -> out.put(k, v == null ? "" : String.valueOf(v)));
-+        }
+         }
 +        return out;
 +    }
 +
@@ -653,12 +708,10 @@ index c3b0411..89d5859 100644
 +            return false;
 +        }
 +        throw new Refusal("Analysis option " + name + " is a boolean; '" + value + "' is not true or false");
-+    }
-+
+     }
+ 
      @McpTool(path = "/get_project_info",
-             description = "The open project: name, file count, whether it is bound to a Ghidra Server "
-                 + "(and which repository), and which programs are open. A shared project is what "
-@@ -1995,13 +2168,19 @@ if (map instanceof ObjectPropertyMap) {
+@@ -1995,13 +2200,19 @@ if (map instanceof ObjectPropertyMap) {
              } catch (Exception e) {
                  // May not have an analysis manager in headless mode
              }
@@ -681,30 +734,44 @@ index c3b0411..89d5859 100644
  
          if (programName != null && !programName.isEmpty() && results.isEmpty()) {
 diff --git a/src/main/java/com/xebyte/core/ProjectProgramProvider.java b/src/main/java/com/xebyte/core/ProjectProgramProvider.java
-index 228d9dd..59d351e 100644
+index 228d9dd..b9fbeb9 100644
 --- a/src/main/java/com/xebyte/core/ProjectProgramProvider.java
 +++ b/src/main/java/com/xebyte/core/ProjectProgramProvider.java
-@@ -191,7 +191,10 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
+@@ -191,7 +191,17 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
              }
              return null;
          }
 -        return unique(programs, s, p -> p.getName().equalsIgnoreCase(s));
-+        // The project file's name counts as well as the program's own: a program imported with a
-+        // program_name keeps the source file's name inside, but is the file the caller named.
-+        return unique(programs, s, p -> p.getName().equalsIgnoreCase(s)
-+            || (p.getDomainFile() != null && s.equalsIgnoreCase(p.getDomainFile().getName())));
++        return unique(programs, s, p -> p.getName().equalsIgnoreCase(s) || fileName(p).equalsIgnoreCase(s));
++    }
++
++    /**
++     * The project file's name, which {@code program_name} sets: a program imported under another
++     * name keeps the source file's name inside, but is the file the caller named.
++     */
++    private static String fileName(Program p) {
++        DomainFile df = p.getDomainFile();
++        String name = df != null ? df.getName() : null;
++        return name != null ? name : "";
      }
  
      private static Program matchSubstring(Collection<Program> programs, String wanted) {
-@@ -472,59 +475,96 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
+@@ -199,7 +209,8 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
+             return null;
+         }
+         String lower = wanted.trim().toLowerCase();
+-        return unique(programs, wanted.trim(), p -> p.getName().toLowerCase().contains(lower));
++        return unique(programs, wanted.trim(),
++            p -> p.getName().toLowerCase().contains(lower) || fileName(p).toLowerCase().contains(lower));
+     }
+ 
+     private static Program unique(Collection<Program> programs, String wanted,
+@@ -472,59 +483,118 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
  
      /**
       * Import a binary into {@code folder} and open it, or open the file already there.
 +     * The original four-argument import: auto-detect, or BinaryLoader with a language.
-      *
--     * <p>A file of the same name already in the folder is opened instead of re-imported:
--     * a second import would fail on the duplicate name, and repeated imports are how a
--     * scripted setup stays idempotent. The caller learns which happened.
++     *
 +     * @see #importFile(ImportRequest)
 +     */
 +    public Imported importFile(java.io.File file, String folder, String languageId,
@@ -716,12 +783,20 @@ index 228d9dd..59d351e 100644
 +     * Import as {@code request} says (loader, loader options, name) and open the result, or
 +     * deal with the program the folder already holds under that name (see
 +     * {@link ImportRequest#ifExists()}).
-+     *
+      *
+-     * <p>A file of the same name already in the folder is opened instead of re-imported:
+-     * a second import would fail on the duplicate name, and repeated imports are how a
+-     * scripted setup stays idempotent. The caller learns which happened.
 +     * <p>By default a program of the same name already in the folder is opened instead of
 +     * re-imported, but only when it was imported from the same bytes: repeated imports are how
 +     * a scripted setup stays idempotent, while opening a different binary under the requested
 +     * name would answer the next question about the wrong program. A program that records no
 +     * hash (not made by an import) is reused as before. The caller learns which happened.
++     *
++     * <p>A program whose import never finished (see {@link #IMPORT_PENDING}) is deleted and
++     * imported again, whatever {@code if_exists} says: it never got its analysis, so reusing it
++     * would answer about a half-made program. The caller must hold the destination's import
++     * lock, so nobody is still working on it.
       *
       * <p>The importer's own references are dropped once the file is saved, and the saved
       * file is opened through {@link #openDomainFile} like any other: the program then has
@@ -752,6 +827,11 @@ index 228d9dd..59d351e 100644
              dest = target.getPathname();
 -            DomainFile existing = target.getFile(file.getName());
 +            DomainFile existing = target.getFile(name);
++            if (existing != null && importUnfinished(existing)) {
++                closeProgramByPath(existing.getPathname());
++                existing.delete();
++                existing = null;
++            }
              if (existing != null) {
 -                return new Imported(openDomainFile(existing), true);
 +                switch (request.ifExists()) {
@@ -819,10 +899,22 @@ index 228d9dd..59d351e 100644
 +                    + "; for a raw binary pass a language (e.g. 'ARM:LE:32:Cortex')"
 +                : "Cannot import " + file.getName() + " with loader " + loader)
 +                + ": " + e.getMessage() + " " + log);
++        }
++
++        // Cleared once the import's analysis is done (markImportFinished); a program saved with
++        // it set is an import that died half way.
++        Program loaded = results.getPrimaryDomainObject(consumer);
++        try {
++            markImportPending(loaded);
++        } catch (Exception e) {
++            results.close();
++            throw e;
++        } finally {
++            loaded.release(consumer);
          }
  
          if (project == null) {
-@@ -545,6 +585,50 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
+@@ -545,6 +615,80 @@ public abstract class ProjectProgramProvider implements ProgramProvider {
          return new Imported(openDomainFile(saved), false);
      }
  
@@ -832,6 +924,36 @@ index 228d9dd..59d351e 100644
 +     * need not be opened to be compared.
 +     */
 +    private static final String EXECUTABLE_SHA256_KEY = "Executable SHA256";
++
++    /**
++     * Program-info flag of an import that has not finished: set when the loaded program is first
++     * saved, cleared by {@link #markImportFinished} once its analysis is done. It is read from the
++     * file's metadata, so a program that is not open need not be opened to be judged.
++     */
++    public static final String IMPORT_PENDING = "ghidra-mcp import pending";
++
++    static boolean importUnfinished(DomainFile df) {
++        return "true".equalsIgnoreCase(df.getMetadata().get(IMPORT_PENDING));
++    }
++
++    private static void markImportPending(Program program) {
++        int tx = program.startTransaction("Import pending");
++        boolean done = false;
++        try {
++            program.getOptions(Program.PROGRAM_INFO).setBoolean(IMPORT_PENDING, true);
++            done = true;
++        } finally {
++            program.endTransaction(tx, done);
++        }
++    }
++
++    /** Clear the pending flag once an import is done; call it inside a write transaction. */
++    public static void markImportFinished(Program program) {
++        ghidra.framework.options.Options info = program.getOptions(Program.PROGRAM_INFO);
++        if (info.contains(IMPORT_PENDING)) {
++            info.removeOption(IMPORT_PENDING);
++        }
++    }
 +
 +    /** Refuse to reuse {@code existing} when it records a hash other than {@code file}'s. */
 +    private static void refuseOtherBytes(DomainFile existing, java.io.File file) throws java.io.IOException {
@@ -875,10 +997,10 @@ index 228d9dd..59d351e 100644
       * ({@code serverInfo}, host:port, null when it cannot be read), and whether connected.
 diff --git a/src/test/java/com/xebyte/core/ProgramImportGhidraTest.java b/src/test/java/com/xebyte/core/ProgramImportGhidraTest.java
 new file mode 100644
-index 0000000..e05ed78
+index 0000000..c7906f6
 --- /dev/null
 +++ b/src/test/java/com/xebyte/core/ProgramImportGhidraTest.java
-@@ -0,0 +1,294 @@
+@@ -0,0 +1,362 @@
 +package com.xebyte.core;
 +
 +import com.xebyte.headless.DirectThreadingStrategy;
@@ -922,7 +1044,8 @@ index 0000000..e05ed78
 +/**
 + * {@code /import_file}'s loader options against a real temp project and the real loaders:
 + * a raw binary at a base address, a DOS .COM at 1000:0100, the same-bytes reuse rule,
-+ * {@code if_exists}, analysis options, {@code wait=false}, and two clients importing one file.
++ * {@code if_exists}, analysis options, {@code wait=false}, an import that never finished, and two
++ * clients importing one file.
 + */
 +public class ProgramImportGhidraTest {
 +
@@ -1143,6 +1266,73 @@ index 0000000..e05ed78
 +        assertEquals(false, status.get("analyzing"));
 +        assertEquals(true, status.get("analyzed"));
 +        assertFalse(status.containsKey("import_error"));
++        assertFalse("a finished import carries no pending marker", unfinished("/fw.bin"));
++    }
++
++    private DomainFile projectFile(String path) {
++        return provider.getProject().getProjectData().getFile(path);
++    }
++
++    private boolean unfinished(String path) {
++        return ProjectProgramProvider.importUnfinished(projectFile(path));
++    }
++
++    /** What an import that died during analysis leaves: the program saved, its pending flag set. */
++    private DomainFile leaveUnfinishedImport(File file) throws Exception {
++        Program half = provider.importFile(file, "/", X86_REAL, "").program();
++        DomainFile df = half.getDomainFile();
++        provider.closeProgramByPath(df.getPathname());
++        assertTrue("a saved, not yet analyzed import is pending", ProjectProgramProvider.importUnfinished(df));
++        return df;
++    }
++
++    @Test
++    public void aFinishedImportCarriesNoPendingMarker() throws Exception {
++        ok(importPlain(file("fw.bin", bytes(32, 10))));
++
++        assertFalse(unfinished("/fw.bin"));
++        assertFalse(provider.getProgram("/fw.bin").getOptions(Program.PROGRAM_INFO)
++            .contains(ProjectProgramProvider.IMPORT_PENDING));
++    }
++
++    /** An import that never finished is deleted and redone, whatever if_exists says. */
++    @Test
++    public void anImportThatNeverFinishedIsDeletedAndRedoneNotReused() throws Exception {
++        for (String ifExists : List.of("reuse", "error", "unique")) {
++            File f = file("fw-" + ifExists + ".bin", bytes(32, 11));
++            leaveUnfinishedImport(f);
++            String path = "/fw-" + ifExists + ".bin";
++            String idBefore = projectFile(path).getFileID();
++
++            Map<String, Object> out = ok(importFile(f, "/", X86_REAL, "", null, "", null, ifExists, true));
++
++            assertEquals(ifExists, path, out.get("path"));
++            assertEquals(ifExists, false, out.get("reused_existing"));
++            assertNotEquals(ifExists + ": a new project file, not the half-made one",
++                idBefore, projectFile(path).getFileID());
++            assertFalse(ifExists, unfinished(path));
++        }
++        assertEquals("one program per file", 3, provider.getProject().getProjectData().getRootFolder().getFiles().length);
++    }
++
++    /**
++     * A wait=false import keeps its destination until analysis is done. Its program is pending
++     * until then, so a second import that did not wait would delete it under the worker.
++     */
++    @Test
++    public void aSecondImportWaitsForABackgroundImportInsteadOfDeletingItsProgram() throws Exception {
++        File f = file("fw.bin", bytes(256, 0x90));
++        Map<String, Object> first = ok(service.importFile(f.getPath(), "/", X86_REAL, "", true, "", null,
++            "", null, "reuse", false));
++        assertEquals(true, first.get("analyzing"));
++        String id = projectFile("/fw.bin").getFileID();
++
++        Map<String, Object> second = ok(importPlain(f));
++
++        assertEquals("the finished program is reused", true, second.get("reused_existing"));
++        assertEquals(id, projectFile("/fw.bin").getFileID());
++        assertFalse(unfinished("/fw.bin"));
++        assertEquals(true, ok(service.analysisStatus("/fw.bin")).get("analyzed"));
 +    }
 +
 +    /** Two clients import the same new file at once: one program, not "<name>" and "<name>.0". */
@@ -1261,7 +1451,7 @@ index 5307fa2..4704024 100644
          assertTrue(((Response.Err) r).message().contains("file_path is required"));
      }
 diff --git a/src/test/java/com/xebyte/offline/ProjectProgramProviderTest.java b/src/test/java/com/xebyte/offline/ProjectProgramProviderTest.java
-index e639fa7..cd0eb55 100644
+index e639fa7..d222412 100644
 --- a/src/test/java/com/xebyte/offline/ProjectProgramProviderTest.java
 +++ b/src/test/java/com/xebyte/offline/ProjectProgramProviderTest.java
 @@ -3,8 +3,10 @@ package com.xebyte.offline;
@@ -1275,7 +1465,7 @@ index e639fa7..cd0eb55 100644
  import com.xebyte.core.Response;
  import com.xebyte.headless.HeadlessProgramProvider;
  import ghidra.framework.model.DomainFile;
-@@ -98,6 +100,15 @@ public class ProjectProgramProviderTest {
+@@ -98,6 +100,24 @@ public class ProjectProgramProviderTest {
          assertSame(v2, ProjectProgramProvider.match(List.of(v1, v2), "/1.13d/D2Common.dll"));
      }
  
@@ -1288,10 +1478,19 @@ index e639fa7..cd0eb55 100644
 +        assertSame(p, ProjectProgramProvider.match(List.of(p), "raw"));
 +    }
 +
++    @Test
++    public void aProgramImportedUnderAnotherNameIsFoundBySubstringOfTheFileName() {
++        Program p = programAt("/fw/renamed.bin");
++        when(p.getName()).thenReturn("raw");
++        assertSame(p, ProjectProgramProvider.match(List.of(p), "rename"));
++        assertSame(p, ProjectProgramProvider.match(List.of(p), "RAW"));
++        assertNull(ProjectProgramProvider.match(List.of(p), "other"));
++    }
++
      @Test
      public void bareNameShared_byTwoVersionsIsAmbiguousNotAGuess() {
          Program v1 = programAt("/1.10/D2Common.dll");
-@@ -316,6 +327,72 @@ public class ProjectProgramProviderTest {
+@@ -316,6 +336,72 @@ public class ProjectProgramProviderTest {
          assertArrayEquals(new Program[] {existing}, f.getAllOpenPrograms());
      }
  
@@ -1496,3 +1695,6 @@ index f48daed..263f5ae 100644
      def test_poll_survives_transient_status_errors(self):
          """A dropped connection mid-analysis must not kill the poll loop --
          it retries until the status endpoint answers."""
+-- 
+2.43.0
+

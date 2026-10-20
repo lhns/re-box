@@ -20,8 +20,14 @@ reuse rule below.
 
 `ProgramLoader.builder()` replaces `AutoImporter`. The destination still goes through
 `ProjectPaths` (scope, `..`), and refusals are `Refusal`s, not logged errors. Imports are
-serialized per destination folder and name. The bridge tool exposes the parameters (sending only
-non-default values) and its timeout goes 300 to 1800 s, because `wait=true` covers analysis.
+serialized per destination folder and name, through analysis: a `wait=false` import hands its
+destination to the worker thread, which leaves it when analysis is done. A failed import
+(analysis options, analysis) removes its program. A program saved by an import that has not
+finished carries a `ghidra-mcp import pending` flag in its program info, cleared once analysis is
+done; the next import of that name deletes such a program and imports again, whatever
+`if_exists` says, instead of reusing a program that never got its analysis. The bridge tool
+exposes the parameters (sending only non-default values) and its timeout goes 300 to 1800 s,
+because `wait=true` covers analysis.
 
 Fixes #
 
@@ -35,6 +41,10 @@ Fixes #
 - Two clients importing the same new file at once: the existence check and the import are not
   atomic, and Ghidra saves the second as `<name>.0`, a second program of the same bytes that
   tools then report as ambiguous. Now the second waits and reuses the first's program.
+- A server that dies during analysis left a saved, unanalyzed program that the next import of
+  the same file reused as if it were done (`reused_existing: true`, no analysis, ever). The
+  pending flag lets the next import tell, and redo it. The flag and the stored SHA-256 are read
+  from the project file's metadata, so the program is not opened to be judged.
 - Reuse: a same-named program was opened and reported as the import whatever it held, so
   importing a different build under the same name silently answered about the old one. It is now
   reused only if its recorded SHA-256 matches the file's (a program that records none is reused
@@ -44,16 +54,19 @@ Fixes #
 
 Behaviour notes: a program imported under another name is found by that name (the loader names
 the program after the source file; `ProjectProgramProvider.match` now also compares the project
-file name). Enum-valued analyzer options cannot be set and are refused with their type.
+file name, for exact and substring lookups). Enum-valued analyzer options cannot be set and are refused with their type.
 
 ## Tests you ran
 
 - [x] `./gradlew test --tests 'com.xebyte.offline.*' --tests 'com.xebyte.core.*' "-PGHIDRA_INSTALL_DIR=/opt/ghidra"`:
-      880 tests, 0 failures. New: `ImportRequestTest`; three reuse-rule cases and a name-match
-      case in `ProjectProgramProviderTest`; `ProgramImportGhidraTest` (real loaders and a real
-      project: BinaryLoader at `1000:0100`, named loader and `program_name`, unknown loader and
-      language refused, same bytes reused and other bytes refused, `unique`/`error`, unknown and
-      known analysis options, `wait=false`, four concurrent imports make one program).
+      884 tests, 0 failures. New: `ImportRequestTest`; three reuse-rule cases and two name-match
+      cases (exact and substring on the project file name) in `ProjectProgramProviderTest`;
+      `ProgramImportGhidraTest` (real loaders and a real project: BinaryLoader at `1000:0100`,
+      named loader and `program_name`, unknown loader and language refused, same bytes reused and
+      other bytes refused, `unique`/`error`, unknown and known analysis options, `wait=false`,
+      an import that never finished is deleted and redone under every `if_exists`, a finished
+      import carries no pending flag, a second import waits for a `wait=false` one instead of
+      deleting its program, four concurrent imports make one program).
 - [x] `uv run pytest tests/offline tests/unit`: green except
       `test_default_branch_constant_matches_git` (fails on any clone whose HEAD is `dev`; pre-existing).
       New bridge tests: payload forwarding, timeout, poll by path, poll reports `import_error`.

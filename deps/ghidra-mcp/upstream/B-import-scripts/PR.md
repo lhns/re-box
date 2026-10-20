@@ -13,7 +13,10 @@ Open after both are merged.
   starts from the file. The response carries `script_output`; a failed `wait=false` import is
   reported by `/analysis_status` (`Import failed: ...`).
 - New `GHIDRA_MCP_IMPORT_SCRIPT_ROOTS` (path list): scripts must lie under one of them (canonical
-  path, so symlinks do not escape). Unset: no restriction beyond the existing gate.
+  path, so symlinks do not escape). Unset: no restriction beyond the existing gate. Set but
+  naming no directory (empty after trimming, or only separators): no import script may run.
+- Post-scripts run under the server's write lock, like every other write to a program other
+  clients can see, and the import's pending flag (A) is cleared in the same transaction.
 - All script loads share one JVM-wide lock (`ImportScripts.LOAD_LOCK`), including
   `/run_ghidra_script`, which now also executes the instance it loaded instead of calling
   `runScript(name, args)` (that looked the script up and loaded it a second time).
@@ -43,22 +46,28 @@ wrapping `getScriptInstance` alone was not enough.
 - `GHIDRA_MCP_IMPORT_SCRIPT_ROOTS` is for the server that wants import scripts but not arbitrary
   ones: with the root set, a client can run the vetted scripts through an import and nothing else
   through it. It does not restrict `run_ghidra_script`; a deployment that denies that tool
-  elsewhere (a gateway deny list) keeps its deny.
+  elsewhere (a gateway deny list) keeps its deny. A variable that is set but names no directory
+  (`GHIDRA_MCP_IMPORT_SCRIPT_ROOTS=:`, or just blank) allows nothing: a stray separator must not
+  switch the restriction off.
 - Only absolute paths to existing `.java` files; checked on the canonical path.
 - Why not reuse `run_ghidra_script`'s copy into `~/ghidra_scripts`: a directory may ship its own
   bundle activator, and copying a client-named file there can replace a script of the same name.
   Import scripts enable the script's own directory as a bundle instead. Under the GUI this
   enables that directory in the running bundle host for the session (not persisted).
-- Scripts run on the request thread under the program's own script transaction, not under the
-  server's write lock; the program is not yet visible to other clients for a `wait=true` import
-  (imports of one destination are serialized).
+- Pre-scripts run on the request thread on the loaded program, before its first save, so no other
+  client can see it. Post-scripts run after analysis, when the program is in the project, under
+  the server's write lock (`executeWrite`), so a script's edits cannot merge into another
+  request's transaction. Imports of one destination are serialized through analysis and the
+  post-scripts.
 
 ## Tests you ran
 
 - [x] `./gradlew test --tests 'com.xebyte.offline.*' --tests 'com.xebyte.core.*' "-PGHIDRA_INSTALL_DIR=/opt/ghidra"`:
-      898 tests, 0 failures. New: `ImportScriptsTest` (request shape, the gate, roots, symlink),
-      `ImportScriptsGhidraTest` (real scripts: arguments, pre and post, failures leave nothing
-      behind, refusals before any import, concurrent loads, concurrent `/run_ghidra_script`).
+      905 tests, 0 failures (on top of A and C). New: `ImportScriptsTest` (request shape, the
+      gate, roots, roots set but naming no directory, symlink), `ImportScriptsGhidraTest` (real
+      scripts: arguments, pre and post, post-scripts inside the write transaction, failures leave
+      nothing behind, refusals before any import, roots set but naming no directory, concurrent
+      loads, concurrent `/run_ghidra_script`).
 - [x] `uv run pytest tests/offline tests/unit`: green except
       `test_default_branch_constant_matches_git` (pre-existing). New bridge tests: payload, poll
       stops on a removed import.

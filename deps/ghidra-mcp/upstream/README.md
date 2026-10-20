@@ -6,12 +6,14 @@ Against ghidra-mcp `dev` at `cf8b12db27eb139b28b90eaa3488306da910d759` (2026-10-
 here by concern. Patches are `git format-patch` output (`git am --keep-cr`); some contain CRLF
 lines on purpose (`.gitattributes` marks them `-text`).
 
+The table is sorted by letter, not by the order to open them in (see below).
+
 | Change | Patches | Size | Depends on |
 | --- | --- | --- | --- |
+| A. `import_file` loader options, `if_exists`, `wait`, serialization, unfinished-import redo | `A-import-loader-options/` (2 commits: move, feature) | 16 files, +1380 -192 | nothing |
+| B. `import_file` scripts, import script roots, script-load lock | `B-import-scripts/` | 20 files, +901 -48 | A and C |
 | C. Several roots in `GHIDRA_MCP_FILE_ROOT` | `C-file-roots/` | 7 files, +125 -27 | nothing |
 | D. `DirectThreadingStrategy.writeLock()` | `D-write-lock/` | 3 files, +66 -1 | nothing (builds on c30b7a74) |
-| A. `import_file` loader options, `if_exists`, `wait`, serialization | `A-import-loader-options/` (2 commits: move, feature) | 16 files, +1205 -191 | nothing |
-| B. `import_file` scripts, import script roots, script-load lock | `B-import-scripts/` | 19 files, +837 -37 | A and C |
 
 Each folder has `PR.md` (description in dev's PR template). `ISSUE-backport-c30b7a74.md` asks for
 c30b7a74 on `release/7.0`.
@@ -33,6 +35,7 @@ tested branches.
 Per change, in a container with Ghidra 12.1.4: `./gradlew test --tests 'com.xebyte.offline.*'`
 (plus `com.xebyte.core.*` for A and B, which includes the real-Ghidra tests) and `uv run pytest
 tests/offline tests/unit`. Baseline on `dev`: 765 offline tests, 0 failures. C 769, D 766,
-A 880, B 898 (offline + core), all green. The only Python failure on every branch and on plain
-`dev` is `test_default_branch_constant_matches_git` (the clone's HEAD is `dev`). Maven (the CI
-gate) and the live tiers were not run; `tests/endpoints.json` was edited by hand.
+A 884, B 905 (offline + core; B on top of A and C), all green. The only Python failure on every
+branch and on plain `dev` is `test_default_branch_constant_matches_git` (the clone's HEAD is
+`dev`). Maven (the CI gate) and the live tiers were not run; `tests/endpoints.json` was edited by
+hand.
