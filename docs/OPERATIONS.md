@@ -175,7 +175,9 @@ analyse very large binaries raise `JAVA_OPTS` and the limit with it. Measured on
   container start (unless preset); the JVM, the bridges and REA's attach helper inherit it and send
   `Authorization: Bearer <token>`. `/check_connection` and `/mcp/health` are exempt. It is not
   `REBOX_`-prefixed, so REA and the targets it runs can read it from their environment; accepted,
-  since they already run as the same uid and could reach the port anyway.
+  since they already run as the same uid and could reach the port anyway. So it stops callers that
+  only reach the port over the network (a web page); it is no boundary against code already running
+  as the service user.
 - Executed targets run as the same uid as the services, so they could reach the headless server
   or read a mounted token file; the network policy above is what contains them. The
   supervisor marks itself non-dumpable so its own environment is not readable through `/proc`.
