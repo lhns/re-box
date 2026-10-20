@@ -333,7 +333,7 @@ Rejected:
 - REA's analysis extensions (`REA_GHIDRA_NATIVEAOT_JAR`) are refused: the bridge would load their
   jars into the shared JVM. PSP targets need Ghidra's Allegrex extension, which the image does
   not ship (unchanged).
-- Memory: REA's programs live in the shared heap (`JAVA_OPTS`, `-Xmx8g`); a session costs about
+- Memory: REA's programs live in the shared heap (half the container limit, `-XX:MaxRAMPercentage=50`); a session costs about
   0.5 GiB outside it (rea node, helper, bridge).
 - Maintenance per REA release (it ships about daily): the build tests the patch anchors and the
   helper's mapping of every profile against the pinned REA and recompiles the patched bridge; a

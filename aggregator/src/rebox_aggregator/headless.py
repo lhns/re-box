@@ -71,12 +71,20 @@ def install_attach_script(cfg: SupervisorConfig) -> None:
         log("rea_attach_install", "warn", error=str(e)[:300])
 
 
+# The heap follows the container's memory limit (or the host's memory without one), so nobody has to
+# size -Xmx; the G1 flags give heap back after a burst. JAVA_OPTS comes after: an -Xmx there wins.
+JVM_FLAGS = (
+    "-XX:MaxRAMPercentage=50", "-XX:+UseG1GC", "-XX:G1PeriodicGCInterval=60000",
+    "-XX:G1PeriodicGCSystemLoadThreshold=0", "-XX:MinHeapFreeRatio=10", "-XX:MaxHeapFreeRatio=30",
+)
+
+
 def headless_command(cfg: SupervisorConfig) -> list[str]:
     jars = [cfg.jar]
     for group in ("Framework", "Features", "Processors"):
         jars += sorted(glob.glob(f"{cfg.ghidra_dir}/Ghidra/{group}/*/lib/*.jar"))
     return [
-        "java", *cfg.java_opts, "-Djava.awt.headless=true", f"-Dghidra.home={cfg.ghidra_dir}",
+        "java", *JVM_FLAGS, *cfg.java_opts, "-Djava.awt.headless=true", f"-Dghidra.home={cfg.ghidra_dir}",
         f"-Duser.home={cfg.state_dir / 'home'}",  # the JVM takes it from passwd, not $HOME
         "-Dapplication.name=GhidraMCP", "-classpath", ":".join(jars),
         "com.xebyte.headless.GhidraMCPHeadlessServer", "--port", str(HEADLESS_PORT), "--bind", "127.0.0.1",

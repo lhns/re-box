@@ -291,9 +291,8 @@ COPY rootfs/etc/rebox/ /etc/rebox/
 # REA's workflow skill for the client side, with tool names prefixed as the aggregator serves
 # them. Extract: docker run --rm <image> tar -C /opt/rebox/skills -c . | tar -x -C ~/.claude/skills
 RUN python3 /usr/local/lib/rebox/rewrite-skill.py /opt/rea/node_modules/rea-agents/skills /opt/rebox/skills rea_
-# Defaults; docs/OPERATIONS.md explains each. Memory: the JAVA_OPTS heap holds ghidra-mcp's and
-# REA's programs (REA attaches to that JVM); these fit 16 GiB. The G1 flags give heap back after
-# a burst.
+# Defaults; docs/OPERATIONS.md explains each. Memory: the shared Ghidra JVM's heap is half the
+# container's memory limit (headless.py JVM_FLAGS); JAVA_OPTS only adds flags.
 # GHIDRA_MCP_ALLOW_SCRIPTS: REA's bridge is started through ghidra-mcp's script endpoint; the
 # aggregator denies the script tools to clients (aggregator.toml), and 8089 is loopback-only and token-protected.
 ENV RE_WORKDIR=/work \
@@ -302,7 +301,6 @@ ENV RE_WORKDIR=/work \
     REBOX_SESSION_IDLE_TIMEOUT=1800 \
     REBOX_GHIDRA_IDLE_TIMEOUT=300 \
     REBOX_AUTOSAVE_INTERVAL=300 \
-    JAVA_OPTS="-Xmx8g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30" \
     GHIDRA_MCP_ALLOW_SCRIPTS=1 \
     GHIDRA_MCP_LAZY=0 \
     GHIDRA_MCP_LOG_LEVEL=WARNING \

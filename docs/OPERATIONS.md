@@ -46,7 +46,7 @@ Design: `aggregator/README.md`; why: `docs/DECISIONS.md`.
 | `REBOX_REA_ATTACH_HELPER` | `/opt/rebox/rea-attach/helper.mjs` | set in the rea child's `[child.env]`; REA's patched launcher starts it instead of a JVM. Unset: REA's Ghidra provider refuses to start |
 | `REBOX_REA_ATTACH` | unset | `0` in the rea child's `[child.env]` (debugging only): REA starts its own Ghidra JVMs again; their heap is `GHIDRA_HEADLESS_MAXMEM` (REA's default 2G), which matters only then |
 | `PUID` / `PGID` | `1000` | owner of files written to `RE_WORKDIR`; only applied when the container starts as root (below) |
-| `JAVA_OPTS` | `-Xmx8g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30` | the shared Ghidra JVM, which also holds the programs REA opens; the G1 flags return heap to the OS after a burst |
+| `JAVA_OPTS` | unset | extra flags for the shared Ghidra JVM, after re-box's own: heap = 50% of the container's memory limit (`-XX:MaxRAMPercentage=50`; without a limit, of the host's or VM's memory) and G1 flags that return heap after a burst (`headless.py` `JVM_FLAGS`). An `-Xmx` here overrides the percentage |
 | `REA_JADX_HEAP_MIB` | `2048` | heap of REA's JADX JVM for Android work |
 | `GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS` | `1`, forced | every program-scoped ghidra-mcp call must name its program; the project is shared |
 | `GHIDRA_MCP_ALLOW_SCRIPTS` | `1` | needed by REA's attach (its bridge is started through ghidra-mcp's script endpoint); clients still cannot run scripts, the aggregator denies `run_ghidra_script`, `run_script_inline` and `delete_project`. `0` breaks REA's Ghidra sessions unless `REBOX_REA_ATTACH` is `0` |
@@ -112,26 +112,28 @@ macOS-only features.
 Per container:
 
 ```
-limit ≥ (JAVA_OPTS -Xmx + 1 GiB)                                shared Ghidra JVM (ghidra-mcp and REA)
+limit ≥ (heap + 1 GiB)                                          shared Ghidra JVM (ghidra-mcp and REA)
       + REBOX_MAX_SESSIONS × 0.5 GiB                            rea node, attach helper, bridge
       + 1 GiB                                                   supervisor, aggregator, page cache
       [+ (REA_JADX_HEAP_MIB + 0.5 GiB) per concurrent Android analysis]
 ```
 
+The heap is half the limit, so this comes down to `limit ≥ 4 GiB + REBOX_MAX_SESSIONS × 1 GiB`
+(plus Android analyses).
+
 REA opens its targets in the shared JVM (docs/DECISIONS.md, "REA attaches to the ghidra-mcp
-JVM"). Defaults: (8 + 1) + 4 × 0.5 + 1 = 12 GiB, under the compose example's 16 GiB limit with
-room for an Android analysis. The shared heap holds every open program: one small binary
-measured 0.4 GiB RSS for the whole JVM, a small PE after analysis 1.3 GiB; size `-Xmx` for the
-programs open at once across all sessions, not per session. A REA session with
+JVM"). The compose example's 16 GiB limit gives an 8 GiB heap: (8 + 1) + 4 × 0.5 + 1 = 12 GiB,
+with room for an Android analysis. The shared heap holds every open program: one small binary
+measured 0.4 GiB RSS for the whole JVM, a small PE after analysis 1.3 GiB; size the heap for the
+programs open at once across all sessions, not per session, by raising the limit. A REA session with
 no Ghidra call yet costs about 0.2 GiB; the headless server idles at about 130 MB RSS (measured)
 and is gone entirely `REBOX_GHIDRA_IDLE_TIMEOUT` after the last session.
 
-**Less memory** (e.g. Docker Desktop / WSL2 with 8 GB for the VM): `REBOX_MAX_SESSIONS=2`,
-`JAVA_OPTS="-Xmx4g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30"` (setting it replaces the default, so keep the G1 flags), container limit 7g: the formula gives
-(4 + 1) + 2 × 0.5 + 1 = 7 GiB. With a 10 GB VM use `--memory 8g` and `-Xmx5g`. Docker
-Desktop's VM limit (Settings, Resources, or `.wslconfig` `memory=`) must be at least the container
-limit. To fit less memory lower `REBOX_MAX_SESSIONS` first; to
-analyse very large binaries raise `JAVA_OPTS` and the limit with it. Measured on the test fixtures: see docs/BUILDING.md.
+**Less memory** (e.g. Docker Desktop / WSL2 with 8 GB for the VM): `--memory 7g` and
+`REBOX_MAX_SESSIONS=2` (heap 3.5 GiB: 4.5 + 1 + 1 = 6.5 GiB). With a 10 GB VM use `--memory 8g`.
+Docker Desktop's VM limit (Settings, Resources, or `.wslconfig` `memory=`) must be at least the
+container limit. To fit less memory lower `REBOX_MAX_SESSIONS` first; to analyse very large
+binaries raise the limit. Measured on the test fixtures: see docs/BUILDING.md.
 
 ## Health, logs, shutdown
 

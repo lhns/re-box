@@ -59,12 +59,11 @@ with a native Linux path.
 
 ### Less memory (Docker Desktop with 8 GB)
 
-The defaults fit a 16 GB container. Docker Desktop's VM must hold the container limit (Settings,
-Resources, or `memory=` in `.wslconfig`). For an 8 GB VM (`JAVA_OPTS` replaces the default, so it
-repeats the G1 flags that hand heap back after a burst):
+Ghidra's heap is half the container's memory limit, so the limit is the one knob. Docker
+Desktop's VM must hold it (Settings, Resources, or `memory=` in `.wslconfig`). For an 8 GB VM:
 
 ```sh
--e REBOX_MAX_SESSIONS=2 --memory 7g -e JAVA_OPTS="-Xmx4g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30"
+--memory 7g -e REBOX_MAX_SESSIONS=2
 ```
 
 Sizing: [docs/OPERATIONS.md](docs/OPERATIONS.md), "Memory".

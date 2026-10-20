@@ -11,7 +11,7 @@ import pytest
 
 from rebox_aggregator import log as rlog
 from rebox_aggregator.config import ConfigError
-from rebox_aggregator.headless import Headless, ProjectError, ensure_project, headless_command
+from rebox_aggregator.headless import JVM_FLAGS, Headless, ProjectError, ensure_project, headless_command
 from rebox_aggregator.supervisor import apply_state_env, ensure_mcp_auth_token, validate
 
 pytestmark = pytest.mark.anyio
@@ -142,7 +142,9 @@ def test_projects_dir_override_anywhere(tmp_path):
 
 def test_headless_command(tmp_path):
     cmd = headless_command(validate(env(tmp_path, JAVA_OPTS="-Xmx2g -Dx=y", GHIDRA_INSTALL_DIR="/g")))
-    assert cmd[:3] == ["java", "-Xmx2g", "-Dx=y"]
+    n = len(JVM_FLAGS)
+    assert cmd[: n + 3] == ["java", *JVM_FLAGS, "-Xmx2g", "-Dx=y"]  # JAVA_OPTS after the defaults: its -Xmx wins
+    assert "-XX:MaxRAMPercentage=50" in JVM_FLAGS
     state = tmp_path / "re-box-state"
     assert "-Dghidra.home=/g" in cmd and f"-Duser.home={state}/home" in cmd
     assert cmd[-7:] == ["com.xebyte.headless.GhidraMCPHeadlessServer", "--port", "8089", "--bind", "127.0.0.1",
