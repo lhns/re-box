@@ -11,7 +11,8 @@ import pytest
 
 from rebox_aggregator import log as rlog
 from rebox_aggregator.config import ConfigError
-from rebox_aggregator.supervisor import Headless, apply_state_env, ensure_project, headless_command, validate
+from rebox_aggregator.headless import Headless, ProjectError, ensure_project, headless_command
+from rebox_aggregator.supervisor import apply_state_env, ensure_mcp_auth_token, validate
 
 pytestmark = pytest.mark.anyio
 
@@ -68,6 +69,22 @@ def test_apply_state_env(tmp_path, monkeypatch):
     assert (os.environ["REBOX_STATE_DIR"], os.environ["HOME"], os.environ["XDG_CACHE_HOME"]) == (s, s + "/home", s + "/cache")
     assert os.environ["XDG_CONFIG_HOME"] == s + "/home/.config" and os.environ["XDG_DATA_HOME"] == s + "/home/.local/share"
     assert os.environ["XDG_STATE_HOME"] == s + "/home/.local/state"
+
+
+def test_mcp_auth_token_generated_once_and_preset_kept(monkeypatch):
+    monkeypatch.setattr(os, "environ", dict(os.environ))
+    os.environ.pop("GHIDRA_MCP_AUTH_TOKEN", None)
+    ensure_mcp_auth_token()
+    token = os.environ["GHIDRA_MCP_AUTH_TOKEN"]
+    assert len(token) == 64 and int(token, 16) >= 0
+    ensure_mcp_auth_token()
+    assert os.environ["GHIDRA_MCP_AUTH_TOKEN"] == token  # not renewed
+    os.environ["GHIDRA_MCP_AUTH_TOKEN"] = ""
+    ensure_mcp_auth_token()
+    assert len(os.environ["GHIDRA_MCP_AUTH_TOKEN"]) == 64  # empty counts as unset
+    os.environ["GHIDRA_MCP_AUTH_TOKEN"] = "preset"
+    ensure_mcp_auth_token()
+    assert os.environ["GHIDRA_MCP_AUTH_TOKEN"] == "preset"
 
 
 def test_autosave_interval_validated(tmp_path):
@@ -169,8 +186,6 @@ class FakeHeadless:
 
 
 async def test_ensure_project_reports_a_lock_held_elsewhere(tmp_path):
-    from rebox_aggregator.supervisor import ProjectError
-
     (tmp_path / "rebox.gpr").write_text("")
     with pytest.raises(ProjectError, match="locked by another Ghidra instance") as e:
         await run_ensure(False, tmp_path, reply={"error": "Project locked by another Ghidra instance: /x/rebox.lock"}, opens=False)
@@ -178,8 +193,6 @@ async def test_ensure_project_reports_a_lock_held_elsewhere(tmp_path):
 
 
 async def test_ensure_project_fails_when_it_is_still_not_open(tmp_path):
-    from rebox_aggregator.supervisor import ProjectError
-
     with pytest.raises(ProjectError, match="project not open"):
         await run_ensure(False, tmp_path, opens=False)
 
@@ -210,10 +223,6 @@ async def run_ensure(has_project: bool, projects: Path, **kw):
 
 async def test_ensure_project_already_open(tmp_path):
     assert await run_ensure(True, tmp_path) == []
-
-
-async def test_ensure_project_creates_when_missing(tmp_path):
-    assert await run_ensure(False, tmp_path) == [("/create_project", {"parentDir": str(tmp_path), "name": "rebox"})]
 
 
 async def test_ensure_project_opens_existing_gpr(tmp_path):

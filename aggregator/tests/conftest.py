@@ -16,10 +16,12 @@ from mcp.client.streamable_http import streamable_http_client
 
 from rebox_aggregator import log as rlog
 from rebox_aggregator.app import App, make_server
-from rebox_aggregator.config import ChildSpec, Settings
+from rebox_aggregator.config import ChildSpec, Settings, load_texts
 
 FAKE = str(Path(__file__).parent / "fakes" / "fake_server.py")
 TOKEN = "s3cret-token"
+_REPO_CONFIG = Path(__file__).parents[2] / "rootfs/etc/rebox/aggregator.toml"
+SHIPPED_CONFIG = str(_REPO_CONFIG if _REPO_CONFIG.exists() else "/etc/rebox/aggregator.toml")  # in the image: the installed copy
 
 
 @pytest.fixture
@@ -90,16 +92,18 @@ def run_app(children=None, **overrides):
         children=tuple(children or [fake_spec("a", "a_"), fake_spec("b", "b_")]),
         port=free_port(),
         bind="127.0.0.1",
-        **{"max_sessions": 4, "idle_timeout": 600.0, "child_grace": 2.0, **overrides},
+        **{"max_sessions": 4, "idle_timeout": 600.0, "child_grace": 2.0, **load_texts(SHIPPED_CONFIG), **overrides},
     )
     app = App(settings, instance="testinstance")
     server = make_server(app)
     loops: list = []
 
+    async def main() -> None:
+        loops.append(asyncio.get_running_loop())
+        await server.serve()
+
     def serve() -> None:
-        loop = asyncio.new_event_loop()
-        loops.append(loop)
-        loop.run_until_complete(server.serve())
+        asyncio.run(main())  # cancels what the server leaves running (sse_starlette tasks) and closes the loop
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()

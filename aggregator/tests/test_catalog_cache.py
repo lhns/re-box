@@ -190,6 +190,40 @@ async def test_replaced_cache_is_announced_on_the_standalone_stream(tmp_path):
             assert "a_ghost" not in {t.name for t in (await c.list_tools()).tools}
 
 
+async def test_resync_announces_every_changed_kind_without_the_childs_list_changed(tmp_path):
+    # The bridge connects quietly (no list_changed of its own): the aggregator re-lists it after on_ready and
+    # announces what changed against the cache, here tools (ghost gone) and prompts (none cached).
+    from mcp_types import PromptListChangedNotification, ToolListChangedNotification
+
+    seed(tmp_path)
+    got: set = set()
+
+    async def handler(message):
+        if isinstance(message, (ToolListChangedNotification, PromptListChangedNotification)):
+            got.add(type(message).__name__)
+
+    with run_app([spec(FAKE_QUIET_CONNECT="1")], state_dir=str(tmp_path), autosave_interval=0, start_timeout=30.0) as r:
+        backend = r.app.backend = FakeBackend(ready=False)
+        async with r.client(message_handler=handler) as c:
+            assert not (await c.list_prompts()).prompts
+            backend.is_ready, backend.state = True, "ready"
+            r.on_loop(r.app.backend_became_ready)
+            assert await wait_until(lambda: len(got) == 2, 10), got
+            assert "a_ghost" not in {t.name for t in (await c.list_tools()).tools}
+            assert {p.name for p in (await c.list_prompts()).prompts} == {"a_greet"}
+
+
+async def test_ready_backend_without_a_cache_lists_the_connected_bridge(tmp_path):
+    # Ghidra is up but nothing is cached and the bridge booted unconnected: the first list must still be complete.
+    with run_app([spec()], state_dir=str(tmp_path), autosave_interval=0, start_timeout=30.0) as r:
+        r.app.backend = FakeBackend(ready=True)
+        async with r.raw() as http:
+            sid, _ = await raw_init(http, r.url)
+            assert {"a_echo", "a_pid"} <= await tool_names(http, r, sid)
+        assert await wait_until(cache_file(tmp_path).exists, 5)
+        assert "echo" in {t["name"] for t in json.loads(cache_file(tmp_path).read_text())["tools"]}
+
+
 async def test_live_backend_at_open_writes_the_cache(tmp_path):
     with run_app([spec(cold=False)], state_dir=str(tmp_path), autosave_interval=0) as r:
         r.app.backend = FakeBackend(ready=True)

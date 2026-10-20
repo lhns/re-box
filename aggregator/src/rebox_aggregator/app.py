@@ -8,8 +8,6 @@ import re
 import signal
 import sys
 import uuid
-from collections.abc import Callable
-
 import anyio
 import anyio.abc
 import uvicorn
@@ -18,9 +16,7 @@ from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS
 
 from .config import ConfigError, Settings, harden, load_settings
 from .log import log
-from .session import Session
-
-Health = Callable[[], tuple[bool, str, str]]  # (ok, reason, backend state)
+from .session import NoBackend, Session
 
 
 def instance_id() -> str:
@@ -29,24 +25,11 @@ def instance_id() -> str:
     return given if re.fullmatch(r"[A-Za-z0-9_-]{1,64}", given) else uuid.uuid4().hex
 
 
-class NoBackend:
-    """Stand-in for the supervisor's Ghidra lifecycle when the app runs on its own."""
-
-    def want(self, wanted: bool) -> None: ...
-
-    def ready(self) -> bool:
-        return True
-
-    def status(self) -> tuple[str, str]:
-        return "ready", ""
-
-
 class App:
-    def __init__(self, settings: Settings, *, instance: str | None = None, health: Health | None = None):
+    def __init__(self, settings: Settings, *, instance: str | None = None):
         self.settings = settings
         self.instance = instance or instance_id()
-        self.health = health or (lambda: (True, "", ""))
-        self.backend = NoBackend()  # the supervisor swaps in the Ghidra lifecycle: want(bool), ready()
+        self.backend = NoBackend()  # the supervisor swaps in the Ghidra lifecycle (headless.Headless)
         self.sessions: dict[str, Session] = {}
         self.closing = False
         self._tg: anyio.abc.TaskGroup | None = None
@@ -68,7 +51,7 @@ class App:
             return
         path = scope["path"]
         if path == "/healthz":
-            ok, reason, state = self.health()
+            ok, reason, state = self.backend.health()
             body = {"status": "ok"} if ok else {"status": "unavailable", "reason": reason}
             if state:
                 body["ghidra"] = state
@@ -161,8 +144,7 @@ class App:
         assert self._tg is not None
         transport = StreamableHTTPServerTransport(mcp_session_id=uuid.uuid4().hex)
         session = Session(
-            transport.mcp_session_id, transport, self.settings, self.instance, self._forget,  # type: ignore[arg-type]
-            lambda: self.backend.ready(), lambda: self.backend.status(),
+            transport.mcp_session_id, transport, self.settings, self.instance, self._forget, self.backend,  # type: ignore[arg-type]
         )
         self.sessions[session.sid] = session
         self.backend.want(True)
@@ -264,7 +246,7 @@ def make_server(app: App) -> uvicorn.Server:
     return _Server(config)
 
 
-async def serve(app: App, *, started: Callable[[uvicorn.Server], None] | None = None) -> None:
+async def serve(app: App) -> None:
     """Run uvicorn until SIGTERM/SIGINT; sessions are closed by the app's lifespan shutdown."""
     server = make_server(app)
     async with anyio.create_task_group() as tg:
@@ -276,8 +258,6 @@ async def serve(app: App, *, started: Callable[[uvicorn.Server], None] | None = 
                     return
 
         tg.start_soon(watch_signals)
-        if started:
-            started(server)
         await server.serve()
         tg.cancel_scope.cancel()
 

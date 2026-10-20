@@ -1,34 +1,32 @@
 """The catalog cache: a child's full tool list, remembered so a session can advertise it before the
 shared backend (Ghidra) is up, plus the session-less warm-up that fills it."""
 
-import itertools
 import json
 import os
 import re
-import signal
-import subprocess
 import tempfile
 import threading
 from pathlib import Path
 from typing import Any
 
 import anyio
-from anyio.streams.buffered import BufferedByteReceiveStream
+from mcp.shared.exceptions import MCPError
 from mcp_types.version import LATEST_HANDSHAKE_VERSION
 
 from . import __version__
 from .catalog import ChildCatalog
-from .config import ChildSpec
+from .children import Child
+from .config import ChildSpec, child_env
 from .log import log
 
-MAX_LINE = 64 * 1024 * 1024
 _save_lock = threading.Lock()  # sessions save from worker threads; compare-and-write must not interleave
 
 
-def resolve_key(spec: ChildSpec, environ: dict[str, str] | None = None) -> str:
-    """spec.catalog_cache.key with {NAME} and {file:/path} filled in, reduced to filename-safe characters."""
+def resolve_key(spec: ChildSpec) -> str:
+    """spec.catalog_cache.key with {NAME} (the child's environment) and {file:/path} filled in, reduced to
+    filename-safe characters."""
     assert spec.catalog_cache
-    env = {**(os.environ if environ is None else environ), **spec.env}
+    env = {**os.environ, **child_env(spec, os.environ)}
 
     def fill(m: re.Match) -> str:
         name = m.group(1)
@@ -42,8 +40,13 @@ def resolve_key(spec: ChildSpec, environ: dict[str, str] | None = None) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", re.sub(r"\{([^{}]+)\}", fill, spec.catalog_cache.key))
 
 
-def path_for(state_dir: str, spec: ChildSpec, environ: dict[str, str] | None = None) -> Path:
-    return Path(state_dir) / "cache" / "rebox-catalog" / f"{spec.name}-{resolve_key(spec, environ)}.json"
+def path_for(state_dir: str, spec: ChildSpec) -> Path:
+    return Path(state_dir) / "cache" / "rebox-catalog" / f"{spec.name}-{resolve_key(spec)}.json"
+
+
+def is_partial(part: ChildCatalog, full: ChildCatalog) -> bool:
+    """Fewer tools than a listing of the same child (and cache key): the bridge was not connected yet."""
+    return len(part.tools) < len(full.tools)
 
 
 def load(state_dir: str, spec: ChildSpec) -> ChildCatalog | None:
@@ -73,7 +76,7 @@ def _save(target: Path, spec: ChildSpec, part: ChildCatalog, body: str) -> bool:
             old = target.read_text()
             if old == body:
                 return False
-            if len(json.loads(old).get("tools", ())) > len(part.tools):
+            if is_partial(part, ChildCatalog(tools=list(json.loads(old).get("tools", ())))):
                 # The key names what changes a catalog, so a smaller one is a bridge that was not
                 # connected yet; keeping the bigger one is the safe side.
                 log("catalog_cache_kept", "warn", child=spec.name, tools=len(part.tools))
@@ -97,64 +100,32 @@ def _save(target: Path, spec: ChildSpec, part: ChildCatalog, body: str) -> bool:
     return True
 
 
-async def fetch_catalog(spec: ChildSpec, env: dict[str, str]) -> ChildCatalog:
-    """Run the child once like a session would (initialize, on_ready, list) and return its catalog.
-    The caller makes sure the backend is up first. The child's process group is killed afterwards."""
-    proc = await anyio.open_process(
-        list(spec.command), stdin=-1, stdout=-1, stderr=subprocess.DEVNULL, env=env, start_new_session=True
-    )
-    ids = itertools.count(1)
-    try:
-        assert proc.stdin and proc.stdout
-        out = BufferedByteReceiveStream(proc.stdout)
+class _NoClient:
+    """The warm-up's child has no client behind it."""
 
-        async def send(msg: dict) -> None:
-            await proc.stdin.send(json.dumps(msg).encode() + b"\n")  # type: ignore[union-attr]
+    async def on_request(self, child: Child, ctx: Any, method: str, params: Any) -> dict:
+        if method == "ping":
+            return {}
+        raise MCPError(-32601, f"{method}: no client during the catalog warm-up")
 
-        async def rpc(method: str, params: dict | None = None) -> dict:
-            rid = next(ids)
-            await send({"jsonrpc": "2.0", "id": rid, "method": method, **({"params": params} if params else {})})
-            while True:
-                msg = json.loads(await out.receive_until(b"\n", MAX_LINE))
-                if isinstance(msg, dict) and msg.get("id") == rid and "method" not in msg:
-                    if "error" in msg:
-                        raise RuntimeError(f"{method}: {msg['error'].get('message')}")
-                    return msg.get("result") or {}
+    def on_notification(self, child: Child, method: str, params: Any) -> None: ...
 
-        async def listing(method: str, key: str) -> list[dict]:
-            items: list[dict] = []
-            cursor = None
-            while True:
-                r = await rpc(method, {"cursor": cursor} if cursor else None)
-                items += r.get(key, [])
-                cursor = r.get("nextCursor")
-                if not cursor:
-                    return items
+    async def on_exit(self, child: Child) -> None: ...
 
-        init = await rpc("initialize", {
-            "protocolVersion": LATEST_HANDSHAKE_VERSION, "capabilities": {},
-            "clientInfo": {"name": "rebox-warmup", "version": __version__},
-        })
-        await send({"jsonrpc": "2.0", "method": "notifications/initialized"})
-        if spec.on_ready:
-            await rpc("tools/call", {"name": spec.on_ready.tool, "arguments": dict(spec.on_ready.arguments)})
-        caps: dict[str, Any] = init.get("capabilities") or {}
-        part = ChildCatalog()
-        if "tools" in caps:
-            part.tools = await listing("tools/list", "tools")
-        if "prompts" in caps:
-            part.prompts = await listing("prompts/list", "prompts")
-        if "resources" in caps:
-            part.resources = await listing("resources/list", "resources")
-            try:
-                part.templates = await listing("resources/templates/list", "resourceTemplates")
-            except RuntimeError:
-                pass
-        return part
-    finally:
-        with anyio.CancelScope(shield=True):
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            await proc.wait()
+
+async def fetch_catalog(spec: ChildSpec, env: dict[str, str], grace: float) -> ChildCatalog:
+    """Run the child once like a session would (handshake, on_ready, list) and return its catalog.
+    The caller makes sure the backend is up first."""
+    child = Child(spec, "warmup", env, grace, _NoClient())
+    async with anyio.create_task_group() as tg:
+        try:
+            await child.open(tg, {
+                "protocolVersion": LATEST_HANDSHAKE_VERSION, "capabilities": {},
+                "clientInfo": {"name": "rebox-warmup", "version": __version__},
+            })
+            if spec.on_ready:
+                await child.request("tools/call", {"name": spec.on_ready.tool, "arguments": dict(spec.on_ready.arguments)})
+            return await child.list_catalog()
+        finally:
+            await child.close()
+            tg.cancel_scope.cancel()

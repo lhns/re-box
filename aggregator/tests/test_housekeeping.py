@@ -2,7 +2,7 @@ import os
 import time
 
 from rebox_aggregator import log as rlog
-from rebox_aggregator.housekeeping import dir_size, prune_rolled_logs, remove_partial_exports, sweep_tmp
+from rebox_aggregator.housekeeping import dir_size, prune_evidence, prune_rolled_logs, remove_partial_exports, sweep_tmp
 
 
 def captured(fn, *a):
@@ -27,10 +27,12 @@ def test_sweep_tmp_removes_only_known_patterns(tmp_path):
     (tmp_path / "rea-ghidra-abc123").mkdir()
     (tmp_path / "rea-ghidra-abc123" / "target.bin").write_bytes(b"x" * 100)
     (tmp_path / "rea-other").write_bytes(b"12")
-    locks = tmp_path / "rebox-attach-locks"
+    locks = tmp_path / "rebox-attach-locks-1000"  # per uid, like REA's TMPDIR
     locks.mkdir()
     (locks / "a.lock").write_text("")
     (locks / "keep.txt").write_text("")
+    (tmp_path / "rebox-attach-locks-4321").mkdir()
+    (tmp_path / "rebox-attach-locks-4321" / "b.lock").write_text("")
     for uid in ("1000", "4321"):  # REA's TMPDIR, named after the service uid
         (tmp_path / f"rebox-rea-{uid}" / f"rea-ghidra-{uid}").mkdir(parents=True)
         (tmp_path / f"rebox-rea-{uid}" / f"rea-ghidra-{uid}" / "target.bin").write_bytes(b"x" * 10)
@@ -41,13 +43,14 @@ def test_sweep_tmp_removes_only_known_patterns(tmp_path):
     (tmp_path / "rebox-e2e" / "f").write_text("")
     (tmp_path / "rebox-e2e" / "rea-nested").mkdir()
     (res, freed), events = captured(sweep_tmp, str(tmp_path))
-    assert res == 5 and freed == 122
+    assert res == 6 and freed == 122
     assert not (tmp_path / "rea-ghidra-abc123").exists() and not (tmp_path / "rea-other").exists()
     assert not list(tmp_path.glob("rebox-rea-*/rea-*")) and (tmp_path / "rebox-rea-1000" / "other").exists()
     assert not (locks / "a.lock").exists() and (locks / "keep.txt").exists()
+    assert not (tmp_path / "rebox-attach-locks-4321").exists()  # emptied, so gone
     assert all(k.exists() for k in keep) and (tmp_path / "rebox-e2e" / "f").exists()
     assert (tmp_path / "rebox-e2e" / "rea-nested").exists()
-    assert [(e["event"], e["removed"], e["bytes"]) for e in events] == [("tmp_swept", 5, 122)]
+    assert [(e["event"], e["removed"], e["bytes"]) for e in events] == [("tmp_swept", 6, 122)]
 
 
 def test_sweep_tmp_does_not_follow_symlinks(tmp_path):
@@ -77,6 +80,21 @@ def test_partial_exports_removed_at_any_age(tmp_path):
     (tmp_path / "s.json").write_text("{}")
     assert remove_partial_exports(str(tmp_path)) == 1
     assert [p.name for p in tmp_path.iterdir()] == ["s.json"]
+
+
+def test_prune_evidence_deletes_by_age(tmp_path):
+    old, new, other = tmp_path / "old.json", tmp_path / "new.json", tmp_path / "keep.txt"
+    for p in (old, new, other):
+        p.write_text("{}")
+    now = time.time()
+    os.utime(old, (now - 40 * 86400,) * 2)
+    os.utime(other, (now - 40 * 86400,) * 2)
+    (res, events) = captured(prune_evidence, str(tmp_path), 30)
+    assert res == 1 and [e["event"] for e in events] == ["evidence_pruned"]
+    assert not old.exists() and new.exists() and other.exists()
+    os.utime(new, (now - 40 * 86400,) * 2)
+    assert prune_evidence(str(tmp_path), 0) == 0 and new.exists()  # 0 keeps everything
+    assert prune_evidence(str(tmp_path / "missing"), 30) == 0
 
 
 def test_rolled_logs_pruned_by_age(tmp_path):

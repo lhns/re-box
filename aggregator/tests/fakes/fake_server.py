@@ -1,8 +1,10 @@
 """Raw JSON-RPC stdio MCP server (no SDK) for the aggregator tests.
 
 Env: FAKE_EXTRA_TOOLS=a,b adds no-op tools; FAKE_BIG=N adds a tool whose description is N bytes;
-FAKE_COLD=1 lists only connect_instance/get_connects until connect_instance is called (a bridge without its backend);
-FAKE_SAVE_SLEEP=N delays the `save` tool (it writes its `path` argument); FAKE_FAIL_INIT=1 exits during initialize; FAKE_HANG_INIT=1 never answers it.
+FAKE_COLD=1 lists only connect_instance/get_connects and no prompts until connect_instance is called (a bridge without
+its backend); FAKE_QUIET_CONNECT=1: connect_instance sends no list_changed; FAKE_RESOURCES=1 advertises resources (with
+templates and subscribe) and completions; FAKE_SAVE_SLEEP=N delays the `save` tool (it writes its `path` argument);
+FAKE_FAIL_INIT=1 exits during initialize; FAKE_HANG_INIT=1 never answers it.
 """
 
 import asyncio
@@ -20,6 +22,7 @@ cancel_events: dict = {}
 extra_tools: list[str] = []
 saves: list[str] = []
 connects: list = []
+seen: dict[str, list] = {"subscribed": [], "unsubscribed": [], "levels": []}
 
 
 def tool(name, props=None):
@@ -31,7 +34,8 @@ def tools():
     if os.environ.get("FAKE_COLD") and not connects:  # a bridge whose backend is not up: static tools only
         return [tool("connect_instance"), tool("get_connects")]
     names = ["echo", "pid", "env", "set_state", "get_state", "slow", "get_cancelled", "progress",
-             "add_tool", "crash", "spawn", "structured", "fail", "ask_roots", "bad_msgs", "save", "sleep", "connect_instance", "get_connects"]
+             "add_tool", "crash", "spawn", "structured", "fail", "ask_roots", "bad_msgs", "save", "sleep", "connect_instance", "get_connects",
+             "seen"]
     out = [tool(n) for n in names + os.environ.get("FAKE_EXTRA_TOOLS", "").split(",") + extra_tools if n]
     if os.environ.get("FAKE_BIG"):
         t = tool("big")
@@ -70,10 +74,13 @@ async def call(rid, name, args, meta):
         return text("slept")
     if name == "connect_instance":
         connects.append(args)
-        send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
+        if not os.environ.get("FAKE_QUIET_CONNECT"):
+            send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
         return text("connected")
     if name == "get_connects":
         return text(json.dumps(connects))
+    if name == "seen":
+        return text(json.dumps(seen))
     if name == "pid":
         return text(str(os.getpid()))
     if name == "env":
@@ -109,6 +116,8 @@ async def call(rid, name, args, meta):
     if name == "fail":
         return text("boom", isError=True)
     if name == "bad_msgs":  # hostile ids and tokens
+        if args.get("hold"):  # arrives while the aggregator holds this child's responses for a catalog refresh
+            send({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})
         send({"jsonrpc": "2.0", "id": [1], "method": "roots/list"})
         send({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progressToken": [1], "progress": 1}})
         send({"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": [1]}})
@@ -138,18 +147,37 @@ async def handle(msg):
             await asyncio.sleep(1e6)
         if os.environ.get("FAKE_FAIL_INIT"):
             os._exit(1)
+        caps = {"tools": {"listChanged": True}, "prompts": {}, "logging": {}}
+        if os.environ.get("FAKE_RESOURCES"):
+            caps |= {"resources": {"subscribe": True}, "completions": {}}
         send({"jsonrpc": "2.0", "id": rid, "result": {
-            "protocolVersion": params["protocolVersion"],
-            "capabilities": {"tools": {"listChanged": True}, "prompts": {}, "logging": {}},
+            "protocolVersion": params["protocolVersion"], "capabilities": caps,
             "serverInfo": {"name": SERVER_NAME, "version": "1"}}})
     elif method == "tools/list":
         send({"jsonrpc": "2.0", "id": rid, "result": {"tools": tools()}})
     elif method == "prompts/list":
-        send({"jsonrpc": "2.0", "id": rid, "result": {"prompts": [{"name": "greet", "description": SERVER_NAME}]}})
+        prompts = [] if os.environ.get("FAKE_COLD") and not connects else [{"name": "greet", "description": SERVER_NAME}]
+        send({"jsonrpc": "2.0", "id": rid, "result": {"prompts": prompts}})
+    elif method == "resources/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"resources": [{"uri": f"mem://{SERVER_NAME}/r1", "name": "r1"}]}})
+    elif method == "resources/templates/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"resourceTemplates": [
+            {"uriTemplate": f"mem://{SERVER_NAME}/t/{{id}}", "name": "t"}]}})
+    elif method == "resources/read":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"contents": [
+            {"uri": params["uri"], "text": f"{SERVER_NAME} read {params['uri']}"}]}})
+    elif method in ("resources/subscribe", "resources/unsubscribe"):
+        seen["subscribed" if method == "resources/subscribe" else "unsubscribed"].append(params["uri"])
+        send({"jsonrpc": "2.0", "id": rid, "result": {}})
+    elif method == "completion/complete":
+        ref = params["ref"]
+        value = f"{SERVER_NAME}:{ref.get('name') or ref.get('uri')}:{params['argument']['value']}"
+        send({"jsonrpc": "2.0", "id": rid, "result": {"completion": {"values": [value]}}})
     elif method == "prompts/get":
         send({"jsonrpc": "2.0", "id": rid, "result": {"messages": [
             {"role": "user", "content": {"type": "text", "text": f"hello from {SERVER_NAME}: {params['name']}"}}]}})
     elif method == "logging/setLevel":
+        seen["levels"].append(params["level"])
         send({"jsonrpc": "2.0", "id": rid, "result": {}})
     elif method == "tools/call":
         try:

@@ -344,3 +344,58 @@ async def test_logs_have_no_tool_arguments(running):
     calls = running.logged("tool_call")
     assert [(e["tool"], e["outcome"]) for e in calls] == [("a_echo", "ok"), ("a_fail", "tool_error")]
     assert running.logged("session_open")[0]["children"][0]["pid"]
+
+
+# -- resources, completion, logging -------------------------------------------
+
+async def test_resources_completion_and_logging_are_routed():
+    with run_app([fake_spec("a", "a_", FAKE_RESOURCES="1"), fake_spec("b", "b_", FAKE_RESOURCES="1")]) as r:
+        async with r.raw() as http:
+            sid, init = await raw_init(http, r.url)
+            caps = init["result"]["capabilities"]
+            assert caps["resources"] == {"subscribe": True} and "completions" in caps and "logging" in caps
+
+            async def call(method, params, rid):
+                return (await raw_call(http, r.url, sid, method, params, rid))[-1]
+
+            res = (await call("resources/list", {}, 3))["result"]["resources"]
+            assert {(x["uri"], x["name"]) for x in res} == {("mem://a/r1", "a_r1"), ("mem://b/r1", "b_r1")}
+            tpl = (await call("resources/templates/list", {}, 4))["result"]["resourceTemplates"]
+            assert {x["name"] for x in tpl} == {"a_t", "b_t"}
+            read = (await call("resources/read", {"uri": "mem://b/r1"}, 5))["result"]["contents"][0]
+            assert read["text"] == "b read mem://b/r1"
+            read = (await call("resources/read", {"uri": "mem://a/t/7"}, 6))["result"]["contents"][0]  # by template
+            assert read["text"] == "a read mem://a/t/7"
+            assert (await call("resources/read", {"uri": "mem://c/x"}, 7))["error"]["code"] == -32602
+            assert (await call("resources/subscribe", {"uri": "mem://a/r1"}, 8))["result"] == {}
+            assert (await call("resources/unsubscribe", {"uri": "mem://a/r1"}, 9))["result"] == {}
+            done = await call("completion/complete", {"ref": {"type": "ref/prompt", "name": "b_greet"},
+                                                      "argument": {"name": "x", "value": "v"}}, 10)
+            assert done["result"]["completion"]["values"] == ["b:greet:v"]  # the child's own prompt name
+            done = await call("completion/complete", {"ref": {"type": "ref/resource", "uri": "mem://a/t/{id}"},
+                                                      "argument": {"name": "id", "value": "1"}}, 11)
+            assert done["result"]["completion"]["values"] == ["a:mem://a/t/{id}:1"]
+            assert (await call("logging/setLevel", {"level": "debug"}, 12))["result"] == {}
+            seen = {n: json.loads(await tool_text(http, r.url, sid, f"{n}_seen", rid=13 + i)) for i, n in enumerate("ab")}
+    assert seen["a"]["subscribed"] == ["mem://a/r1"] and seen["a"]["unsubscribed"] == ["mem://a/r1"]
+    assert not seen["b"]["subscribed"]
+    assert seen["a"]["levels"] == seen["b"]["levels"] == ["debug"]
+
+
+async def test_failed_refresh_keeps_the_catalog_and_is_logged(running, monkeypatch):
+    from mcp.shared.exceptions import MCPError
+
+    from rebox_aggregator.children import Child
+
+    async def refuse(self, *a, **kw):
+        raise MCPError(-32603, "listing refused")
+
+    async with running.raw() as http:
+        sid, _ = await raw_init(http, running.url)
+        monkeypatch.setattr(Child, "list_catalog", refuse)
+        assert await tool_text(http, running.url, sid, "a_add_tool", {"name": "dyn"}) == "added"
+        monkeypatch.undo()
+        names = {t["name"] for t in (await raw_call(http, running.url, sid, "tools/list", {}, 3))[-1]["result"]["tools"]}
+        assert "a_echo" in names and "a_dyn" not in names
+    (e,) = running.logged("refresh_failed")
+    assert e["child"] == "a" and "listing refused" in e["error"]

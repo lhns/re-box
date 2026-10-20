@@ -4,7 +4,7 @@ import sys
 import anyio
 import pytest
 
-from conftest import FAKE, raw_call, raw_init, run_app, wait_until
+from conftest import FAKE, RAW_HEADERS, raw_call, raw_init, run_app, wait_until
 from rebox_aggregator.config import Autosave, ChildSpec
 
 pytestmark = pytest.mark.anyio
@@ -113,3 +113,32 @@ async def test_autosave_does_not_refresh_idle_clock(tmp_path):
             before = session.last_activity
             assert await wait_until(lambda: r.logged("autosave"), 5)
             assert session.last_activity == before
+
+
+async def test_cancelled_before_save_keeps_the_child_dirty(tmp_path):
+    # The client cancels a call during the autosave that runs before it: the work is still unsaved.
+    before = ChildSpec("a", "a_", (sys.executable, FAKE, "a"), {"FAKE_SAVE_SLEEP": "1"},
+                       Autosave("save", ARGS, before_tools=("echo",)))
+    with run_app([before], state_dir=str(tmp_path), autosave_interval=0) as r:
+        async with r.raw() as http:
+            sid, _ = await raw_init(http, r.url)
+            await call(http, r, sid, "a_echo")  # dirty
+            session = r.app.sessions[sid]
+            async with anyio.create_task_group() as tg:
+                tg.start_soon(call, http, r, sid, "a_echo", 3)  # saves first
+                assert await wait_until(lambda: session.autosaver.saving(session.children["a"]), 5)
+                await http.post(r.url, json={"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 3}},
+                                headers={**RAW_HEADERS, "mcp-session-id": sid, "mcp-protocol-version": "2025-11-25"})
+            await http.delete(r.url, headers={"mcp-session-id": sid})
+        assert "close" in [e["reason"] for e in r.logged("autosave")]
+
+
+async def test_close_waits_for_a_periodic_save_in_flight(tmp_path):
+    with run_app([spec(FAKE_SAVE_SLEEP="1.5")], state_dir=str(tmp_path), autosave_interval=0.3) as r:
+        async with r.raw() as http:
+            sid, _ = await raw_init(http, r.url)
+            await call(http, r, sid, "a_echo")
+            session = r.app.sessions[sid]
+            assert await wait_until(lambda: session.autosaver.saving(session.children["a"]), 5)
+            await http.delete(r.url, headers={"mcp-session-id": sid})
+        assert json.loads(saved_file(tmp_path, sid).read_text()) == {"saves": 1}  # not killed mid-export
