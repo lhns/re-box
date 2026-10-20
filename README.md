@@ -57,11 +57,17 @@ Tell the agent to use paths like `/c/Users/you/re/x.exe` (the `initialize` instr
 `C:\...` path does not exist in the container. Docker Desktop with WSL2 also works from a WSL shell
 with a native Linux path.
 
-### Laptop
+### Less memory (Docker Desktop with 8 GB)
 
-Docker Desktop's VM must hold the container limit (Settings, Resources, or `memory=` in
-`.wslconfig`). For an 8 GB VM: `-e REBOX_MAX_SESSIONS=2 -e JAVA_OPTS="-Xmx4g -XX:+UseG1GC"
---memory 7g`. Sizing: [docs/OPERATIONS.md](docs/OPERATIONS.md), "Memory".
+The defaults fit a 16 GB container. Docker Desktop's VM must hold the container limit (Settings,
+Resources, or `memory=` in `.wslconfig`). For an 8 GB VM (`JAVA_OPTS` replaces the default, so it
+repeats the G1 flags that hand heap back after a burst):
+
+```sh
+-e REBOX_MAX_SESSIONS=2 --memory 7g -e JAVA_OPTS="-Xmx4g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30"
+```
+
+Sizing: [docs/OPERATIONS.md](docs/OPERATIONS.md), "Memory".
 
 ## Connect a client
 

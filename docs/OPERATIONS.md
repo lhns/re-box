@@ -126,8 +126,8 @@ programs open at once across all sessions, not per session. A REA session with
 no Ghidra call yet costs about 0.2 GiB; the headless server idles at about 130 MB RSS (measured)
 and is gone entirely `REBOX_GHIDRA_IDLE_TIMEOUT` after the last session.
 
-**Laptop profile** (Docker Desktop / WSL2, 8 GB for the VM): `REBOX_MAX_SESSIONS=2`,
-`JAVA_OPTS="-Xmx4g -XX:+UseG1GC"` (+ the G1 flags above), container limit 7g: the formula gives
+**Less memory** (e.g. Docker Desktop / WSL2 with 8 GB for the VM): `REBOX_MAX_SESSIONS=2`,
+`JAVA_OPTS="-Xmx4g -XX:+UseG1GC -XX:G1PeriodicGCInterval=60000 -XX:G1PeriodicGCSystemLoadThreshold=0 -XX:MinHeapFreeRatio=10 -XX:MaxHeapFreeRatio=30"` (setting it replaces the default, so keep the G1 flags), container limit 7g: the formula gives
 (4 + 1) + 2 × 0.5 + 1 = 7 GiB. With a 10 GB VM use `--memory 8g` and `-Xmx5g`. Docker
 Desktop's VM limit (Settings, Resources, or `.wslconfig` `memory=`) must be at least the container
 limit. To fit less memory lower `REBOX_MAX_SESSIONS` first; to
