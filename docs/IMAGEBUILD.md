@@ -23,7 +23,7 @@ metadata:
   namespace: re-box
 spec:
   interval: 1h
-  url: https://github.com/lhns/re-box  # private: add spec.secretRef
+  url: https://github.com/lhns/re-box
   ref:
     branch: main
 ---

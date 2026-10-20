@@ -44,13 +44,13 @@ deps/<dir>/requirements-<name>.txt` (the header it writes is what Renovate re-ru
 
 ### Runner
 
-The `image` job defaults to the GitHub-hosted `ubuntu-24.04` runner, which for a private repo has
-2 CPUs, 8 GB RAM and a 6 h job limit; the job frees ~25 GB of preinstalled toolchains first.
+The `image` job defaults to the GitHub-hosted `ubuntu-24.04` runner (4 CPUs, 16 GB RAM for a public
+repo, 6 h job limit); the job frees ~25 GB of preinstalled toolchains first.
 That is enough: the first run (empty cache, 2026-10-19) took 11 min for the whole job — the test
 stage 7 min including `install-tools.sh` (3 min) and the suite (2 min, peak RSS 2.1 GiB), then
 push and cache export 2.5 min. Most of the local 40 min was download and compile time that the
-hosted runner's network and CPUs do faster than Docker Desktop. Each run costs its minutes from
-the account's included private-repo Actions minutes.
+hosted runner's network and CPUs do faster than Docker Desktop. The timings above were measured
+while the repo was private (2 CPUs); public repos run on bigger runners at no cost.
 
 To move it, set repository variables (Settings -> Secrets and variables -> Actions -> Variables):
 

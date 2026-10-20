@@ -33,7 +33,6 @@ docker run -d --name re-box --stop-timeout 120 --memory 16g \
 
 Mount the work dir at the **same absolute path** inside and out: tool arguments are container
 paths, so the paths your agent already uses stay valid, and so do the paths re-box writes back.
-Pulling needs `docker login ghcr.io` while the package is private.
 
 Ghidra runs only while a session is open: the first session starts it (about 40 s; the `ghidra_` tools
 call waits for it) and it stops 5 minutes after the last session closed
@@ -119,3 +118,8 @@ every 5 minutes and on shutdown; REA sessions export their evidence when they en
 
 **Security:** several REA features execute the target. The container is the sandbox: run it on an
 egress-restricted network and treat what it analyses as hostile (docs/OPERATIONS.md, "Security").
+
+## License
+
+re-box's own code is under the [Apache License 2.0](LICENSE). The image bundles Ghidra, REA,
+ghidra-mcp and the analysis tools, each under its own license.
