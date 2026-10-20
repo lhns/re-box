@@ -1,7 +1,8 @@
 import pytest
 
+from conftest import SHIPPED_CONFIG
 from rebox_aggregator.app import instance_id
-from rebox_aggregator.config import ConfigError, load_children, load_settings
+from rebox_aggregator.config import ConfigError, load_children, load_settings, load_texts
 
 
 def toml(tmp_path, body: str) -> str:
@@ -68,10 +69,7 @@ def test_bad_autosave(tmp_path, bad):
 
 
 def test_shipped_config_has_rea_autosave():
-    from pathlib import Path
-
-    repo = Path(__file__).parents[2] / "rootfs/etc/rebox/aggregator.toml"  # in the image: the installed copy
-    specs = {s.name: s for s in load_children(str(repo if repo.exists() else "/etc/rebox/aggregator.toml"))}
+    specs = {s.name: s for s in load_children(SHIPPED_CONFIG)}
     assert specs["rea"].autosave.tool == "export_evidence_bundle" and specs["ghidra"].autosave is None
     assert specs["rea"].autosave.before_tools == ("close_binary",)  # it clears REA's evidence
 
@@ -118,10 +116,7 @@ def test_prune_empty_parsed(tmp_path):
 
 
 def test_shipped_config_denies_scripts_and_connects_on_ready():
-    from pathlib import Path
-
-    repo = Path(__file__).parents[2] / "rootfs/etc/rebox/aggregator.toml"
-    specs = {s.name: s for s in load_children(str(repo if repo.exists() else "/etc/rebox/aggregator.toml"))}
+    specs = {s.name: s for s in load_children(SHIPPED_CONFIG)}
     assert specs["ghidra"].deny == ("run_ghidra_script", "run_script_inline", "delete_project")
     assert (specs["ghidra"].on_ready.tool, dict(specs["ghidra"].on_ready.arguments)) == ("connect_instance", {"project": "rebox"})
     assert specs["rea"].autosave.prune_empty and not specs["rea"].deny
@@ -132,15 +127,12 @@ def test_shipped_config_denies_scripts_and_connects_on_ready():
 
 
 def test_catalog_cache_parsed_and_shipped(tmp_path):
-    from pathlib import Path
-
     (spec,) = load_children(toml(tmp_path, GOOD + '[child.catalog_cache]\nkey = "k-{X}"\n'))
     assert spec.catalog_cache.key == "k-{X}"
     assert load_children(toml(tmp_path, GOOD))[0].catalog_cache is None
     with pytest.raises(ConfigError, match="catalog_cache"):
         load_children(toml(tmp_path, GOOD + "[child.catalog_cache]\n"))
-    repo = Path(__file__).parents[2] / "rootfs/etc/rebox/aggregator.toml"
-    specs = {s.name: s for s in load_children(str(repo if repo.exists() else "/etc/rebox/aggregator.toml"))}
+    specs = {s.name: s for s in load_children(SHIPPED_CONFIG)}
     assert specs["ghidra"].catalog_cache and not specs["rea"].catalog_cache
 
 
@@ -164,3 +156,17 @@ def test_child_env_fills_in_environment_variables():
 
     spec = ChildSpec("a", "a_", ("x",), {"TMPDIR": "{T}/x", "PLAIN": "v", "MISSING": "{NOPE}"})
     assert child_env(spec, {"T": "/tmp/t"}) == {"TMPDIR": "/tmp/t/x", "PLAIN": "v", "MISSING": ""}
+
+
+def test_session_texts_parsed_filled_in_and_shipped(tmp_path):
+    body = '[session]\ninstructions = """\nwork in {W}, not {NOPE}.\n"""\nbackend_failed = "x {state}"\n' + GOOD
+    assert load_texts(toml(tmp_path, body), {"W": "/w"}) == {"instructions": "work in /w, not .", "backend_failed": "x {state}"}
+    assert load_texts(toml(tmp_path, GOOD)) == {}
+    for bad in ('[session]\ninstructions = 1\n', '[session]\nother = "x"\n'):
+        with pytest.raises(ConfigError, match="session"):
+            load_texts(toml(tmp_path, bad + GOOD))
+    s = load_settings({"REBOX_TOKEN": "t", "REBOX_CONFIG": toml(tmp_path, body)})
+    assert (s.instructions, s.backend_failed) == ("work in , not .", "x {state}")
+    shipped = load_texts(SHIPPED_CONFIG, {"RE_WORKDIR": "/work"})
+    assert "under RE_WORKDIR (/work)." in shipped["instructions"] and "/rea/<sha12>-<profile8>/" in shipped["instructions"]
+    assert "Ghidra is {state}: {reason}" in shipped["backend_failed"] and "{seconds} s" in shipped["backend_starting"]

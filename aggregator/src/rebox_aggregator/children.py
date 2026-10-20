@@ -124,6 +124,17 @@ class Child:
             await self.exited.wait()
         raise self.gone_error()
 
+    async def call_tool(self, tool: str, arguments: Mapping[str, Any]) -> tuple[str, str | None]:
+        """One of the child's own tools, called by the aggregator itself (autosave, on_ready):
+        (ok | tool_error | rpc_error, the error text)."""
+        try:
+            result = await self.request("tools/call", {"name": tool, "arguments": dict(arguments)})
+        except MCPError as e:
+            return "rpc_error", e.message
+        if result.get("isError"):
+            return "tool_error", " ".join(c.get("text", "") for c in result.get("content") or [] if isinstance(c, dict))
+        return "ok", None
+
     async def notify(self, method: str, params: dict | None = None) -> None:
         """Fire and forget: dropped once the child is gone."""
         await self._rpc.notify(method, params)

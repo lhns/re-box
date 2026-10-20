@@ -10,17 +10,19 @@ Why custom, and the protocol-era decision: `docs/DECISIONS.md`, "5.2".
 
 | module | role |
 | --- | --- |
-| `config.py` | settings from env, children from the TOML config |
-| `children.py` | one stdio child: own process group, newline-delimited JSON-RPC, stderr relay, group kill |
+| `config.py` | settings from env, children and session texts from the TOML config |
+| `children.py` | one stdio child: own process group, newline-delimited JSON-RPC through mcp's `JSONRPCDispatcher`, stderr relay, group kill |
 | `catalog.py` | prefixing, name validation, merged tools/prompts/resources catalog |
-| `session.py` | per-session router between the downstream transport and the children |
-| `app.py` | ASGI app: auth, `/healthz`, `/mcp` session manager (cap, idle reaping, era rejection) |
+| `session.py` | per-session router between the downstream transport (its own `JSONRPCDispatcher`) and the children; idle and orphan timeouts |
+| `sessioncatalog.py` | what a session advertises: merged listings, list_changed refresh, the cached catalog while Ghidra starts, `on_ready` |
+| `autosave.py` | a child's autosave tool: on close, periodically, before a tool that drops the work |
+| `app.py` | ASGI app: auth, `/healthz`, `/mcp` session manager (cap, eviction, era rejection) |
 | `supervisor.py` | container entry point: config checks, the 8089 auth token, runs the app and the headless server, catalog warm-up, signal handling |
 | `headless.py` | the ghidra-mcp JVM (on demand: start, health, save, idle stop, crash restart) and the Ghidra project |
 | `evidence.py` | REA evidence bundles: drop an empty export |
 | `housekeeping.py` | leftovers nothing else removes (`/tmp` sweep, half-written exports, old evidence bundles, rolled Ghidra logs), the daily loop, project size |
 | `catalogcache.py` | per-child catalog cache (key, atomic save/load) and the session-less listing used by the warm-up |
-| `log.py` | JSON-lines logging to stdout |
+| `log.py` | JSON-lines logging to stdout (also the mcp library's warnings), process output relay |
 
 Entry points: `rebox-supervisor` (container default), `rebox-aggregator` (app only, no
 headless server; used by unit tests and for development).
@@ -37,13 +39,18 @@ exceeds it is killed and counts as failed), `REBOX_MAX_BODY_BYTES` (16 MiB; larg
 (`/etc/rebox/aggregator.toml`), `REBOX_STATE_DIR` (the supervisor exports the resolved path; empty
 disables autosave), `REBOX_AUTOSAVE_INTERVAL` (300 s, 0 = only on close), `REBOX_AUTOSAVE_TIMEOUT` (20 s),
 `REBOX_SESSION_ORPHAN_TIMEOUT` (300 s: idle limit of a session with no open GET stream; 0 = same as the idle
-timeout), `REBOX_SESSION_EVICT_MIN_IDLE` (120 s), `REBOX_PROGRESS_KEEPALIVE_INTERVAL` (30 s, 0 = off).
-Supervisor only: `REBOX_GHIDRA_IDLE_TIMEOUT` (300 s, 0 = never stop), `REBOX_EVIDENCE_RETENTION_DAYS` (30, 0 = keep),
-`REBOX_HEADLESS_START_TIMEOUT` (300 s).
+timeout), `REBOX_SESSION_EVICT_MIN_IDLE` (120 s), `REBOX_PROGRESS_KEEPALIVE_INTERVAL` (30 s, 0 = off),
+`REBOX_HEADLESS_START_TIMEOUT` (300 s; also how long a session waits for Ghidra, below).
+Supervisor only: `REBOX_GHIDRA_IDLE_TIMEOUT` (300 s, 0 = never stop), `REBOX_EVIDENCE_RETENTION_DAYS` (30, 0 = keep).
 
-Children (TOML), generic so more servers can be added without code changes:
+Children and session texts (TOML), generic so more servers can be added without code changes:
 
 ```toml
+[session]                    # optional; the shipped file says what Ghidra and REA need said
+instructions = '''...'''     # the initialize result's instructions; {NAME}: env var (the session adds state dir, tag, evidence file)
+backend_failed = "Ghidra is {state}: {reason}. Try again later."      # a call held for the backend: it failed
+backend_starting = "Ghidra is still starting after {seconds} s. Try again later."  # ... or took too long
+
 [[child]]
 name = "rea"                 # [a-z0-9-]+, used in logs and errors
 prefix = "rea_"              # prepended to tool and prompt names
@@ -71,9 +78,10 @@ shipped config denies ghidra-mcp's `run_ghidra_script`, `run_script_inline` and 
 
 **on_ready:** the Ghidra server starts with the first session, so a bridge usually boots before it
 and shows only static tools. When the server becomes ready (and the client has sent
-`notifications/initialized`), the aggregator calls this tool on every session's child over the same
-bypass path as autosave; the bridge connects and sends `tools/list_changed`, which is relayed. A
-session that opens while Ghidra is already up gets no call. Logged as `on_ready` (`outcome`
+`notifications/initialized`), the aggregator calls this tool on every session's child (its response
+is never held); the bridge connects and sends `tools/list_changed`, which is relayed, and a child
+advertised from the cache is re-listed either way. A session that opens while Ghidra is already up
+gets no call, unless there is no cache yet (below). Logged as `on_ready` (`outcome`
 ok/tool_error/failed); the bridge's own 15 s retry is the fallback.
 
 **Catalog cache:** clients cannot be relied on to follow `tools/list_changed`, so a session must
@@ -85,17 +93,19 @@ smaller listing never replaces a bigger one). A session that opens with the back
 advertises the cache instead of the child's partial listing; the child's tools that existed at
 boot (the bridge's static ones) stay callable at once, a `tools/call` for any other cached tool is
 held (progress keepalive applies) until the live listing has replaced the cache, at most
-`REBOX_HEADLESS_START_TIMEOUT`, and then fails with a tool result `isError` saying
-"Ghidra is failed: <reason>" / "still starting". When the live listing differs, `list_changed` is
-sent. With no cache the session's `initialize` reply is held until the child is connected (bounded;
+`REBOX_HEADLESS_START_TIMEOUT`, and then fails with a tool result `isError` (`[session]`
+`backend_failed` / `backend_starting`). When the live listing differs, `list_changed` is sent for
+each kind that changed. With no cache the session's `initialize` reply is held until the child is
+connected (`on_ready`, then re-listed, also when Ghidra is already up; bounded;
 on timeout the partial listing is used and `catalog_cold` is logged), and the supervisor, at
 container start, runs the server once and lists the child itself (`catalog_warmup`) so that rarely
 happens. Without `REBOX_STATE_DIR` the feature is off.
 
 Autosave runs when `REBOX_STATE_DIR` is set, for children that served a `tools/call` since their
 last save (dirty): on session close (all reasons, concurrently, before the children are closed,
-each bounded by `REBOX_AUTOSAVE_TIMEOUT`) and every `REBOX_AUTOSAVE_INTERVAL` seconds while no
-request is in flight to that child. It never counts as session activity. Logged as `autosave`
+each bounded by `REBOX_AUTOSAVE_TIMEOUT`, waiting for a periodic save in flight) and every
+`REBOX_AUTOSAVE_INTERVAL` seconds while no request is in flight to that child. A save that fails,
+times out or whose caller is cancelled leaves the child dirty. It never counts as session activity. Logged as `autosave`
 (`reason`, `outcome` ok/tool_error/rpc_error/timeout, `duration_ms`); failures only warn.
 
 A child's environment is the container env **minus every `REBOX_*` variable** (the token is not
@@ -119,8 +129,8 @@ supervisor's random instance id) and `REBOX_SESSION` (the session tag, below).
   each (forwarding the client's `capabilities` and `clientInfo`, with the negotiated
   `protocolVersion`), send each `notifications/initialized`, fetch `tools/list` (all pages),
   `prompts/list` / `resources/list` / `resources/templates/list` where advertised, build the
-  catalog, reply (the result carries `instructions`: state dir, this session's tag and evidence
-  file, ghidra_ vs rea_ persistence, the path rule, the cold-start note). It does not wait for Ghidra.
+  catalog, reply (the result carries `instructions`: `[session] instructions`, then the state dir,
+  this session's tag and evidence file). It does not wait for Ghidra (except as in "Catalog cache").
   A child that fails to start or initialize is logged and marked dead; the
   session still opens if at least one child is up. All down, or an invalid catalog (below): the
   `initialize` gets a JSON-RPC error and the session is discarded.
@@ -132,7 +142,8 @@ supervisor's random instance id) and `REBOX_SESSION` (the session tag, below).
   to `initialize`. GET/DELETE without a session id: 400. Unknown session id: 404, `-32001`.
 - **Close:** on DELETE, idle or orphan timeout, eviction, supervisor shutdown, or as soon as any
   child dies (`child_exited`: a session missing a backend is half dead; the client's next request
-  gets 404 and it re-initializes): (0) autosave
+  gets 404 and it re-initializes; a child's exit is seen when it exits, even while a grandchild
+  holds its stdout, and its process group is killed then): (0) autosave
   the live children; (1) close
   each child's stdin and wait up to 2 s; (2) SIGTERM its process group, wait `REBOX_CHILD_GRACE`;
   (3) SIGKILL the group; (4) SIGKILL any remaining process whose `/proc/<pid>/environ` holds
@@ -159,14 +170,20 @@ supervisor's random instance id) and `REBOX_SESSION` (the session tag, below).
 ## Routing (per session)
 
 Messages stay plain dicts end to end; results and `structuredContent` are forwarded unchanged.
-The aggregator is the client of each child and keeps its own request-id counter per child.
+mcp's `JSONRPCDispatcher` (2.3.0) runs both sides: the downstream session and, as its client, each
+child. It owns request ids, correlation, cancellation and progress tokens; every child line is
+validated as a JSON-RPC message (an invalid one, such as an id that is a list, is logged
+`child_bad_line` and dropped). An unexpected error in a request handler answers `-32603`; in a
+notification handler it closes the session (`internal_error`).
 
-- `initialize`: above. `notifications/initialized` from downstream: swallowed.
+- `initialize`: above. `notifications/initialized` from downstream: not forwarded (the children had
+  theirs); it lets `on_ready` calls go out.
+- `notifications/roots/list_changed` from downstream: forwarded to every child.
 - `ping`: answered locally.
 - `tools/list`: the merged catalog, one page. `prompts/list`, `resources/list`,
   `resources/templates/list`: likewise.
 - `tools/call`, `prompts/get`: strip the prefix, forward to the owning child with the original
-  name, everything else in `params` unchanged (including `_meta.progressToken`). Unknown name:
+  name, everything else in `params` unchanged except `_meta.progressToken` (below). Unknown name:
   JSON-RPC `-32602` "Unknown tool: X". Dead child: `-32603` "backend 'rea' is not running in
   this session (exited with code N)".
 - `resources/read`, `resources/subscribe`, `resources/unsubscribe`: routed by URI to the child
@@ -175,21 +192,28 @@ The aggregator is the client of each child and keeps its own request-id counter 
 - `completion/complete`: `ref/prompt` by prefixed name, `ref/resource` by URI.
 - `logging/setLevel`: sent to every live child that advertises logging; reply `{}`.
 - Anything else: `-32601`.
-- **Progress:** child `notifications/progress` is sent downstream as related to the downstream
-  request that carried that `progressToken` (so it rides that POST's SSE stream).
-- **Cancellation:** downstream `notifications/cancelled` is translated to the child's request id
-  and forwarded; the downstream request is then settled without a response (the transport's
-  `on_request_unanswered` callback) and a late child reply is dropped. A child's
-  `notifications/cancelled` for a request it sent to the client is mapped the same way.
+- **Progress:** a request with a `progressToken` reaches the child with the child request's id as
+  its token; the child's progress for it is sent downstream with the client's token (values as
+  floats, kept increasing past keepalives), related to that request (so it rides that POST's SSE
+  stream). Progress for any other token is dropped.
+- **Cancellation:** downstream `notifications/cancelled` cancels the request's handler; the child
+  gets `notifications/cancelled` for its own request id (reason "caller cancelled"), the downstream
+  request is settled without a response (the transport's `on_request_unanswered` callback) and a
+  late child reply is dropped. A child's `notifications/cancelled` for a request it sent to the
+  client is relayed the same way.
 - **Child-to-client requests** (`roots/list`, `sampling/createMessage`, `elicitation/create`):
-  forwarded downstream under a new id, related to an in-flight downstream request to that child
-  when there is one; the client's response is mapped back. A child `ping` is answered locally.
+  forwarded downstream under the dispatcher's own id, related to an in-flight downstream request to
+  that child when there is one; the client's response goes back. A child `ping` is answered locally.
+- **Other child notifications** (logging, resource updates): forwarded, related to an in-flight
+  request to that child if any.
 - **list_changed:** on a child's `notifications/tools/list_changed` (and prompts/resources),
   re-list that child, revalidate, swap its part of the catalog, then send one downstream
   `notifications/tools/list_changed`, related to an in-flight downstream request to that child if
-  any, else on the standalone GET stream. While a refresh for a child is pending, that child's
-  responses are held and new `tools/list` / `tools/call` wait for it, so the client never sees a
-  response before the notification or calls a tool the aggregator does not know yet.
+  any, else on the standalone GET stream. While a refresh for a child is pending (from the
+  list_changed on, in receive order), responses to calls forwarded to that child are held and new
+  requests wait for it, so the client never sees a response before the notification or calls a
+  tool the aggregator does not know yet. A refresh that fails is logged `refresh_failed`; the
+  previous catalog stays.
 - **Child crash:** its in-flight requests fail with `-32603`, then the session is closed
   (`child_exited`, above).
 - **No timeouts** on forwarded requests; cold Ghidra starts take minutes.
@@ -209,8 +233,9 @@ killed), `session_refused` (reason), `session_evicted`, `get_stream_open` / `get
 `on_ready`, `headless_state` (state, reason), `headless_idle_stop`, `evidence_dropped`,
 `evidence_pruned`, `evidence_partial_removed`, `tmp_swept`, `ghidra_logs_pruned`, `project_size` (bytes, files; at each Ghidra start), `child_exit`, `tool_call` (session, tool, duration_ms,
 outcome `ok` / `tool_error` / `rpc_error` / `cancelled`, error code), `catalog_rejected`,
-`child_stderr` (session, child, line truncated to 2000 chars). **Never tool arguments or
-results.**
+`child_stderr` (session, child, line truncated to 2000 chars), `child_bad_line`, `refresh_failed`,
+`catalog_cold`, `internal_error`, `library_log` (a warning of the mcp library: logger, message,
+exception type). **Never tool arguments or results.**
 
 ## Supervisor
 

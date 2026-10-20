@@ -16,10 +16,12 @@ from mcp.client.streamable_http import streamable_http_client
 
 from rebox_aggregator import log as rlog
 from rebox_aggregator.app import App, make_server
-from rebox_aggregator.config import ChildSpec, Settings
+from rebox_aggregator.config import ChildSpec, Settings, load_texts
 
 FAKE = str(Path(__file__).parent / "fakes" / "fake_server.py")
 TOKEN = "s3cret-token"
+_REPO_CONFIG = Path(__file__).parents[2] / "rootfs/etc/rebox/aggregator.toml"
+SHIPPED_CONFIG = str(_REPO_CONFIG if _REPO_CONFIG.exists() else "/etc/rebox/aggregator.toml")  # in the image: the installed copy
 
 
 @pytest.fixture
@@ -90,7 +92,7 @@ def run_app(children=None, **overrides):
         children=tuple(children or [fake_spec("a", "a_"), fake_spec("b", "b_")]),
         port=free_port(),
         bind="127.0.0.1",
-        **{"max_sessions": 4, "idle_timeout": 600.0, "child_grace": 2.0, **overrides},
+        **{"max_sessions": 4, "idle_timeout": 600.0, "child_grace": 2.0, **load_texts(SHIPPED_CONFIG), **overrides},
     )
     app = App(settings, instance="testinstance")
     server = make_server(app)

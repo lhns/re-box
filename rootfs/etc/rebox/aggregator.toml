@@ -1,6 +1,19 @@
 # Children of each MCP session (aggregator/README.md, "Configuration"). [child.env] values are
 # forced over the container env; everything else is inherited minus REBOX_*.
 
+# What a client cannot see from the tool list. `instructions` goes into every initialize result
+# ({NAME}: an environment variable; the session adds its state dir, tag and evidence file). The other
+# two answer a call to a cached tool that waits for the shared backend (Ghidra) in vain.
+[session]
+instructions = '''
+re-box: Ghidra (ghidra_ tools) and REA (rea_ tools) behind one endpoint.
+ghidra_: one persistent Ghidra project shared by all sessions. Pass the program selector on every call; ghidra_import_file only reads files under RE_WORKDIR ({RE_WORKDIR}).
+rea_: REA works in the same Ghidra project: rea_open_binary imports the file into /rea/<sha12>-<profile8>/<file name> (the first 12 hex digits of the file's sha256 and 8 of REA's profile digest; open it with ghidra_ tools there), and REA's renames and comments persist, whatever REA's own texts say about an ephemeral project. rea_ tools see edits made meanwhile by ghidra_ tools or other sessions. REA's evidence and in-session state still end with the session.
+Paths: the container sees host paths unchanged (same-path mount). On Windows send the Git Bash form (/c/Users/you/re/x.bin), not C:\... .
+Ghidra starts with the first session (about 40 s). A ghidra_ call made while it starts waits for it; if it fails you get a tool error saying why.'''
+backend_failed = "Ghidra is {state}: {reason}. Try again later."
+backend_starting = "Ghidra is still starting after {seconds} s. Try again later."
+
 [[child]]
 name = "rea"
 prefix = "rea_"

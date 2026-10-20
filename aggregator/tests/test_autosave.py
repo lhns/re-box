@@ -126,7 +126,7 @@ async def test_cancelled_before_save_keeps_the_child_dirty(tmp_path):
             session = r.app.sessions[sid]
             async with anyio.create_task_group() as tg:
                 tg.start_soon(call, http, r, sid, "a_echo", 3)  # saves first
-                assert await wait_until(lambda: "a" in session._save_locks and session._save_locks["a"].locked(), 5)
+                assert await wait_until(lambda: session.autosaver.saving(session.children["a"]), 5)
                 await http.post(r.url, json={"jsonrpc": "2.0", "method": "notifications/cancelled", "params": {"requestId": 3}},
                                 headers={**RAW_HEADERS, "mcp-session-id": sid, "mcp-protocol-version": "2025-11-25"})
             await http.delete(r.url, headers={"mcp-session-id": sid})
@@ -139,6 +139,6 @@ async def test_close_waits_for_a_periodic_save_in_flight(tmp_path):
             sid, _ = await raw_init(http, r.url)
             await call(http, r, sid, "a_echo")
             session = r.app.sessions[sid]
-            assert await wait_until(lambda: "a" in session._save_locks and session._save_locks["a"].locked(), 5)
+            assert await wait_until(lambda: session.autosaver.saving(session.children["a"]), 5)
             await http.delete(r.url, headers={"mcp-session-id": sid})
         assert json.loads(saved_file(tmp_path, sid).read_text()) == {"saves": 1}  # not killed mid-export

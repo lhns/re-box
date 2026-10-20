@@ -44,6 +44,11 @@ def path_for(state_dir: str, spec: ChildSpec) -> Path:
     return Path(state_dir) / "cache" / "rebox-catalog" / f"{spec.name}-{resolve_key(spec)}.json"
 
 
+def is_partial(part: ChildCatalog, full: ChildCatalog) -> bool:
+    """Fewer tools than a listing of the same child (and cache key): the bridge was not connected yet."""
+    return len(part.tools) < len(full.tools)
+
+
 def load(state_dir: str, spec: ChildSpec) -> ChildCatalog | None:
     if not (state_dir and spec.catalog_cache):
         return None
@@ -71,7 +76,7 @@ def _save(target: Path, spec: ChildSpec, part: ChildCatalog, body: str) -> bool:
             old = target.read_text()
             if old == body:
                 return False
-            if len(json.loads(old).get("tools", ())) > len(part.tools):
+            if is_partial(part, ChildCatalog(tools=list(json.loads(old).get("tools", ())))):
                 # The key names what changes a catalog, so a smaller one is a bridge that was not
                 # connected yet; keeping the bigger one is the safe side.
                 log("catalog_cache_kept", "warn", child=spec.name, tools=len(part.tools))
