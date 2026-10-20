@@ -13,8 +13,9 @@ export REBOX_TOKEN="e2e-$(head -c24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 export REBOX_PORT=18443
 export REBOX_URL="http://127.0.0.1:$REBOX_PORT/mcp"
 export RE_WORKDIR=/tmp/rebox-e2e/work
-# REA's TMPDIR, the supervisor's per-uid default spelled out once: the e2e tests read it from here.
-export REBOX_REA_TMP=/tmp/rebox-rea-$PUID
+# REA's TMPDIR, the supervisor's per-uid default (unset for the supervisor, which creates it); the
+# e2e tests get it as REBOX_REA_TMP.
+REA_TMP=/tmp/rebox-rea-$PUID
 # Outside RE_WORKDIR on purpose: exercises the analyzeHeadless + --project path. The supervisor
 # (as PUID) creates it.
 export REBOX_STATE_DIR=/tmp/rebox-e2e/state
@@ -98,7 +99,7 @@ sampler=$!
 step "e2e"
 set +e
 # As PUID, for the same /proc reason (test 10 finds a session's processes by their environment).
-(cd "$TESTS/e2e" && REBOX_INSTANCE="$REBOX_INSTANCE" as_puid "$PY" -m pytest -v -p no:cacheprovider -rA .)
+(cd "$TESTS/e2e" && REBOX_REA_TMP="$REA_TMP" REBOX_INSTANCE="$REBOX_INSTANCE" as_puid "$PY" -m pytest -v -p no:cacheprovider -rA .)
 e2e=$?
 set -e
 
@@ -110,12 +111,12 @@ if [ "$e2e" = 0 ]; then
   # Same work and state dirs: what a SIGTERM stop must have kept (project edits, REA evidence).
   step "restart on the same state"
   # What a killed session leaves in /tmp; the supervisor sweeps it at start (test_restart.py).
-  planted=$REBOX_REA_TMP/rea-ghidra-planted  # in REA's TMPDIR, where its sessions put it
+  planted=$REA_TMP/rea-ghidra-planted  # in REA's TMPDIR, where its sessions put it
   mkdir -p "$planted" && echo x >"$planted/target.bin"
   chown -R "$PUID:$PGID" "$planted"
   start_services
   set +e
-  (cd "$TESTS/e2e" && REBOX_INSTANCE="$REBOX_INSTANCE" REBOX_E2E_PHASE=restart as_puid "$PY" -m pytest -v -p no:cacheprovider -rA test_restart.py)
+  (cd "$TESTS/e2e" && REBOX_REA_TMP="$REA_TMP" REBOX_INSTANCE="$REBOX_INSTANCE" REBOX_E2E_PHASE=restart as_puid "$PY" -m pytest -v -p no:cacheprovider -rA test_restart.py)
   e2e=$?
   set -e
   step "graceful shutdown (2)"

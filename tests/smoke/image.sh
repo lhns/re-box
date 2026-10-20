@@ -67,7 +67,7 @@ grep -q 'rea_open_binary' "$skill" || fail "skill not rewritten"
 # The image's empty /work follows the PUID/PGID remap (a fresh named volume starts as the image has
 # it), so the default RE_WORKDIR stays usable. Last: the remap sticks to the rebox user.
 [ "$(stat -c %u:%g /work)" = 1000:1000 ] || fail "/work is not rebox's in the image"
-out=$(env PUID=4321 PGID=4321 /usr/local/bin/re-box-entrypoint stat -c %u:%g /work)
+out=$(env RE_WORKDIR=/work PUID=4321 PGID=4321 /usr/local/bin/re-box-entrypoint stat -c %u:%g /work)
 [ "$out" = 4321:4321 ] || fail "/work did not follow the remap: $out"
 
 echo "image smoke: ok"
