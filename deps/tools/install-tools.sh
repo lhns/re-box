@@ -3,8 +3,9 @@
 #   RUN --mount=type=bind,from=pins,source=/pins/tools.env,target=/run/pins.env \
 #       --mount=type=bind,source=deps/tools,target=/build/tools sh /build/tools/install-tools.sh
 # Every download is sha256-pinned (versions.env, TOOL_*); Python is installed from hash-locked
-# requirements-*.txt; apt packages come from the signed Ubuntu 24.04 archive. Paths the tools land
-# on are set as ENV in the Dockerfile (runtime stage).
+# requirements-*.txt; apt packages come from the signed Ubuntu 24.04 archive (a dated snapshot, see
+# the Dockerfile's ubuntu stage). Paths the tools land on are set as ENV in the Dockerfile (tools
+# stage); tests/smoke/tools.sh checks that every tool runs.
 set -eu
 
 . /run/pins.env
@@ -18,6 +19,9 @@ export UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never UV_PYTHON=/usr/bin/python3.12
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p "$TOOLS"
+# The versions the tools were installed from, for tests/smoke/tools.sh.
+install -m 0644 /run/pins.env "$TOOLS/pins.env"
+install -m 0644 "$SRC"/requirements-pwntools.in "$SRC"/requirements-unblob.in "$TOOLS/"
 
 # --- apt ----------------------------------------------------------------------------------------
 # tools:    binutils (objdump, strings), rizin's neighbours, gdb, sigrok-cli (0.7.2 = REA's), adb,
@@ -69,9 +73,15 @@ git -C "$pw/src" remote add origin https://github.com/pwndbg/pwndbg.git
 git -C "$pw/src" fetch -q --depth 1 origin "$TOOL_PWNDBG_COMMIT"
 git -C "$pw/src" checkout -q FETCH_HEAD
 [ "$(git -C "$pw/src" rev-parse HEAD)" = "$TOOL_PWNDBG_COMMIT" ]
-# ziglang (~100 MB) only backs the optional cymbol command.
+# ziglang (~100 MB) only backs the optional cymbol command. Its lock has two sdists (pt,
+# intervaltree): built against hash-locked backends (--no-build-isolation), which fails if the
+# lock gains another.
+uv venv -q --python "$UV_PYTHON" "$pw/venv"
+uv pip install -q --python "$pw/venv/bin/python" --require-hashes --no-deps --no-build \
+  -r "$SRC/requirements-pwndbg-build.txt"
 (cd "$pw/src" && UV_PROJECT_ENVIRONMENT="$pw/venv" uv sync -q --frozen --no-dev --no-install-project \
-  --no-install-package ziglang --no-build-package pwndbg)
+  --no-install-package ziglang --no-build-isolation --inexact)
+uv pip uninstall -q --python "$pw/venv/bin/python" poetry-core
 rm -rf "$pw/src/.git"
 
 # --- pinned upstream archives --------------------------------------------------------------------
@@ -113,44 +123,3 @@ rm -rf "$TOOLS/chrome/WidevineCdm"
 
 # Everything under /opt/rebox/tools must be readable and executable by the unprivileged runtime user.
 chmod -R a+rX "$TOOLS"
-
-# --- self-check: every tool must run, or the build fails -----------------------------------------
-echo "== self-check"
-must_ok() { # name cmd... : the full exit status counts (no pipe)
-  name=$1; shift
-  "$@" >"$work/out" 2>&1 || { cat "$work/out" >&2; echo "self-check FAILED: $name ($*)" >&2; exit 1; }
-  printf '%-14s %s\n' "$name" "$(head -n 1 "$work/out")"
-}
-must_ok objdump    objdump --version
-must_ok strings    strings --version
-must_ok file       file --version
-must_ok xxd        xxd -v
-must_ok 7z         7z i
-must_ok unzip      unzip -v
-must_ok gdb        gdb --version
-must_ok sigrok-cli sigrok-cli --version
-must_ok adb        adb version
-must_ok tshark     tshark --version
-must_ok capinfos   capinfos --version
-must_ok prlimit    prlimit --version
-must_ok rizin      rizin -v
-must_ok binwalk    binwalk --version
-must_ok unblob     unblob --version
-must_ok apktool    apktool --version
-must_ok mitmdump   "$TOOLS/mitmproxy/mitmdump" --version
-must_ok wasm-validate  "$TOOLS/wabt/bin/wasm-validate" --version
-must_ok wasm-objdump   "$TOOLS/wabt/bin/wasm-objdump" --version
-must_ok wasm2wat       "$TOOLS/wabt/bin/wasm2wat" --version
-must_ok chrome     "$TOOLS/chrome/chrome" --version
-must_ok pwntools   "$TOOLS/pwntools/bin/python" -c '
-import importlib.metadata as m
-v = {n: m.version(n) for n in ("pwntools", "pyelftools", "unicorn")}
-assert v == {"pwntools": "4.15.0", "pyelftools": "0.33", "unicorn": "2.1.2"}, v
-from pwn import ELF  # noqa: F401
-print(v)'
-must_ok jadx-jar   /opt/java/bin/jar tf "$TOOLS/jadx/jadx-headless-mcp.jar"
-# pwndbg is loaded the way REA loads it: gdb sources gdbinit.py with the venv selected.
-must_ok pwndbg env PWNDBG_VENV_PATH="$TOOLS/pwndbg/venv" PWNDBG_NO_AUTOUPDATE=1 HOME="$work" TERM=dumb \
-  gdb -nx -q -batch -ex "source $TOOLS/pwndbg/src/gdbinit.py"
-grep -q 'loaded [0-9]* pwndbg commands' "$work/out" || { cat "$work/out" >&2; echo "self-check FAILED: pwndbg did not load" >&2; exit 1; }
-echo "== self-check passed"

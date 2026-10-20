@@ -5,6 +5,12 @@
 # features and the REA skill install are expected to be unavailable and are not asserted on.
 set -u
 
+# The versions the tools were built from (deps/tools/install-tools.sh keeps them in the image).
+tools=/opt/rebox/tools
+. "$tools/pins.env"
+re() { printf '%s' "$1" | sed 's/\./\\./g'; }  # a version as a regex
+locked() { sed -n "s/^$2==//p" "$tools/requirements-$1.in"; }  # <file> <package>: its pinned version
+
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 # Apktool and adb keep state under $HOME.
@@ -50,22 +56,24 @@ run git         '^git version'                git --version
 run curl        '^curl '                      curl --version
 run prlimit     '^prlimit'                    prlimit --version
 run gdb         '^GNU gdb'                    "${REA_GDB_COMMAND:-gdb}" --version
-run rizin       '^rizin 0\.'                  "${REA_RIZIN_COMMAND:-rizin}" -v
+run rizin       "^rizin $(re "$TOOL_RIZIN_VERSION")" "${REA_RIZIN_COMMAND:-rizin}" -v
 run adb         '^Android Debug Bridge'       "${REA_ADB_PATH:-adb}" version
-run apktool     '^[0-9]+\.[0-9]+'             "${REA_APKTOOL_COMMAND:-apktool}" --version
-run binwalk     '^binwalk 3\.1\.'             "$REA_BINWALK_COMMAND" --version
-run unblob      '^26\.6\.'                    "$REA_UNBLOB_COMMAND" --version
+run apktool     "^$(re "$TOOL_APKTOOL_VERSION")" "${REA_APKTOOL_COMMAND:-apktool}" --version
+run binwalk     "^binwalk $(re "${TOOL_BINWALK_REF#v}")" "$REA_BINWALK_COMMAND" --version
+run unblob      "^$(re "$(locked unblob unblob)")" "$REA_UNBLOB_COMMAND" --version
 run tshark      '^TShark .* 4\.'              "$REA_TSHARK_COMMAND" --version
 run capinfos    '^Capinfos .* 4\.'            "$REA_CAPINFOS_COMMAND" --version
 run sigrok-cli  '^sigrok-cli 0\.7\.'          "$REA_SIGROK_COMMAND" --version
-run wasm-validate '^1\.0\.42'                 "$REA_WABT_BIN_DIRECTORY/wasm-validate" --version
-run wasm-objdump  '^1\.0\.42'                 "$REA_WABT_BIN_DIRECTORY/wasm-objdump" --version
-run wasm2wat      '^1\.0\.42'                 "$REA_WABT_BIN_DIRECTORY/wasm2wat" --version
-run mitmdump    '^Mitmproxy: 12\.2\.3'        "$REA_MITMDUMP_COMMAND" --version
-run chrome      'Chrome for Testing'          "$REA_BROWSER_EXECUTABLE" --version
+for t in wasm-validate wasm-objdump wasm2wat; do
+  run $t "^$(re "$TOOL_WABT_VERSION")" "$REA_WABT_BIN_DIRECTORY/$t" --version
+done
+run mitmdump    "^Mitmproxy: $(re "$TOOL_MITMPROXY_VERSION")" "$REA_MITMDUMP_COMMAND" --version
+run chrome      "Chrome for Testing $(re "$TOOL_CHROME_VERSION")" "$REA_BROWSER_EXECUTABLE" --version
 run jadx-jar    'MANIFEST'                    jar tf "$REA_JADX_MCP_JAR"
-run pwntools    "'pwntools': '4.15.0'"        "$REA_PWNTOOLS_PYTHON" -c '
+run pwntools    "'pwntools': '$(locked pwntools pwntools)', 'pyelftools': '$(locked pwntools pyelftools)', 'unicorn': '$(locked pwntools unicorn)'" \
+  "$REA_PWNTOOLS_PYTHON" -c '
 import importlib.metadata as m
+from pwn import ELF  # noqa: F401
 print({n: m.version(n) for n in ("pwntools", "pyelftools", "unicorn")})'
 run pwndbg      'loaded [0-9]+ pwndbg commands' env PWNDBG_VENV_PATH="$REA_PWNDBG_VENV_PATH" PWNDBG_NO_AUTOUPDATE=1 \
   "$REA_PWNDBG_GDB" -nx -q -batch -ex "source $REA_PWNDBG_GDBINIT"

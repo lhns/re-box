@@ -40,8 +40,8 @@ grep -q 'ignoring them' <<<"$out" || fail "no PUID warning in uid-1000 mode: $ou
   || fail "arbitrary uid did not get a writable HOME"
 
 # As root, PUID/PGID 0 is refused.
-for bad in 0 00 "" x1; do
-  if [ -n "$bad" ] && env PUID="$bad" /usr/local/bin/re-box-entrypoint true 2>/dev/null; then fail "PUID=$bad accepted"; fi
+for bad in 0 00 x1; do
+  if env PUID="$bad" /usr/local/bin/re-box-entrypoint true 2>/dev/null; then fail "PUID=$bad accepted"; fi
 done
 
 # Security defaults.
@@ -63,5 +63,11 @@ grep -q 'GHIDRA_MCP_REQUIRE_PROGRAM_SELECTORS = "1"' /etc/rebox/aggregator.toml 
 # The shipped REA skill is rewritten to the prefixed names.
 skill=/opt/rebox/skills/reverse-engineer-anything/SKILL.md
 grep -q 'rea_open_binary' "$skill" || fail "skill not rewritten"
+
+# The image's empty /work follows the PUID/PGID remap (a fresh named volume starts as the image has
+# it), so the default RE_WORKDIR stays usable. Last: the remap sticks to the rebox user.
+[ "$(stat -c %u:%g /work)" = 1000:1000 ] || fail "/work is not rebox's in the image"
+out=$(env PUID=4321 PGID=4321 /usr/local/bin/re-box-entrypoint stat -c %u:%g /work)
+[ "$out" = 4321:4321 ] || fail "/work did not follow the remap: $out"
 
 echo "image smoke: ok"

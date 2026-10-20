@@ -9,9 +9,15 @@ docker build --target final -t re-box .      # the release image
 
 `final` copies `/opt/rebox/tests-passed`, which only a passing `test` stage writes, so building
 `final` always runs the suite first (docs/DECISIONS.md, "Supervision"). Stages:
-`pins -> base -> ghidra, ghidra-mcp, rea -> runtime-core -> runtime -> test -> final`. All
-downloads are pinned in `versions.env` and checked against their sha256; after a version change
-run `python3 scripts/check-pins.py --update` (docs/OPERATIONS.md, "Upgrades").
+`pins`; `ubuntu -> base -> tools, build-backends, ghidra, ghidra-mcp, rea, fixtures`;
+`tools + ghidra + ghidra-mcp + rea -> runtime -> test -> final`. `tools` (the analysis tools) comes
+before the others are copied in, so a change to ghidra-mcp, its patches or REA does not reinstall
+them. All downloads are pinned in `versions.env` and checked against their sha256; after a version
+change run `python3 scripts/check-pins.py --update` (docs/OPERATIONS.md, "Upgrades"). apt reads a
+dated Ubuntu snapshot (`APT_SNAPSHOT` in `versions.env`; move it by hand to a recent date and run
+the test stage). Python build backends and the tools' lockfiles are hash-locked: regenerate with
+`uv pip compile --generate-hashes --python-version 3.12 deps/<dir>/requirements-<name>.in -o
+deps/<dir>/requirements-<name>.txt` (the header it writes is what Renovate re-runs).
 
 ## CI
 
@@ -19,9 +25,10 @@ run `python3 scripts/check-pins.py --update` (docs/OPERATIONS.md, "Upgrades").
 
 | job | runs on | what |
 | --- | --- | --- |
-| `pins` | every push and PR | `scripts/check-pins.py`: every `versions.env` digest matches its URL |
-| `unit` | every push and PR | aggregator unit tests with fake children (seconds, no image) |
-| `image` | after both | builds `test` (the suite); on `main`, `v*` tags and manual runs also builds and pushes `final` |
+| `changes` | every push and PR | whether `versions.env`, `scripts/check-pins.py`, `renovate.json`, `deps/rea/package-lock.json` or `.github/workflows/` changed |
+| `pins` | when `changes` says so, on `v*` tags and manual runs | `scripts/check-pins.py`: every `versions.env` digest matches its URL (hundreds of MB of downloads) |
+| `unit` | every push and PR | check-pins and aggregator unit tests with fake children (seconds, no image) |
+| `image` | after `unit` and `pins` (skipped `pins` is fine) | builds `test` (the suite); on `main`, `v*` tags and manual runs also builds and pushes `final` |
 
 - **Registry:** `ghcr.io/lhns/re-box`, pushed with the job's `GITHUB_TOKEN` (`packages: write`).
   Tags: `sha-<short>` always, `latest` on `main`, `X.Y.Z` and `X.Y` for a `vX.Y.Z` git tag.

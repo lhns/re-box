@@ -1,0 +1,3 @@
+# Build backends of the two sdists in pwndbg's own uv.lock: pt (poetry-core), intervaltree (setuptools).
+poetry-core==2.5.0
+setuptools==82.0.1

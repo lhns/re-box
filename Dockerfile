@@ -1,7 +1,8 @@
 # syntax=docker/dockerfile:1
 #
 # re-box: ghidra-mcp + REA behind one authenticated MCP endpoint. Stages:
-#   pins -> base -> ghidra, ghidra-mcp, rea (-> rea-attach) -> runtime-core -> runtime -> test -> final
+#   pins; ubuntu -> base -> tools, build-backends, ghidra, ghidra-mcp, rea (-> rea-attach), fixtures
+#   tools + ghidra + ghidra-mcp + rea -> runtime -> test -> final
 # `final` copies a marker that only a passing `test` stage writes, so building `final` (the
 # release image CI builds; an in-cluster ImageBuild also works) always runs the test suite.
 # Pins live in versions.env; docs/DECISIONS.md says why each departure from the spec exists.
@@ -13,6 +14,7 @@ RUN <<'EOS'
 set -eu
 cd /pins
 split() { grep -E "^($2)=" versions.env > "$1.env" || true; }
+split apt 'APT_SNAPSHOT'
 split ghidra 'GHIDRA_VERSION|GHIDRA_RELEASE_DATE|GHIDRA_URL|GHIDRA_SHA256'
 split ghidra-mcp 'GHIDRA_MCP_[A-Z0-9_]+'
 split rea 'REA_VERSION'
@@ -23,12 +25,31 @@ EOS
 
 FROM ghcr.io/astral-sh/uv:0.13.1@sha256:4a1f3666816dafadd20ceb71eac9a7d56d7ef30279f7d64048519ab901ada336 AS uv
 
+# --- ubuntu: apt reads a dated archive snapshot (APT_SNAPSHOT in versions.env), so a rebuild gets
+# the same packages. https needs the CA bundle: the one package taken from the live archive.
+FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS ubuntu
+ENV DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=pins,source=/pins/apt.env,target=/run/pins.env <<'EOS'
+set -eu
+. /run/pins.env
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates
+cat > /etc/apt/sources.list.d/ubuntu.sources <<EOF
+Types: deb
+URIs: https://snapshot.ubuntu.com/ubuntu/$APT_SNAPSHOT/
+Suites: noble noble-updates noble-backports noble-security
+Components: main universe restricted multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+rm -rf /var/lib/apt/lists/*
+EOS
+
 # --- base: OS packages, JDK, Node, Python (Ubuntu's 3.12) and uv. Shared by build and runtime.
-FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS base
-ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8
+FROM ubuntu AS base
+ENV LANG=C.UTF-8
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      ca-certificates curl git jq procps python3 python3-venv tini unzip util-linux xz-utils \
+      curl git jq procps python3 python3-venv tini unzip util-linux xz-utils \
  && rm -rf /var/lib/apt/lists/*
 # fetch <url> <sha256> <dest>: every download is checked against its pin.
 COPY rootfs/usr/local/lib/rebox/fetch.sh /usr/local/lib/rebox/fetch.sh
@@ -53,6 +74,48 @@ ENV JAVA_HOME=/opt/java \
     UV_LINK_MODE=copy \
     UV_COMPILE_BYTECODE=1
 
+# --- build-backends: hatchling (the aggregator's and the bridge's), installed from hashes. The
+# wheels are built against it with --no-build-isolation, so no backend is fetched unverified.
+FROM base AS build-backends
+RUN --mount=type=bind,source=deps/build,target=/build <<'EOS'
+set -eu
+uv venv -q /opt/build-venv
+uv pip install -q -p /opt/build-venv/bin/python --require-hashes --no-deps --no-build -r /build/requirements-hatchling.txt
+EOS
+
+# --- tools: the analysis tools REA drives on Linux (spec 6.3); deps/tools/install-tools.sh. Built
+# before Ghidra, ghidra-mcp and REA come in, so a change to those does not reinstall them.
+FROM base AS tools
+RUN --mount=type=bind,from=pins,source=/pins/tools.env,target=/run/pins.env \
+    --mount=type=bind,source=deps/tools,target=/build/tools \
+    sh /build/tools/install-tools.sh
+# Where REA finds each tool. REA enables the firmware, packet, signal and WASM features only for
+# absolute paths, and compares REA_BROWSER_NO_SANDBOX to the string "true": Chromium's sandbox
+# needs user namespaces the container does not grant, the container is the sandbox.
+ENV REA_RIZIN_COMMAND=/usr/local/bin/rizin \
+    REA_OBJDUMP_COMMAND=/usr/bin/objdump \
+    REA_GDB_COMMAND=/usr/bin/gdb \
+    REA_JADX_MCP_JAR=/opt/rebox/tools/jadx/jadx-headless-mcp.jar \
+    REA_JADX_HEAP_MIB=2048 \
+    REA_APKTOOL_COMMAND=/usr/local/bin/apktool \
+    REA_ADB_PATH=/usr/bin/adb \
+    REA_BINWALK_COMMAND=/usr/local/bin/binwalk \
+    REA_UNBLOB_COMMAND=/usr/local/bin/unblob \
+    REA_FIRMWARE_PRLIMIT_COMMAND=/usr/bin/prlimit \
+    REA_TSHARK_COMMAND=/usr/bin/tshark \
+    REA_CAPINFOS_COMMAND=/usr/bin/capinfos \
+    REA_TSHARK_PRLIMIT_COMMAND=/usr/bin/prlimit \
+    REA_SIGROK_COMMAND=/usr/bin/sigrok-cli \
+    REA_SIGROK_PRLIMIT_COMMAND=/usr/bin/prlimit \
+    REA_WABT_BIN_DIRECTORY=/opt/rebox/tools/wabt/bin \
+    REA_PWNTOOLS_PYTHON=/opt/rebox/tools/pwntools/bin/python \
+    REA_PWNDBG_GDB=/usr/bin/gdb \
+    REA_PWNDBG_GDBINIT=/opt/rebox/tools/pwndbg/src/gdbinit.py \
+    REA_PWNDBG_VENV_PATH=/opt/rebox/tools/pwndbg/venv \
+    REA_MITMDUMP_COMMAND=/opt/rebox/tools/mitmproxy/mitmdump \
+    REA_BROWSER_EXECUTABLE=/opt/rebox/tools/chrome/chrome \
+    REA_BROWSER_NO_SANDBOX=true
+
 # --- ghidra: the one install both REA and ghidra-mcp use (DECISIONS.md, 5.1).
 FROM base AS ghidra
 RUN --mount=type=bind,from=pins,source=/pins/ghidra.env,target=/run/pins.env <<'EOS'
@@ -75,7 +138,9 @@ set -eu
 . /run/pins.env
 git init -q /src/ghidra-mcp && cd /src/ghidra-mcp
 git remote add origin https://github.com/bethington/ghidra-mcp.git
-tag_commit=$(git ls-remote origin "refs/tags/$GHIDRA_MCP_REF^{}" | cut -f1)
+# An annotated tag lists its own object and the commit (^{}); a lightweight one only the commit.
+tag_commit=$(git ls-remote origin "refs/tags/$GHIDRA_MCP_REF" "refs/tags/$GHIDRA_MCP_REF^{}" \
+  | awk -v r="refs/tags/$GHIDRA_MCP_REF" '$2 == r "^{}" { peeled = $1 } $2 == r { direct = $1 } END { print peeled ? peeled : direct }')
 [ "$tag_commit" = "$GHIDRA_MCP_COMMIT" ] || { echo "tag $GHIDRA_MCP_REF is $tag_commit, pinned $GHIDRA_MCP_COMMIT" >&2; exit 1; }
 git fetch -q --depth 1 origin "$GHIDRA_MCP_COMMIT"
 git checkout -q FETCH_HEAD
@@ -110,21 +175,25 @@ t=$(mktemp -d)
 fetch "$GRADLE_URL" "$GRADLE_SHA256" "$t/gradle.zip"
 unzip -q "$t/gradle.zip" -d "$t"
 cd /src/ghidra-mcp
-# Compile only: the Java unit tests would pull junit/mockito from Maven Central unverified.
+# Compile only: the compile classpath is Ghidra's own jars (build.gradle), while the Java unit
+# tests would pull junit and mockito from Maven Central unverified.
 "$t/gradle-$GRADLE_VERSION/bin/gradle" --no-daemon -q jar -x test -PGHIDRA_INSTALL_DIR=/opt/ghidra
 mkdir -p /opt/ghidra-mcp
 cp build/libs/GhidraMCP-*.jar /opt/ghidra-mcp/GhidraMCP.jar
 cp /src/ghidra-mcp.version /opt/ghidra-mcp/VERSION
 rm -rf "$t" /root/.gradle
 EOS
-# The bridge's runtime deps come from upstream's uv.lock with hashes; the bridge itself from source.
-RUN <<'EOS'
+# The bridge's runtime deps come from upstream's uv.lock with hashes, wheels only; the bridge
+# itself is built from source with the hash-locked backend (stage build-backends).
+RUN --mount=type=bind,from=build-backends,source=/opt/build-venv,target=/opt/build-venv <<'EOS'
 set -eu
 cd /src/ghidra-mcp
 uv export --frozen --no-default-groups --no-emit-project --format requirements-txt -o /tmp/bridge-req.txt
 uv venv -q /opt/ghidra-mcp/venv
-uv pip install -q -p /opt/ghidra-mcp/venv/bin/python --require-hashes -r /tmp/bridge-req.txt
-uv pip install -q -p /opt/ghidra-mcp/venv/bin/python --no-deps .
+uv pip install -q -p /opt/ghidra-mcp/venv/bin/python --require-hashes --no-build -r /tmp/bridge-req.txt
+uv build -q --wheel --no-build-isolation --python /opt/build-venv/bin/python -o /tmp/wheels .
+uv pip install -q -p /opt/ghidra-mcp/venv/bin/python --no-deps /tmp/wheels/*.whl
+rm -rf /tmp/wheels
 /opt/ghidra-mcp/venv/bin/bridge-mcp-ghidra --help >/dev/null
 EOS
 
@@ -144,7 +213,7 @@ EOS
 
 # --- rea-attach: REA's Ghidra sessions attach to the ghidra-mcp JVM (deps/rea-attach,
 # DECISIONS.md). The tests check the patch anchors against this REA release first; any mismatch
-# fails the build. Copied into `runtime` late, so a patch change does not rebuild the tools.
+# fails the build.
 FROM rea AS rea-attach
 RUN --mount=type=bind,source=deps/rea-attach,target=/src/rea-attach <<'EOS'
 set -eu
@@ -156,7 +225,7 @@ install -m 0644 ReboxReaAttach.java helper.mjs /opt/rebox/rea-attach/
 EOS
 
 # --- fixtures: test binaries (spec 8.2).
-FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS fixtures
+FROM ubuntu AS fixtures
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc libc6-dev gcc-mingw-w64-x86-64 gcc-mipsel-linux-gnu binutils \
  && rm -rf /var/lib/apt/lists/*
@@ -188,34 +257,32 @@ mipsel-linux-gnu-gcc $free -march=mips32r2 -mabi=32 -msoft-float -mno-abicalls -
 sh /src/make-dos.sh /fixtures
 EOS
 
-# --- runtime-core: Ghidra, ghidra-mcp and REA, before the extra tools and the aggregator.
-FROM base AS runtime-core
+# --- runtime: everything the release image needs. The tools come first (stage tools).
+FROM tools AS runtime
 COPY --from=ghidra /opt/ghidra /opt/ghidra
 COPY --from=ghidra-mcp /opt/ghidra-mcp /opt/ghidra-mcp
 COPY --from=rea /opt/rea /opt/rea
 RUN ln -s /opt/rea/node_modules/.bin/rea /usr/local/bin/rea
 ENV GHIDRA_INSTALL_DIR=/opt/ghidra
-
-# --- runtime: everything the release image needs.
-FROM runtime-core AS runtime
 # Ubuntu's image ships a uid-1000 user `ubuntu`; rebox takes that id.
 RUN userdel -r ubuntu 2>/dev/null; groupadd -g 1000 rebox && useradd -u 1000 -g 1000 -m -s /bin/bash rebox
-# The analysis tools REA drives on Linux (spec 6.3); deps/tools/install-tools.sh.
-RUN --mount=type=bind,from=pins,source=/pins/tools.env,target=/run/pins.env     --mount=type=bind,source=deps/tools,target=/build/tools     sh /build/tools/install-tools.sh
-# Where REA finds each tool. REA enables the firmware, packet, signal and WASM features only for
-# absolute paths, and compares REA_BROWSER_NO_SANDBOX to the string "true": Chromium's sandbox
-# needs user namespaces the container does not grant, the container is the sandbox.
-ENV REA_RIZIN_COMMAND=/usr/local/bin/rizin     REA_OBJDUMP_COMMAND=/usr/bin/objdump     REA_GDB_COMMAND=/usr/bin/gdb     REA_JADX_MCP_JAR=/opt/rebox/tools/jadx/jadx-headless-mcp.jar     REA_JADX_HEAP_MIB=2048     REA_APKTOOL_COMMAND=/usr/local/bin/apktool     REA_ADB_PATH=/usr/bin/adb     REA_BINWALK_COMMAND=/usr/local/bin/binwalk     REA_UNBLOB_COMMAND=/usr/local/bin/unblob     REA_FIRMWARE_PRLIMIT_COMMAND=/usr/bin/prlimit     REA_TSHARK_COMMAND=/usr/bin/tshark     REA_CAPINFOS_COMMAND=/usr/bin/capinfos     REA_TSHARK_PRLIMIT_COMMAND=/usr/bin/prlimit     REA_SIGROK_COMMAND=/usr/bin/sigrok-cli     REA_SIGROK_PRLIMIT_COMMAND=/usr/bin/prlimit     REA_WABT_BIN_DIRECTORY=/opt/rebox/tools/wabt/bin     REA_PWNTOOLS_PYTHON=/opt/rebox/tools/pwntools/bin/python     REA_PWNDBG_GDB=/usr/bin/gdb     REA_PWNDBG_GDBINIT=/opt/rebox/tools/pwndbg/src/gdbinit.py     REA_PWNDBG_VENV_PATH=/opt/rebox/tools/pwndbg/venv     REA_MITMDUMP_COMMAND=/opt/rebox/tools/mitmproxy/mitmdump     REA_BROWSER_EXECUTABLE=/opt/rebox/tools/chrome/chrome     REA_BROWSER_NO_SANDBOX=true
 # REA's patched `rea mcp` chunk and the attach files (stage rea-attach). The patched bridge must
 # still compile against this Ghidra, or sessions would fail at open.
 COPY --from=rea-attach /opt/rea/node_modules/rea-agents/dist/mcp /opt/rea/node_modules/rea-agents/dist/mcp
 COPY --from=rea-attach /opt/rebox/rea-attach /opt/rebox/rea-attach
 RUN --mount=type=bind,source=deps/rea-attach/compile-check.sh,target=/run/compile-check.sh \
     sh /run/compile-check.sh /opt/ghidra /opt/rebox/rea-attach
+# The aggregator: runtime deps from its uv.lock, the package built with the hash-locked backend.
 COPY aggregator /src/aggregator
-RUN UV_PROJECT_ENVIRONMENT=/opt/rebox/venv uv sync -q --frozen --no-dev --no-editable --project /src/aggregator \
- && rm -rf /src /root/.cache /tmp/hsperfdata_root /tmp/uv-* /var/tmp/*
-# A fresh named volume at /work is root-owned otherwise, and the uid-1000 supervisor refuses it.
+RUN --mount=type=bind,from=build-backends,source=/opt/build-venv,target=/opt/build-venv <<'EOS'
+set -eu
+UV_PROJECT_ENVIRONMENT=/opt/rebox/venv uv sync -q --frozen --no-dev --no-install-project --no-build --project /src/aggregator
+uv build -q --wheel --no-build-isolation --python /opt/build-venv/bin/python -o /tmp/wheels /src/aggregator
+uv pip install -q -p /opt/rebox/venv/bin/python --no-deps /tmp/wheels/*.whl
+rm -rf /src /root/.cache /tmp/hsperfdata_root /tmp/uv-* /tmp/wheels /var/tmp/*
+EOS
+# A fresh named volume at /work is root-owned otherwise, and the uid-1000 supervisor refuses it
+# (the entrypoint re-owns an empty /work when PUID/PGID remap the user).
 # 0755 home: the PUID remap's `usermod` must read it without CAP_DAC_OVERRIDE (it is empty).
 RUN mkdir -p /work && chown 1000:1000 /work && chmod 0755 /home/rebox
 COPY --chmod=0755 rootfs/usr/local/bin/ /usr/local/bin/
@@ -259,7 +326,7 @@ FROM ghidra-mcp-src AS ghidra-mcp-test
 RUN <<'EOS'
 set -eu
 cd /src/ghidra-mcp
-uv sync -q --frozen --no-default-groups --group test
+uv sync -q --frozen --no-default-groups --group test --no-install-project --no-build
 uv run --no-sync pytest -q -p no:cacheprovider --no-cov tests/offline/
 uv run --no-sync pytest -q -p no:cacheprovider --no-cov -p tests.offline.replay_plugin tests/integration/test_readonly_endpoints.py
 touch /ghidra-mcp-offline-passed
@@ -272,7 +339,14 @@ COPY --from=ghidra-mcp-test /ghidra-mcp-offline-passed /opt/rebox/
 COPY --from=fixtures /fixtures /opt/rebox/fixtures
 COPY aggregator /src/aggregator
 # UV_NO_CACHE: HOME is /home/rebox here, and a root-owned cache there breaks the tools as rebox.
-RUN UV_NO_CACHE=1 UV_PROJECT_ENVIRONMENT=/opt/rebox/test-venv uv sync -q --frozen --project /src/aggregator
+RUN --mount=type=bind,from=build-backends,source=/opt/build-venv,target=/opt/build-venv <<'EOS'
+set -eu
+export UV_NO_CACHE=1 UV_PROJECT_ENVIRONMENT=/opt/rebox/test-venv
+uv sync -q --frozen --no-install-project --no-build --project /src/aggregator
+uv build -q --wheel --no-build-isolation --python /opt/build-venv/bin/python -o /tmp/wheels /src/aggregator
+uv pip install -q -p /opt/rebox/test-venv/bin/python --no-deps /tmp/wheels/*.whl
+rm -rf /tmp/wheels
+EOS
 COPY --chmod=0755 tests /src/tests
 RUN /src/tests/run-tests.sh
 

@@ -14,6 +14,12 @@ if [ "$(id -u)" = 0 ]; then
   fi
   [ "$(id -g rebox)" = "$pgid" ] || groupmod -o -g "$pgid" rebox
   [ "$(id -u rebox)" = "$puid" ] || usermod -o -u "$puid" rebox  # also re-owns /home/rebox
+  # The image's /work belongs to uid 1000, and so does a fresh named volume that starts from it:
+  # follow the remap while nothing lives there yet, or the supervisor refuses RE_WORKDIR. A bind
+  # mount with data is the operator's to chown.
+  if [ "${RE_WORKDIR:-/work}" = /work ] && [ "$(stat -c %u /work 2>/dev/null)" = 1000 ] && [ -z "$(ls -A /work)" ]; then
+    chown "$puid:$pgid" /work
+  fi
   export HOME=/home/rebox USER=rebox LOGNAME=rebox
   exec setpriv --reuid=rebox --regid=rebox --init-groups --no-new-privs --inh-caps=-all -- "$@"
 fi
