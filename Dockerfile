@@ -5,7 +5,7 @@
 #   tools + ghidra + ghidra-mcp + rea -> runtime -> test -> final
 # `final` copies a marker that only a passing `test` stage writes, so building `final` (the
 # release image CI builds; an in-cluster ImageBuild also works) always runs the test suite.
-# Pins live in versions.env; docs/DECISIONS.md says why each departure from the spec exists.
+# Pins live in versions.env; docs/DECISIONS.md says why things are the way they are.
 
 # --- pins: versions.env split per component, so a bump rebuilds only the stages that use it.
 FROM ubuntu:24.04@sha256:68ee22004a9109b44973313b02ff7b1de250f1de0f5ecb628d73f579aaff33ac AS pins
@@ -83,7 +83,7 @@ uv venv -q /opt/build-venv
 uv pip install -q -p /opt/build-venv/bin/python --require-hashes --no-deps --no-build -r /build/requirements-hatchling.txt
 EOS
 
-# --- tools: the analysis tools REA drives on Linux (spec 6.3); deps/tools/install-tools.sh. Built
+# --- tools: the analysis tools REA drives on Linux; deps/tools/install-tools.sh. Built
 # before Ghidra, ghidra-mcp and REA come in, so a change to those does not reinstall them.
 FROM base AS tools
 RUN --mount=type=bind,from=pins,source=/pins/tools.env,target=/run/pins.env \
@@ -224,7 +224,7 @@ python3 -B patch-rea.py /opt/rea/node_modules/rea-agents /opt/rebox/rea-attach/g
 install -m 0644 ReboxReaAttach.java helper.mjs /opt/rebox/rea-attach/
 EOS
 
-# --- fixtures: test binaries (spec 8.2).
+# --- fixtures: test binaries.
 FROM ubuntu AS fixtures
 RUN apt-get update \
  && apt-get install -y --no-install-recommends gcc libc6-dev gcc-mingw-w64-x86-64 gcc-mipsel-linux-gnu binutils \
@@ -289,7 +289,7 @@ COPY --chmod=0755 rootfs/usr/local/bin/ /usr/local/bin/
 COPY rootfs/usr/local/lib/rebox/ /usr/local/lib/rebox/
 COPY rootfs/etc/rebox/ /etc/rebox/
 # REA's workflow skill for the client side, with tool names prefixed as the aggregator serves
-# them (spec 11). Extract: docker run --rm <image> tar -C /opt/rebox/skills -c . | tar -x -C ~/.claude/skills
+# them. Extract: docker run --rm <image> tar -C /opt/rebox/skills -c . | tar -x -C ~/.claude/skills
 RUN python3 /usr/local/lib/rebox/rewrite-skill.py /opt/rea/node_modules/rea-agents/skills /opt/rebox/skills rea_
 # Defaults; docs/OPERATIONS.md explains each. Memory: the JAVA_OPTS heap holds ghidra-mcp's and
 # REA's programs (REA attaches to that JVM); these fit 16 GiB. The G1 flags give heap back after
@@ -321,7 +321,7 @@ WORKDIR /home/rebox
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/re-box-entrypoint"]
 CMD ["/opt/rebox/venv/bin/rebox-supervisor"]
 
-# --- ghidra-mcp-test: upstream's offline tier at the pinned ref (spec 8.1), no Ghidra needed.
+# --- ghidra-mcp-test: upstream's offline tier at the pinned ref, no Ghidra needed.
 FROM ghidra-mcp-src AS ghidra-mcp-test
 RUN <<'EOS'
 set -eu
@@ -332,7 +332,7 @@ uv run --no-sync pytest -q -p no:cacheprovider --no-cov -p tests.offline.replay_
 touch /ghidra-mcp-offline-passed
 EOS
 
-# --- test: the whole suite (spec 8). Root, to exercise the PUID/PGID remap; tests/run-tests.sh.
+# --- test: the whole suite. Root, to exercise the PUID/PGID remap; tests/run-tests.sh.
 FROM runtime AS test
 USER root
 COPY --from=ghidra-mcp-test /ghidra-mcp-offline-passed /opt/rebox/

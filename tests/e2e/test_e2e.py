@@ -1,5 +1,5 @@
-"""End-to-end suite (spec 8.3) against the running container services, over streamable HTTP
-with the Bearer token, exactly as a harness connects. Numbers in the test names follow the spec.
+"""End-to-end suite against the running container services, over streamable HTTP with the Bearer
+token, exactly as a harness connects. The numbers in the test names fix their order.
 """
 from __future__ import annotations
 

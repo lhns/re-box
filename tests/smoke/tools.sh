@@ -1,5 +1,5 @@
 #!/bin/bash
-# Smoke test for the bundled analysis tools (spec 8.1, first two bullets). Run as the runtime user with
+# Smoke test for the bundled analysis tools. Run as the runtime user with
 # the image env (the REA_* tool paths in the Dockerfile). Exits non-zero if
 # any tool or REA-reported readiness check fails. Hopper, IDA, JEB, Kuna, ILSpy, macOS/Apple
 # features and the REA skill install are expected to be unavailable and are not asserted on.
