@@ -5,8 +5,8 @@ One container for agent-driven reverse engineering: [Ghidra](https://github.com/
 [ghidra-mcp](https://github.com/bethington/ghidra-mcp), plus the Linux tools REA drives (rizin,
 gdb/pwndbg, pwntools, JADX, apktool, binwalk, unblob, tshark, sigrok, WABT, mitmproxy, Chrome for
 Testing), behind **one authenticated MCP endpoint** on port 8443. REA's tools and prompts are
-prefixed `rea_`, ghidra-mcp's `ghidra_`. Every MCP session gets its own REA and bridge processes; the
-ghidra-mcp Ghidra project is shared and persistent.
+prefixed `rea_`, ghidra-mcp's `ghidra_`. Every MCP session gets its own REA and bridge processes (and an attach helper per
+binary REA opens); the one Ghidra JVM and its project are shared and persistent.
 
 Image: `ghcr.io/lhns/re-box` (`latest` = `main`, `sha-<commit>`, `X.Y.Z` for release tags), linux/amd64, ~3.7 GB.
 

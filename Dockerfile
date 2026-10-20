@@ -295,7 +295,7 @@ RUN python3 /usr/local/lib/rebox/rewrite-skill.py /opt/rea/node_modules/rea-agen
 # REA's programs (REA attaches to that JVM); these fit 16 GiB. The G1 flags give heap back after
 # a burst.
 # GHIDRA_MCP_ALLOW_SCRIPTS: REA's bridge is started through ghidra-mcp's script endpoint; the
-# aggregator denies the script tools to clients (aggregator.toml), and 8089 is loopback-only.
+# aggregator denies the script tools to clients (aggregator.toml), and 8089 is loopback-only and token-protected.
 ENV RE_WORKDIR=/work \
     REBOX_PORT=8443 \
     REBOX_MAX_SESSIONS=4 \

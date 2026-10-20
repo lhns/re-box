@@ -31,7 +31,7 @@ services:
       # A separate state dir (e.g. an agent's scratchpad), also at its own path. Uncomment with
       # REBOX_STATE_DIR set in .env:
       # - ${REBOX_STATE_DIR}:${REBOX_STATE_DIR}
-      # REA's per-session Ghidra projects and tool scratch space: a few GB per busy session.
+      # REA's run dirs, target snapshot copies and tool scratch: a few GB per busy session.
       - rebox-tmp:/tmp
     ports:
       # Plain HTTP: keep it on loopback, or put a TLS proxy in front (docs/OPERATIONS.md, Security).

@@ -6,14 +6,14 @@ Against ghidra-mcp `dev` at `cf8b12db27eb139b28b90eaa3488306da910d759` (2026-10-
 here by concern. Patches are `git format-patch` output (`git am --keep-cr`); some contain CRLF
 lines on purpose (`.gitattributes` marks them `-text`).
 
-The table is sorted by letter, not by the order to open them in (see below).
+The table follows the order to open them in (below); the letters are the folder names.
 
 | Change | Patches | Size | Depends on |
 | --- | --- | --- | --- |
-| A. `import_file` loader options, `if_exists`, `wait`, serialization, unfinished-import redo | `A-import-loader-options/` (2 commits: move, feature) | 16 files, +1380 -192 | nothing |
-| B. `import_file` scripts, import script roots, script-load lock | `B-import-scripts/` | 20 files, +901 -48 | A and C |
 | C. Several roots in `GHIDRA_MCP_FILE_ROOT` | `C-file-roots/` | 7 files, +125 -27 | nothing |
 | D. `DirectThreadingStrategy.writeLock()` | `D-write-lock/` | 3 files, +66 -1 | nothing (builds on c30b7a74) |
+| A. `import_file` loader options, `if_exists`, `wait`, serialization, unfinished-import redo | `A-import-loader-options/` (2 commits: move, feature) | 16 files, +1380 -192 | nothing |
+| B. `import_file` scripts, import script roots, script-load lock | `B-import-scripts/` | 20 files, +901 -48 | A and C |
 
 Each folder has `PR.md` (description in dev's PR template). `ISSUE-backport-c30b7a74.md` asks for
 c30b7a74 on `release/7.0`.

@@ -51,8 +51,9 @@ spec:
       memory: 6Gi
       ephemeral-storage: 30Gi
     limits:
-      # The suite peaked at 2.7 GiB; the headless JVM may grow to its 4 GiB heap and REA's JVM to
-      # 1.5 GiB, and the Gradle and cargo (binwalk) build steps run JVM/rustc next to BuildKit.
+      # The suite peaked at 2.7 GiB; the shared Ghidra JVM may grow to its 8 GiB heap
+      # (docs/OPERATIONS.md, Memory), and the Gradle and cargo (binwalk) build steps run
+      # JVM/rustc next to BuildKit.
       memory: 12Gi
       ephemeral-storage: 40Gi
   push:
