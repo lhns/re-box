@@ -20,15 +20,16 @@ prefix = "rea_"
 command = ["/usr/local/bin/rea", "mcp"]
 # REA's Ghidra sessions run in the ghidra-mcp JVM on the shared project (deps/rea-attach): REA's
 # patched launcher starts this helper instead of its own JVM. To debug with REA's own JVMs, add
-# REBOX_REA_ATTACH = "0" (without either, REA's Ghidra provider refuses to start).
+# REBOX_REA_ATTACH = "0" (without either, REA's Ghidra provider refuses to start). The helper's
+# GHIDRA_MCP_AUTH_TOKEN for ghidra-mcp's port is inherited from the supervisor, not set here.
 [child.env]
 REBOX_REA_ATTACH_HELPER = "/opt/rebox/rea-attach/helper.mjs"
 # REA keeps its runtime roots (and the target snapshot the helper imports) under TMPDIR; the
-# supervisor creates this directory and lets ghidra-mcp import from it (supervisor.REA_TMP).
+# supervisor creates this directory and lets ghidra-mcp import from it (headless.REA_TMP).
 # {NAME} is filled in from the supervisor's environment.
 TMPDIR = "{REBOX_REA_TMP}"
-# REA's session state (and annotations on targets in its own JVM) is private to the process; its
-# evidence bundle keeps what it found. Run on session close and periodically when REBOX_STATE_DIR is
+# REA's session state (its evidence ledger, findings) is private to the process and ends with it;
+# its annotations persist in the shared project. The evidence bundle keeps what it found. Run on session close and periodically when REBOX_STATE_DIR is
 # set; {state_dir} and {session} are substituted. prune_empty deletes the file again when the
 # bundle holds nothing.
 [child.autosave]

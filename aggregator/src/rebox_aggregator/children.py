@@ -252,26 +252,3 @@ class Child:
             self._signal_group(signal.SIGKILL)
             await self._wait_group_gone(2.0)
 
-
-def kill_leftovers(session: str | None, instance: str, command: str | None = None) -> int:
-    """SIGKILL every process whose environment carries this instance (and session, when given) and, when
-    `command` is given, whose command line contains it."""
-    wanted = {f"REBOX_INSTANCE={instance}".encode()}
-    if session:
-        wanted.add(f"REBOX_SESSION={session}".encode())
-    killed = 0
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit() or int(entry) == os.getpid():
-            continue
-        try:
-            if command:
-                with open(f"/proc/{entry}/cmdline", "rb") as f:
-                    if command.encode() not in f.read():
-                        continue
-            with open(f"/proc/{entry}/environ", "rb") as f:
-                if wanted <= set(f.read().split(b"\0")):
-                    os.kill(int(entry), signal.SIGKILL)
-                    killed += 1
-        except OSError:
-            continue
-    return killed

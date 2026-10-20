@@ -84,7 +84,7 @@ def test_harden_keeps_children_and_sweep_working():
     code = """
 import os, subprocess, sys, time
 from rebox_aggregator.config import harden
-from rebox_aggregator.children import kill_leftovers
+from rebox_aggregator.housekeeping import kill_leftovers
 harden()
 assert open('/proc/self/status').read().count('\\n') and os.stat('/proc/self/environ').st_uid == 0
 env = {**os.environ, 'REBOX_INSTANCE': 'hard-1', 'REBOX_SESSION': 'abc'}

@@ -1,9 +1,11 @@
-"""Cleanup of leftovers that nothing else removes: temp dirs of killed processes, half-written exports,
-old evidence bundles and rolled Ghidra logs, plus the project size (logged at each Ghidra start)."""
+"""Cleanup of leftovers that nothing else removes: processes of a session or instance, temp dirs of killed
+processes, half-written exports, old evidence bundles and rolled Ghidra logs, plus the project size (logged
+at each Ghidra start)."""
 
 import fnmatch
 import os
 import shutil
+import signal
 import time
 from collections.abc import Iterable
 from pathlib import Path
@@ -59,22 +61,31 @@ def _entries(path: str) -> list[os.DirEntry]:
 
 def sweep_tmp(root: str) -> tuple[int, int]:
     """Remove what killed processes left in the temp dir: REA's rea-* runtime dirs, also inside REA's
-    TMPDIRs (rebox-rea-<uid>, any uid: the name follows PUID), and the attach helper's lock files.
-    Only these patterns; run before any session exists. Returns (removed, bytes)."""
+    TMPDIRs (rebox-rea-<uid>, any uid: the name follows PUID), and the attach helper's lock files
+    (rebox-attach-locks-<uid>/*.lock; the directory too once empty, if it is ours). Only these
+    patterns; run before any session exists. Returns (removed, bytes)."""
     removed = freed = 0
     entries = _entries(root)
     todo = [e for e in entries if fnmatch.fnmatchcase(e.name, "rea-*")]
+    lock_dirs = []
     for e in entries:
         if not e.is_dir(follow_symlinks=False):
             continue
         if fnmatch.fnmatchcase(e.name, "rebox-rea-*"):
             todo += [x for x in _entries(e.path) if fnmatch.fnmatchcase(x.name, "rea-*")]
-        elif e.name == "rebox-attach-locks":
+        elif fnmatch.fnmatchcase(e.name, "rebox-attach-locks-*"):
             todo += [x for x in _entries(e.path) if x.name.endswith(".lock")]
+            lock_dirs.append(e)
     for e in todo:
         try:
             freed += _remove(e)
             removed += 1
+        except OSError:
+            continue
+    for e in lock_dirs:
+        try:
+            if e.stat(follow_symlinks=False).st_uid == os.getuid():
+                os.rmdir(e.path)  # fails while anything else is in it
         except OSError:
             continue
     if removed:
@@ -151,3 +162,27 @@ async def housekeeping_loop(state_dir: Path, evidence_retention_days: float) -> 
         await anyio.to_thread.run_sync(_housekeep, state_dir, evidence_retention_days, first)
         first = False
         await anyio.sleep(PRUNE_INTERVAL)
+
+
+def kill_leftovers(session: str | None, instance: str, command: str | None = None) -> int:
+    """SIGKILL every process whose environment carries this instance (and session, when given) and, when
+    `command` is given, whose command line contains it."""
+    wanted = {f"REBOX_INSTANCE={instance}".encode()}
+    if session:
+        wanted.add(f"REBOX_SESSION={session}".encode())
+    killed = 0
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit() or int(entry) == os.getpid():
+            continue
+        try:
+            if command:
+                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                    if command.encode() not in f.read():
+                        continue
+            with open(f"/proc/{entry}/environ", "rb") as f:
+                if wanted <= set(f.read().split(b"\0")):
+                    os.kill(int(entry), signal.SIGKILL)
+                    killed += 1
+        except OSError:
+            continue
+    return killed

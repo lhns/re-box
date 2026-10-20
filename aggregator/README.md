@@ -20,7 +20,7 @@ Why custom, and the protocol-era decision: `docs/DECISIONS.md`, "5.2".
 | `supervisor.py` | container entry point: config checks, the 8089 auth token, runs the app and the headless server, catalog warm-up, signal handling |
 | `headless.py` | the ghidra-mcp JVM (on demand: start, health, save, idle stop, crash restart) and the Ghidra project |
 | `evidence.py` | REA evidence bundles: drop an empty export |
-| `housekeeping.py` | leftovers nothing else removes (`/tmp` sweep, half-written exports, old evidence bundles, rolled Ghidra logs), the daily loop, project size |
+| `housekeeping.py` | leftovers nothing else removes (a session's or instance's processes by environment, `/tmp` sweep, half-written exports, old evidence bundles, rolled Ghidra logs), the daily loop, project size |
 | `catalogcache.py` | per-child catalog cache (key, atomic save/load) and the session-less listing used by the warm-up |
 | `log.py` | JSON-lines logging to stdout (also the mcp library's warnings), process output relay |
 
@@ -254,7 +254,7 @@ exception type). **Never tool arguments or results.**
    Set `REBOX_INSTANCE` to a random id in its own environment, unless it is already set (the
    test-stage runner sets it to find every process of the instance).
 3. Before anything else runs, remove what killed processes left in the temp dir (`sweep_tmp`:
-   `rea-*` and `rebox-attach-locks/*.lock` only; logged as `tmp_swept`). No session exists yet,
+   `rea-*`, also in `rebox-rea-*/`, and `rebox-attach-locks-*/*.lock` (an emptied lock dir of ours too) only; logged as `tmp_swept`). No session exists yet,
    so none of it is in use. Then serve at once (the port opens; no JVM runs yet). The headless server is **on demand**: the app
    calls `want(True)` when a session is created and `want(False)` when the last one is gone. State:
    `stopped`, `starting`, `ready`, `failed` (crashed, backing off), `stopping` (idle stop),

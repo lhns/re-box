@@ -26,8 +26,9 @@ from mcp_types.version import HANDSHAKE_PROTOCOL_VERSIONS, LATEST_HANDSHAKE_VERS
 from . import __version__
 from .autosave import Autosaver
 from .catalog import CatalogError
-from .children import Child, kill_leftovers
+from .children import Child
 from .config import ChildSpec, Settings, child_environ
+from .housekeeping import kill_leftovers
 from .log import log
 from .sessioncatalog import SessionCatalog
 

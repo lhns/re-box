@@ -141,11 +141,11 @@ def test_supervisor_cleans_up_leftovers_at_start(tmp_path):
     t = tmp_path / "t"
     (t / "rea-ghidra-x").mkdir(parents=True)
     (t / "rea-ghidra-x" / "target.bin").write_bytes(b"x" * 10)
-    (t / "rebox-attach-locks").mkdir()
-    (t / "rebox-attach-locks" / "a.lock").write_text("")
+    (t / "rebox-attach-locks-1000").mkdir()
+    (t / "rebox-attach-locks-1000" / "a.lock").write_text("")
     (t / "unrelated").mkdir()
     with supervisor(tmp_path, REBOX_EVIDENCE_RETENTION_DAYS="30") as (proc, base, work, marker):
-        assert not (t / "rea-ghidra-x").exists() and not (t / "rebox-attach-locks" / "a.lock").exists()
+        assert not (t / "rea-ghidra-x").exists() and not (t / "rebox-attach-locks-1000" / "a.lock").exists()
         assert (t / "unrelated").exists()
         assert wait_for(lambda: not old.exists() and not (ev / ".rea-write-abc").exists(), 10)
         assert fresh.exists()

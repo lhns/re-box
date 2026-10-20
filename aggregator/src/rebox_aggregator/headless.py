@@ -13,9 +13,8 @@ import anyio
 import anyio.abc
 import httpx2
 
-from .children import kill_leftovers
 from .config import service_env
-from .housekeeping import dir_size
+from .housekeeping import dir_size, kill_leftovers
 from .log import log, relay_lines
 
 HEADLESS_PORT = 8089
