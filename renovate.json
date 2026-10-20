@@ -76,10 +76,21 @@
       "matchDepNames": [
         "1013503897/jadx-headless-mcp",
         "WebAssembly/wabt",
+        "mitmproxy/mitmproxy",
         "pwndbg/pwndbg",
         "pwntools",
         "pyelftools",
         "unicorn"
+      ],
+      "enabled": false
+    },
+    {
+      "description": "The lockfiles are pip-compile output: the pip-compile manager bumps the .in pins and regenerates them; pip_requirements would open a bump per locked package (82 found when checked).",
+      "matchManagers": [
+        "pip_requirements"
+      ],
+      "matchFileNames": [
+        "deps/*/requirements-*.txt"
       ],
       "enabled": false
     },
@@ -102,7 +113,7 @@
   },
   "pip-compile": {
     "managerFilePatterns": [
-      "/^deps/tools/requirements-[^/]+\\.txt$/"
+      "/^deps/(tools|build)/requirements-[^/]+\\.txt$/"
     ]
   }
 }

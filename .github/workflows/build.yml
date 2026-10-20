@@ -1,4 +1,5 @@
-# Pins and aggregator unit tests on every push and PR. The image's test stage (the whole suite,
+# Unit tests on every push and PR; the pins check (it downloads hundreds of MB) only when something
+# it covers changed, on v* tags and on manual runs. The image's test stage (the whole suite,
 # docs/BUILDING.md) on PRs without pushing; on main and v* tags the release image is pushed to
 # ghcr.io/<owner>/re-box.
 name: build
@@ -23,7 +24,36 @@ env:
   DOCKER_BUILD_RECORD_UPLOAD: "false"
 
 jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    outputs:
+      pins: ${{ steps.filter.outputs.pins }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: filter
+        name: Did anything the pins check covers change?
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          pins=false
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || [ "$GITHUB_REF_TYPE" = tag ]; then
+            pins=true
+          else
+            # HEAD is a PR's merge commit, so its first parent is the base.
+            if [ "$GITHUB_EVENT_NAME" = pull_request ]; then base=HEAD^1; else base=$BEFORE; fi
+            if files=$(git diff --name-only "$base" "$GITHUB_SHA" 2>/dev/null); then
+              if echo "$files" | grep -Eq '^(versions\.env|scripts/check-pins\.py|renovate\.json|deps/rea/package-lock\.json|\.github/workflows/)'; then pins=true; fi
+            else
+              pins=true  # no usable base (new branch, force push): check
+            fi
+          fi
+          echo "pins=$pins" >> "$GITHUB_OUTPUT"
+
   pins:
+    needs: changes
+    if: needs.changes.outputs.pins == 'true'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -36,6 +66,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: check-pins unit tests (offline)
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - name: Aggregator unit tests (fake children, no image)
         working-directory: aggregator
         run: |
@@ -44,7 +76,9 @@ jobs:
           uv run --no-sync pytest -q -p no:cacheprovider tests
 
   image:
-    needs: [pins, unit]
+    # A skipped pins job (nothing it covers changed) does not hold the image back; a failed one does.
+    needs: [changes, pins, unit]
+    if: ${{ !cancelled() && needs.changes.result == 'success' && needs.unit.result == 'success' && contains(fromJSON('["success","skipped"]'), needs.pins.result) }}
     # Repository variable REBOX_RUNNER (JSON) moves this job off the hosted runner, e.g. '"re-box"'
     # for an ARC scale set; REBOX_BUILD_TIMEOUT raises the limit there (hosted jobs stop at 360).
     runs-on: ${{ fromJSON(vars.REBOX_RUNNER || '"ubuntu-24.04"') }}
@@ -76,9 +110,6 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable={{is_default_branch}}
-          labels: |
-            org.opencontainers.image.title=re-box
-            org.opencontainers.image.description=Ghidra, REA and ghidra-mcp behind one authenticated MCP endpoint
       - name: Test stage (runs the whole suite)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
