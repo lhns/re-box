@@ -10,6 +10,8 @@ PY=/opt/rebox/test-venv/bin/python
 export PUID=4321 PGID=4321                       # exercise the root -> PUID/PGID remap
 REBOX_INSTANCE="e2e-$(head -c8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 export REBOX_TOKEN="e2e-$(head -c24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+# ghidra-mcp's 8089 token: the supervisor keeps a preset one, so the tests know it.
+export GHIDRA_MCP_AUTH_TOKEN="e2e-$(head -c24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 export REBOX_PORT=18443
 export REBOX_URL="http://127.0.0.1:$REBOX_PORT/mcp"
 export RE_WORKDIR=/tmp/rebox-e2e/work
