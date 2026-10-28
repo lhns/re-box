@@ -151,6 +151,23 @@ def test_session_policy_settings(tmp_path):
                 load_settings({"REBOX_TOKEN": "t", "REBOX_CONFIG": cfg, key: bad})
 
 
+def test_env_deny_adds_to_the_children_by_prefix(tmp_path):
+    two = CHILD + 'deny = ["x"]\n[[child]]\nname = "gh"\nprefix = "gh_"\ncommand = ["/bin/true"]\n'
+    rea, gh = load_children(toml(tmp_path, two), {"REBOX_DENY_TOOLS": "rea_gdb_start, gh_run , rea_x,"})
+    assert rea.deny == ("x", "gdb_start") and gh.deny == ("run",)
+
+
+def test_env_deny_refuses_hook_tools_and_unknown_prefix(tmp_path):
+    body = AUTOSAVE.replace("[child.autosave]\n", '[child.autosave]\nbefore_tools = ["close_binary"]\n') + READY
+    for name in ("rea_export_evidence_bundle", "rea_close_binary", "rea_connect"):
+        with pytest.raises(ConfigError, match="REBOX_DENY_TOOLS.*hooks"):
+            load_children(toml(tmp_path, body), {"REBOX_DENY_TOOLS": name})
+    with pytest.raises(ConfigError, match="REBOX_DENY_TOOLS.*prefix"):
+        load_children(toml(tmp_path, body), {"REBOX_DENY_TOOLS": "nope_x"})
+    with pytest.raises(ConfigError, match="REBOX_DENY_TOOLS"):
+        load_settings({"REBOX_TOKEN": "t", "REBOX_CONFIG": toml(tmp_path, body), "REBOX_DENY_TOOLS": "rea_close_binary"})
+
+
 def test_child_env_fills_in_environment_variables():
     from rebox_aggregator.config import ChildSpec, child_env
 

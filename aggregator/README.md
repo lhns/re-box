@@ -75,6 +75,10 @@ key = "{file:/opt/ghidra-mcp/VERSION}-lazy{GHIDRA_MCP_LAZY}-scripts{GHIDRA_MCP_A
 `tools/list` (again after every `list_changed` refresh), and a `tools/call` to one fails with
 `-32602` "Tool ghidra_x is disabled by this re-box's configuration" without reaching the child. The
 shipped config denies ghidra-mcp's `run_ghidra_script`, `run_script_inline` and `delete_project`.
+`REBOX_DENY_TOOLS` (comma-separated, prefixed names such as `rea_start_gdb_session`) adds to the
+lists at start without editing the file: the longest matching child prefix picks the child. It is a
+config error to name an unknown prefix or a tool of that child's `autosave` (`tool`, `before_tools`)
+or `on_ready`, since denying it would silently break the hook.
 
 **on_ready:** the Ghidra server starts with the first session, so a bridge usually boots before it
 and shows only static tools. When the server becomes ready (and the client has sent

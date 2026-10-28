@@ -4,7 +4,7 @@ import os
 import re
 import tomllib
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -158,7 +158,26 @@ def load_texts(path: str, environ: Mapping[str, str] = os.environ) -> dict[str, 
     return texts
 
 
-def load_children(path: str) -> tuple[ChildSpec, ...]:
+def _env_deny(specs: list[ChildSpec], environ: Mapping[str, str]) -> list[ChildSpec]:
+    """Add REBOX_DENY_TOOLS (comma-separated prefixed names) to the children's deny lists. Refuses an unknown
+    prefix and a tool the child's autosave or on_ready needs, since hiding it would break them quietly."""
+    extra: dict[str, list[str]] = {s.name: [] for s in specs}
+    for name in (n.strip() for n in environ.get("REBOX_DENY_TOOLS", "").split(",")):
+        if not name:
+            continue
+        owner = max((s for s in specs if name.startswith(s.prefix)), key=lambda s: len(s.prefix), default=None)
+        if owner is None:
+            raise ConfigError(f"REBOX_DENY_TOOLS: {name!r} starts with no child's prefix ({', '.join(s.prefix for s in specs)})")
+        tool = name[len(owner.prefix):]
+        needed = set(owner.autosave.before_tools if owner.autosave else ())
+        needed |= {h.tool for h in (owner.autosave, owner.on_ready) if h}
+        if tool in needed:
+            raise ConfigError(f"REBOX_DENY_TOOLS: {name!r} is used by the autosave or on_ready hooks of child {owner.name}")
+        extra[owner.name].append(tool)
+    return [replace(s, deny=tuple(dict.fromkeys((*s.deny, *extra[s.name])))) for s in specs]
+
+
+def load_children(path: str, environ: Mapping[str, str] = os.environ) -> tuple[ChildSpec, ...]:
     data = _read(path)
     specs = []
     for i, c in enumerate(data.get("child", [])):
@@ -184,7 +203,7 @@ def load_children(path: str) -> tuple[ChildSpec, ...]:
         raise ConfigError(f"no [[child]] entries in {path}")
     if len({s.name for s in specs}) != len(specs):
         raise ConfigError("duplicate child names")
-    return tuple(specs)
+    return tuple(_env_deny(specs, environ))
 
 
 def number(env: Mapping[str, str], key: str, default: float, cast=float):
@@ -243,7 +262,7 @@ def load_settings(env: Mapping[str, str] = os.environ) -> Settings:
     path = env.get("REBOX_CONFIG", "/etc/rebox/aggregator.toml")
     return Settings(
         token=token,
-        children=load_children(path),
+        children=load_children(path, env),
         **load_texts(path, env),
         port=number(env, "REBOX_PORT", 8443, int),
         bind=env.get("REBOX_BIND", "0.0.0.0"),

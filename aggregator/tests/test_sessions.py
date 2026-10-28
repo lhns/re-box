@@ -7,7 +7,7 @@ import anyio
 import pytest
 
 from conftest import FAKE, INIT, RAW_HEADERS, FakeBackend, fake_spec, raw_call, raw_init, run_app, wait_until
-from rebox_aggregator.config import ChildSpec, OnReady
+from rebox_aggregator.config import ChildSpec, OnReady, load_children
 
 pytestmark = pytest.mark.anyio
 
@@ -237,6 +237,19 @@ async def test_denied_tools_are_hidden_and_calls_fail_clearly():
             assert err["code"] == -32602 and "a_run_script is disabled" in err["message"]
             err = (await raw_call(http, r.url, sid, "tools/call", {"name": "a_nope", "arguments": {}}, 5))[-1]["error"]
             assert "Unknown tool" in err["message"]
+
+
+async def test_env_deny_hides_and_refuses_a_tool(tmp_path):
+    cfg = tmp_path / "c.toml"
+    cfg.write_text(f'[[child]]\nname = "a"\nprefix = "a_"\ncommand = [{sys.executable!r}, {FAKE!r}, "a"]\n[child.env]\nFAKE_EXTRA_TOOLS = "run_script"\n')
+    (spec,) = load_children(str(cfg), {"REBOX_DENY_TOOLS": "a_run_script, "})
+    with run_app([spec]) as r:
+        async with r.raw() as http:
+            sid, _ = await raw_init(http, r.url)
+            names = {t["name"] for t in (await raw_call(http, r.url, sid, "tools/list", {}, 3))[-1]["result"]["tools"]}
+            assert "a_run_script" not in names and "a_echo" in names
+            err = (await raw_call(http, r.url, sid, "tools/call", {"name": "a_run_script", "arguments": {}}, 4))[-1]["error"]
+            assert err["code"] == -32602 and "a_run_script is disabled" in err["message"]
 
 
 async def test_denied_tool_stays_hidden_after_list_changed():
