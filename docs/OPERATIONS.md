@@ -35,7 +35,7 @@ Design: `aggregator/README.md`; why: `docs/DECISIONS.md`.
 | `REBOX_CHILD_GRACE` | `5` | seconds between SIGTERM and SIGKILL when closing a session |
 | `REBOX_HEADLESS_START_TIMEOUT` | `300` | seconds the headless server may take to answer; `/healthz` is 503 once a start takes longer |
 | `REBOX_CONFIG` | `/etc/rebox/aggregator.toml` | the children of each session |
-| `REBOX_DENY_TOOLS` | unset | comma-separated prefixed tool names (`rea_start_gdb_session,rea_adb_shell`) to hide and refuse, on top of the config's `deny`. Startup fails on an unknown prefix or on a tool the autosave/on_ready hooks call (`rea_export_evidence_bundle`, `rea_close_binary`, `ghidra_connect_instance`) |
+| `REBOX_DENY_TOOLS` | unset | comma-separated prefixed tool names (`rea_start_gdb_session,rea_start_adb_app`) to hide and refuse, on top of the config's `deny`. Startup fails on an unknown prefix or on a tool the autosave/on_ready hooks call (`rea_export_evidence_bundle`, `rea_close_binary`, `ghidra_connect_instance`) |
 | `RE_WORKDIR` | `/work` | bind-mount point; must equal the path the harness uses. ghidra-mcp imports only from here and from REA's `TMPDIR` (`GHIDRA_MCP_FILE_ROOT`, below). May be read-only (`:ro`) when `REBOX_STATE_DIR` is set elsewhere (Volumes) |
 | `REBOX_STATE_DIR` | `$RE_WORKDIR/re-box-state` | everything worth keeping that the services write: Ghidra project, settings, caches, REA evidence (docs/PERSISTENCE.md). Empty means the default. Must be writable by the service user; no path element may start with `.` |
 | `GHIDRA_PROJECTS_DIR` | `$REBOX_STATE_DIR/ghidra-projects` | ghidra-mcp's persistent project (`rebox.gpr`); no path element may start with `.` |
