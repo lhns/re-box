@@ -26,7 +26,8 @@ services:
     volumes:
       # Create RE_WORKDIR on the host first (mkdir -p), or Docker creates it as root.
       # Same absolute path inside as outside: paths a client sends are valid here as they are,
-      # and paths re-box writes are valid on the host.
+      # and paths re-box writes are valid on the host. Add :ro for a shared sample store, with
+      # REBOX_STATE_DIR on its own mount (below).
       - ${RE_WORKDIR}:${RE_WORKDIR}
       # A separate state dir (e.g. an agent's scratchpad), also at its own path. Uncomment with
       # REBOX_STATE_DIR set in .env:

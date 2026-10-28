@@ -52,10 +52,14 @@ def validate(env: Mapping[str, str]) -> SupervisorConfig:
     """Raise ConfigError (one clear line) when the container is misconfigured."""
     read_token(env)
     workdir_s = env.get("RE_WORKDIR", "")
-    if not workdir_s or not os.path.isdir(workdir_s) or not os.access(workdir_s, os.W_OK):
-        raise ConfigError(f"RE_WORKDIR {workdir_s!r} must be an existing writable directory")
-    workdir = Path(os.path.abspath(workdir_s))
     state_s = env.get("REBOX_STATE_DIR") or ""
+    # Read-only is fine for a shared sample store, but only when the state dir is elsewhere (its default is inside).
+    need = os.R_OK | os.X_OK | (0 if state_s else os.W_OK)
+    if not workdir_s or not os.path.isdir(workdir_s) or not os.access(workdir_s, need):
+        raise ConfigError(
+            f"RE_WORKDIR {workdir_s!r} must be an existing directory, writable unless REBOX_STATE_DIR is set elsewhere"
+        )
+    workdir = Path(os.path.abspath(workdir_s))
     if state_s and not os.path.isabs(state_s):
         raise ConfigError(f"REBOX_STATE_DIR {state_s!r} must be an absolute path")
     state = Path(os.path.abspath(state_s or workdir / "re-box-state"))

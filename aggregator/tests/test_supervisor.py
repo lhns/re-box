@@ -54,6 +54,17 @@ def test_state_dir_with_dot_element(tmp_path):
     assert not (tmp_path / ".cache").exists()
 
 
+def test_read_only_workdir_needs_a_state_dir_elsewhere(tmp_path, monkeypatch):
+    work, state = tmp_path / "work", tmp_path / "state"
+    work.mkdir()
+    real = os.access
+    # Not chmod: root, which runs the tests in the image, writes anywhere.
+    monkeypatch.setattr(os, "access", lambda p, m, **kw: False if str(p) == str(work) and m & os.W_OK else real(p, m, **kw))
+    assert validate(env(tmp_path, RE_WORKDIR=str(work), REBOX_STATE_DIR=str(state))).state_dir == state
+    with pytest.raises(ConfigError, match="RE_WORKDIR.*REBOX_STATE_DIR"):
+        validate(env(tmp_path, RE_WORKDIR=str(work)))
+
+
 def test_state_dir_outside_workdir(tmp_path):
     work, state = tmp_path / "work", tmp_path / "state"
     work.mkdir()
