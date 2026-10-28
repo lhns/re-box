@@ -122,7 +122,8 @@ every 5 minutes and on shutdown; REA sessions export their evidence when they en
 | [aggregator/README.md](aggregator/README.md) | the MCP aggregator and supervisor |
 
 **Security:** several REA features execute the target. The container is the sandbox: run it on an
-egress-restricted network and treat what it analyses as hostile (docs/OPERATIONS.md, "Security").
+egress-restricted network, give it folders of its own (not a repo or `$HOME`) and treat what it
+analyses as hostile (docs/OPERATIONS.md, "Security").
 
 ## License
 

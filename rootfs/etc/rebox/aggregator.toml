@@ -10,6 +10,7 @@ re-box: Ghidra (ghidra_ tools) and REA (rea_ tools) behind one endpoint.
 ghidra_: one persistent Ghidra project shared by all sessions. Pass the program selector on every call; ghidra_import_file only reads files under RE_WORKDIR ({RE_WORKDIR}).
 rea_: REA works in the same Ghidra project: rea_open_binary imports the file into /rea/<sha12>-<profile8>/<file name> (the first 12 hex digits of the file's sha256 and 8 of REA's profile digest; open it with ghidra_ tools there), and REA's renames and comments persist, whatever REA's own texts say about an ephemeral project. rea_ tools see edits made meanwhile by ghidra_ tools or other sessions. REA's evidence and in-session state still end with the session.
 Paths: the container sees host paths unchanged (same-path mount). On Windows send the Git Bash form (/c/Users/you/re/x.bin), not C:\... .
+RE_WORKDIR may be read-only: write exports and extraction output (evidence bundles, firmware directories) under the state directory.
 Ghidra starts with the first session (about 40 s). A ghidra_ call made while it starts waits for it; if it fails you get a tool error saying why.'''
 backend_failed = "Ghidra is {state}: {reason}. Try again later."
 backend_starting = "Ghidra is still starting after {seconds} s. Try again later."

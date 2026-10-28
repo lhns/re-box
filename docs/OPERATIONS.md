@@ -35,7 +35,8 @@ Design: `aggregator/README.md`; why: `docs/DECISIONS.md`.
 | `REBOX_CHILD_GRACE` | `5` | seconds between SIGTERM and SIGKILL when closing a session |
 | `REBOX_HEADLESS_START_TIMEOUT` | `300` | seconds the headless server may take to answer; `/healthz` is 503 once a start takes longer |
 | `REBOX_CONFIG` | `/etc/rebox/aggregator.toml` | the children of each session |
-| `RE_WORKDIR` | `/work` | bind-mount point; must equal the path the harness uses. ghidra-mcp imports only from here and from REA's `TMPDIR` (`GHIDRA_MCP_FILE_ROOT`, below) |
+| `REBOX_DENY_TOOLS` | unset | comma-separated prefixed tool names (`rea_start_gdb_session,rea_adb_shell`) to hide and refuse, on top of the config's `deny`. Startup fails on an unknown prefix or on a tool the autosave/on_ready hooks call (`rea_export_evidence_bundle`, `rea_close_binary`, `ghidra_connect_instance`) |
+| `RE_WORKDIR` | `/work` | bind-mount point; must equal the path the harness uses. ghidra-mcp imports only from here and from REA's `TMPDIR` (`GHIDRA_MCP_FILE_ROOT`, below). May be read-only (`:ro`) when `REBOX_STATE_DIR` is set elsewhere (Volumes) |
 | `REBOX_STATE_DIR` | `$RE_WORKDIR/re-box-state` | everything worth keeping that the services write: Ghidra project, settings, caches, REA evidence (docs/PERSISTENCE.md). Empty means the default. Must be writable by the service user; no path element may start with `.` |
 | `GHIDRA_PROJECTS_DIR` | `$REBOX_STATE_DIR/ghidra-projects` | ghidra-mcp's persistent project (`rebox.gpr`); no path element may start with `.` |
 | `REBOX_AUTOSAVE_INTERVAL` | `300` | seconds between saves of changed ghidra-mcp programs, and between evidence exports of REA sessions with new calls; `0` disables both periodic saves (shutdown and session-end saves stay) |
@@ -89,6 +90,10 @@ macOS-only features.
   inside the work dir; mount a separate one the same way. Layout, save points and what survives a
   stop, kill or OOM kill: docs/PERSISTENCE.md. Only one container may use a state dir at a time
   (Ghidra locks the project).
+- A shared sample store can be mounted `:ro`: set `REBOX_STATE_DIR` to another mount (without it
+  the supervisor refuses a read-only work dir, as the default state dir would sit inside). re-box
+  and REA write nothing into the work dir; only a path the agent picks does (an evidence bundle,
+  firmware extraction output), and the initialize instructions tell it to use the state dir.
 - `/tmp` holds REA's run dirs, the snapshot copy of each target it opens and tool scratch
   (`/tmp/rebox-rea-<uid>`); give it a volume or tmpfs (compose.yaml) sized for a few GB per
   concurrent REA session on large targets. REA's Ghidra programs live in the project, not here.
@@ -172,6 +177,20 @@ binaries raise the limit. Measured on the test fixtures: see docs/BUILDING.md.
   uid remap needs), `no-new-privileges`, headless server on loopback behind its own token, scripts off for
   clients, the file root guard on `RE_WORKDIR` (and REA's `TMPDIR`), the token stripped from every
   child's environment.
+- **Untrusted targets: give re-box its own folders.** Whatever code a target or an injected prompt
+  runs can write to any folder you bind-mount, and a write there outlives the container (e.g. into
+  `.git/hooks`). Point `RE_WORKDIR` and `REBOX_STATE_DIR` at directories made for re-box, never
+  at a repository, `$HOME` or anything with hooks or dotfiles; mount a shared sample store `:ro`
+  (Volumes). Keep secrets out of the container's environment: REA passes its environment to some
+  of the programs it starts (the 8089 token below is the same kind). Beyond the network policy
+  above, remove what you don't need:
+  - `REBOX_DENY_TOOLS=rea_start_gdb_session,rea_gdb_console` hides tools by name (Environment).
+  - REA's own switches, in the rea child's `[child.env]` (`aggregator/README.md`, "Configuration"),
+    make a program unavailable: `REA_GDB_COMMAND = "/disabled"` (gdb sessions; pwndbg has its own
+    `REA_PWNDBG_GDB`), `REA_ADB_PATH = "/disabled"` (the `*_adb_*` tools; an empty value would fall
+    back to `adb` on `PATH`), `REA_BROWSER_EXECUTABLE = ""` (REA's headless Chrome, which only
+    resolves ES imports of recovered web scripts; they are still recovered). REA starts normally;
+    the gdb and adb tools stay listed and fail with `capability_unavailable` naming `/disabled`.
 - **ghidra-mcp's port 8089 wants a token.** Loopback alone does not stop a page that headless
   Chrome loads for REA from reaching it. The supervisor generates `GHIDRA_MCP_AUTH_TOKEN` once per
   container start (unless preset); the JVM, the bridges and REA's attach helper inherit it and send
